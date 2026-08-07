@@ -13,6 +13,14 @@ const DEFAULTS: PantheonConfig = {
         baseUrl: "http://localhost:4000",
         masterKey: "sk-pantheon-local",
     },
+    routing: {
+        enabled: true,
+        tiers: {
+            simple: "llama-fast",
+            standard: "llama-fast",
+            complex: "llama-smart",
+        },
+    },
     defaultModel: "llama-smart",
 };
 
@@ -40,6 +48,11 @@ export function loadConfig(): PantheonConfig {
         ...DEFAULTS,
         ...parsed,
         gateway: { ...DEFAULTS.gateway, ...parsed.gateway },
+        routing: {
+            ...DEFAULTS.routing,
+            ...parsed.routing,
+            tiers: { ...DEFAULTS.routing.tiers, ...parsed.routing?.tiers },
+        },
     };
 }
 

@@ -1,4 +1,4 @@
-import type { ModelConfig, PantheonConfig } from "@pantheon/shared";
+import type { ModelConfig, PantheonConfig, RoutingConfig } from "@pantheon/shared";
 import { loadConfig, saveConfig } from "../config/loader.js";
 
 export class ModelRegistry {
@@ -45,4 +45,9 @@ export class ModelRegistry {
     getGatewayConfig() {
         return this.config.gateway;
     }
+
+    getRoutingConfig(): RoutingConfig {
+        return this.config.routing;
+    }
+
 }

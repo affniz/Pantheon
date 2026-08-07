@@ -1,6 +1,6 @@
 # ◆ Pantheon
 
-> A multi-model AI agent orchestration system.
+> A self-hosted, multi-model AI orchestration system with intelligent routing.
 
 ---
 
@@ -10,18 +10,34 @@ Pantheon is an orchestration layer for AI models. Rather than locking you into a
 
 ---
 
-## v0.1 — The Foundation
+## v0.2 — Intelligent Routing & Cost Tracking
 
-A working CLI that streams responses from multiple models through a local gateway.
+Pantheon now classifies every prompt and routes it to the cheapest capable model automatically. Usage is tracked in a local SQLite database. The CLI ships with a polished terminal UI — branded splash screen, bordered input, and live streaming output.
 
 ### Commands
 
 ```bash
-pantheon chat                     # interactive streaming chat (uses default model)
-pantheon chat --model llama-fast  # pick a specific model
+pantheon                          # branded welcome screen
+pantheon chat                     # auto-routes based on prompt complexity
+pantheon chat --model llama-fast  # manual override — bypasses routing
 pantheon models list              # list configured models
 pantheon models default <id>      # change the default model
+pantheon cost                     # show total usage summary
+pantheon cost recent              # show last 10 calls
+pantheon cost reset               # clear usage data
 ```
+
+### Chat TUI
+
+Inside `pantheon chat`:
+
+| Key | Action |
+|:----|:-------|
+| `tab` | Cycle through available models (auto-route → llama-fast → llama-smart → …) |
+| `enter` | Send message |
+| `ctrl+c` | Exit |
+
+The input box shows the active model and routing mode. Each assistant response includes a routing badge: `↳ routed: llama-fast · simple · ~42 tokens`.
 
 ---
 
@@ -30,7 +46,7 @@ pantheon models default <id>      # change the default model
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) v20+
-- [pnpm](https://pnpm.io/) v8+
+- [pnpm](https://pnpm.io/) v9+
 - [Docker](https://www.docker.com/)
 - A [Groq API key](https://console.groq.com/) (free)
 
@@ -45,7 +61,7 @@ cd pantheon
 pnpm install
 
 # 3. Build all packages
-pnpm turbo build
+npx turbo build
 
 # 4. Link the CLI globally
 cd packages/cli && npm link && cd ../..
@@ -71,7 +87,10 @@ pantheon chat
   CLI (Ink TUI)
      │
      ▼
-  Gateway (@pantheon/core)
+  Classifier (@pantheon/core)   ← one-shot LLM call, picks tier
+     │  simple / standard / complex
+     ▼
+  Gateway (@pantheon/core)      ← routes to correct model, records usage
      │  OpenAI-compatible API
      ▼
   LiteLLM Proxy (Docker :4000)
@@ -84,16 +103,17 @@ pantheon chat
 
 ```
 packages/
-├── shared/   # Shared types and interfaces
-├── core/     # Model registry, config loader, gateway
-└── cli/      # pantheon binary (Commander + Ink)
+├── shared/   # Shared types: ModelConfig, ChatMessage, RoutingDecision, UsageRecord, etc.
+├── core/     # ModelRegistry, Gateway, Classifier, CostTracker, config loader
+└── cli/      # pantheon binary (Commander + Ink) — chat, models, cost commands
+               #   ui/  theme, logo, input-box, message, status-bar, key-hints
 ```
 
 ### Models
 
 Pantheon is built around **role-based model assignment** — rather than picking models by provider or name, the system assigns models to roles like *planner*, *executor*, and *reviewer*. Each role gets the model best suited for it.
 
-v0.1 ships with two Groq models as a starting point:
+v0.2 ships with two Groq models as a starting point:
 
 | ID | Model | Role |
 |:---|:------|:-----|
@@ -111,9 +131,9 @@ Pantheon reads config from `.pantheon/config.yml` in the current directory, or `
 ## Development
 
 ```bash
-pnpm turbo build   # build all packages
-pnpm turbo dev     # watch mode
-pnpm turbo clean   # remove build artifacts
+npx turbo build   # build all packages
+npx turbo dev     # watch mode
+npx turbo clean   # remove build artifacts
 ```
 
 ---
@@ -123,3 +143,4 @@ pnpm turbo clean   # remove build artifacts
 | Version | What it adds |
 |:--------|:-------------|
 | **v0.1** | Multi-model CLI, streaming chat, model registry |
+| **v0.2** | Intelligent routing, LLM complexity classifier, SQLite cost tracker, polished TUI |
