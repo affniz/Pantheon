@@ -2,6 +2,8 @@ export interface ModelConfig {
     id: string;
     provider: string;
     displayName?: string;
+    /** Real upstream model name, used when provider needs direct routing (e.g. google). Defaults to id. */
+    modelName?: string;
 }
 
 export interface GatewayConfig {

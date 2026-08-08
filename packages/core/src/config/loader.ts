@@ -17,7 +17,7 @@ const DEFAULTS: PantheonConfig = {
         enabled: true,
         tiers: {
             simple: "llama-fast",
-            standard: "llama-fast",
+            standard: "llama-smart",
             complex: "llama-smart",
         },
     },

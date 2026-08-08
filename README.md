@@ -10,16 +10,19 @@ Pantheon is an orchestration layer for AI models. Rather than locking you into a
 
 ---
 
-## v0.2 — Intelligent Routing & Cost Tracking
+## v0.3 — Tool Use, Agent Runtime & Sandboxing
 
-Pantheon now classifies every prompt and routes it to the cheapest capable model automatically. Usage is tracked in a local SQLite database. The CLI ships with a polished terminal UI — branded splash screen, bordered input, and live streaming output.
+Pantheon is now an **agentic system**. The LLM can call tools — read files, write files, list directories, and run shell commands — with a ReAct-style agent loop that handles multi-step reasoning autonomously.
+
+**Safety-first**: All tools are sandboxed to the project root. Destructive tools (`writeFile`, `shell`) always require user confirmation. Safe tools (`readFile`, `listDirectory`) prompt on first use with the option to allow once or always allow for the session.
 
 ### Commands
 
 ```bash
 pantheon                          # branded welcome screen
-pantheon chat                     # auto-routes based on prompt complexity
-pantheon chat --model llama-fast  # manual override — bypasses routing
+pantheon chat                     # agentic chat — tools enabled
+pantheon chat --no-tools          # pure chat mode (v0.2 behavior)
+pantheon chat --model llama-fast  # manual model override
 pantheon models list              # list configured models
 pantheon models default <id>      # change the default model
 pantheon cost                     # show total usage summary
@@ -37,7 +40,17 @@ Inside `pantheon chat`:
 | `enter` | Send message |
 | `ctrl+c` | Exit |
 
-The input box shows the active model and routing mode. Each assistant response includes a routing badge: `↳ routed: llama-fast · simple · ~42 tokens`.
+When the agent calls tools, you'll see inline prompts:
+
+```
+  🔧 readFile({ path: "src/index.ts" })
+  First use of readFile — [a] allow once  [A] always allow  [n] deny
+  ↳ ✓ Done · 42 lines
+
+  🔧 shell({ command: "ls -la" })
+  ⚠ Destructive operation — [y] approve  [n] deny
+  ↳ ✓ Done · 12 lines
+```
 
 ---
 
@@ -81,32 +94,44 @@ pantheon chat
 ## Architecture
 
 ```
-pantheon chat
+pantheon chat "Read src/index.ts and explain it"
      │
      ▼
   CLI (Ink TUI)
      │
-     ▼
-  Classifier (@pantheon/core)   ← one-shot LLM call, picks tier
-     │  simple / standard / complex
-     ▼
-  Gateway (@pantheon/core)      ← routes to correct model, records usage
-     │  OpenAI-compatible API
-     ▼
-  LiteLLM Proxy (Docker :4000)
+     ├── Sandbox(projectRoot: cwd)     ← path jail + command validation
+     ├── PermissionManager             ← two-tier confirmation
      │
      ▼
-  Groq → llama-3.1-8b-instant / llama-3.3-70b-versatile
+  AgentRuntime (@pantheon/core)
+     │
+     ├── 1. Classify → Route to model
+     │
+     ├── 2. Gateway.complete() ──→ LiteLLM ──→ Groq
+     │        │
+     │        ▼
+     ├── 3. LLM returns tool_calls?
+     │     YES → PermissionManager → Sandbox → ToolRegistry
+     │           ├── readFile()      (safe)
+     │           ├── writeFile()     (destructive)
+     │           ├── listDirectory() (safe)
+     │           └── shell()         (destructive)
+     │           → Append results → Loop to step 2
+     │     NO  → Stream final text response
+     │
+     ▼
+  Display in TUI
 ```
 
 ### Packages
 
 ```
 packages/
-├── shared/   # Shared types: ModelConfig, ChatMessage, RoutingDecision, UsageRecord, etc.
-├── core/     # ModelRegistry, Gateway, Classifier, CostTracker, config loader
+├── shared/   # Shared types: ModelConfig, ChatMessage, ToolDefinition, ToolCall, ToolResult, etc.
+├── core/     # ModelRegistry, Gateway, Classifier, CostTracker, Sandbox, PermissionManager,
+│             #   ToolRegistry, AgentRuntime, built-in tools
 └── cli/      # pantheon binary (Commander + Ink) — chat, models, cost commands
-               #   ui/  theme, logo, input-box, message, status-bar, key-hints
+               #   ui/  theme, logo, input-box, message, status-bar, tool-call, tool-permission
 ```
 
 ### Models
@@ -133,6 +158,8 @@ Pantheon reads config from `.pantheon/config.yml` in the current directory, or `
 ```bash
 npx turbo build   # build all packages
 npx turbo dev     # watch mode
+npx turbo lint    # run ESLint
+npx turbo test    # run Vitest tests
 npx turbo clean   # remove build artifacts
 ```
 
@@ -144,3 +171,4 @@ npx turbo clean   # remove build artifacts
 |:--------|:-------------|
 | **v0.1** | Multi-model CLI, streaming chat, model registry |
 | **v0.2** | Intelligent routing, LLM complexity classifier, SQLite cost tracker, polished TUI |
+| **v0.3** | Tool use (readFile, writeFile, listDirectory, shell), agent runtime (ReAct loop), sandbox + two-tier permissions, CI pipeline (ESLint + Vitest + GitHub Actions) |

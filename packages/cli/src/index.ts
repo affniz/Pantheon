@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+
+// Load .env from the project root (or wherever the CLI is invoked from) before
+// anything else so API keys like GROQ_API_KEY are in process.env.
+try { (process as any).loadEnvFile(); } catch { /* no .env file — that's fine */ }
+
 import { Command } from "commander";
 import chalk from "chalk";
 import { chatCommand } from "./commands/chat.js";
@@ -26,12 +31,13 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(`${dim("                              v0.2.0")}`);
+    console.log(`${dim("                              v0.3.0")}`);
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
     console.log("");
-    console.log(`  ${accent("chat")}              ${dim("Start an interactive chat session")}`);
+    console.log(`  ${accent("chat")}              ${dim("Start an agentic chat session (with tools)")}`);
+    console.log(`  ${accent("chat --no-tools")}   ${dim("Chat without tool access")}`);
     console.log(`  ${accent("models list")}       ${dim("List configured models")}`);
     console.log(`  ${accent("models default")} ${muted("<id>")} ${dim("Set the default model")}`);
     console.log(`  ${accent("cost")}              ${dim("Show usage summary")}`);
@@ -46,7 +52,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.2.0")
+    .version("0.3.0")
     .action(() => {
         showWelcome();
     });
@@ -55,7 +61,8 @@ program
     .command("chat")
     .description("Start an interactive chat session")
     .option("-m, --model <id>", "Model ID to use (bypasses auto-routing)")
-    .action((opts) => chatCommand(opts.model));
+    .option("--no-tools", "Disable tool use (pure chat mode)")
+    .action((opts) => chatCommand(opts.model, opts.tools === false ? true : undefined));
 
 const modelsCmd = program.command("models").description("Manage models");
 

@@ -28,7 +28,7 @@ export function Logo() {
           {line}
         </Text>
       ))}
-      <Text color={theme.colors.textDim}>v0.2.0</Text>
+      <Text color={theme.colors.textDim}>v0.3.0</Text>
     </Box>
   );
 }

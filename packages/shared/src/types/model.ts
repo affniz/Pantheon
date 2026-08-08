@@ -1,6 +1,6 @@
 export interface ModelProfile {
     id: string;
-    provider: "groq" | "openai" | "anthropic" | "google" | "mistral";
+    provider: "groq" | "openai" | "anthropic" | "mistral";
     displayName: string;
     contextWindow: number;
     costPer1kInputTokens: number;

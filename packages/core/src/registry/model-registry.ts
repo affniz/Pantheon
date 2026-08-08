@@ -50,4 +50,13 @@ export class ModelRegistry {
         return this.config.routing;
     }
 
+    /**
+     * Returns the model ID configured for the 'complex' routing tier —
+     * the most capable model in the registry. Used by agentic chat to
+     * prefer the smart model for reliable tool calling.
+     */
+    getSmartModelId(): string | undefined {
+        return this.config.routing.tiers.complex;
+    }
+
 }
