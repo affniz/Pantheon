@@ -1,86 +1,78 @@
-import Database from "better-sqlite3";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { desc, sql } from "drizzle-orm";
 import type { UsageRecord } from "@pantheon/shared";
-
-const DB_PATH = path.join(os.homedir(), ".pantheon", "usage.db");
+import { getDb, type PantheonDatabase } from "../db/client.js";
+import { usageRecords } from "../db/schema.js";
 
 export class CostTracker {
-    private db: Database.Database;
+    private db: PantheonDatabase;
 
-    constructor() {
-        fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-        this.db = new Database(DB_PATH);
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS usage_records (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp     TEXT    NOT NULL,
-                modelId       TEXT    NOT NULL,
-                inputTokens   INTEGER NOT NULL,
-                outputTokens  INTEGER NOT NULL,
-                costUsd       REAL    NOT NULL,
-                promptPreview TEXT    NOT NULL
-            )
-        `);
+    constructor(db?: PantheonDatabase) {
+        this.db = db ?? getDb();
     }
 
     record(usage: Omit<UsageRecord, "id">): void {
         this.db
-            .prepare(
-                `INSERT INTO usage_records
-                 (timestamp, modelId, inputTokens, outputTokens, costUsd, promptPreview)
-                 VALUES (?, ?, ?, ?, ?, ?)`
-            )
-            .run(
-                usage.timestamp,
-                usage.modelId,
-                usage.inputTokens,
-                usage.outputTokens,
-                usage.costUsd,
-                usage.promptPreview
-            );
+            .insert(usageRecords)
+            .values({
+                timestamp: usage.timestamp,
+                modelId: usage.modelId,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+                costUsd: usage.costUsd,
+                promptPreview: usage.promptPreview,
+            })
+            .run();
     }
 
     getSummary(): { totalCalls: number; totalInputTokens: number; totalOutputTokens: number; totalCostUsd: number } {
-        return this.db
-            .prepare(
-                `SELECT
-                    COUNT(*)        AS totalCalls,
-                    SUM(inputTokens)  AS totalInputTokens,
-                    SUM(outputTokens) AS totalOutputTokens,
-                    SUM(costUsd)      AS totalCostUsd
-                 FROM usage_records`
-            )
-            .get() as any;
+        const result = this.db
+            .select({
+                totalCalls: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+                totalInputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.inputTokens}), 0) AS INTEGER)`,
+                totalOutputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.outputTokens}), 0) AS INTEGER)`,
+                totalCostUsd: sql<number>`CAST(COALESCE(SUM(${usageRecords.costUsd}), 0) AS REAL)`,
+            })
+            .from(usageRecords)
+            .get();
+        return result || { totalCalls: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 };
     }
 
     getByModel(): Record<string, { calls: number; inputTokens: number; outputTokens: number; costUsd: number }> {
         const rows = this.db
-            .prepare(
-                `SELECT
-                    modelId,
-                    COUNT(*)         AS calls,
-                    SUM(inputTokens)  AS inputTokens,
-                    SUM(outputTokens) AS outputTokens,
-                    SUM(costUsd)      AS costUsd
-                 FROM usage_records
-                 GROUP BY modelId`
-            )
-            .all() as any[];
+            .select({
+                modelId: usageRecords.modelId,
+                calls: sql<number>`CAST(COUNT(*) AS INTEGER)`,
+                inputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.inputTokens}), 0) AS INTEGER)`,
+                outputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.outputTokens}), 0) AS INTEGER)`,
+                costUsd: sql<number>`CAST(COALESCE(SUM(${usageRecords.costUsd}), 0) AS REAL)`,
+            })
+            .from(usageRecords)
+            .groupBy(usageRecords.modelId)
+            .all();
 
-        return Object.fromEntries(rows.map((r) => [r.modelId, r]));
+        return Object.fromEntries(
+            rows.map((r) => [
+                r.modelId,
+                {
+                    calls: r.calls,
+                    inputTokens: r.inputTokens,
+                    outputTokens: r.outputTokens,
+                    costUsd: r.costUsd,
+                },
+            ])
+        );
     }
 
     getRecent(n = 10): UsageRecord[] {
         return this.db
-            .prepare(
-                `SELECT * FROM usage_records ORDER BY id DESC LIMIT ?`
-            )
-            .all(n) as UsageRecord[];
+            .select()
+            .from(usageRecords)
+            .orderBy(desc(usageRecords.id))
+            .limit(n)
+            .all();
     }
 
     reset(): void {
-        this.db.exec(`DELETE FROM usage_records`);
+        this.db.delete(usageRecords).run();
     }
 }

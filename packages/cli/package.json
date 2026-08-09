@@ -1,6 +1,6 @@
 {
     "name": "@pantheon/cli",
-    "version": "0.1.0",
+    "version": "0.4.0",
     "type": "module",
     "bin": {
         "pantheon": "./dist/index.js"
@@ -9,8 +9,7 @@
         "build": "tsc",
         "dev": "tsc --watch",
         "clean": "rm -rf dist",
-        "lint": "eslint src/",
-        "test": "vitest run"
+        "lint": "eslint src/"
     },
     "dependencies": {
         "@pantheon/core": "workspace:*",

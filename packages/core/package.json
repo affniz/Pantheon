@@ -1,6 +1,6 @@
 {
     "name": "@pantheon/core",
-    "version": "0.1.0",
+    "version": "0.4.0",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -14,19 +14,20 @@
         "build": "tsc",
         "dev": "tsc --watch",
         "clean": "rm -rf dist",
-        "lint": "eslint src/",
-        "test": "vitest run"
+        "lint": "eslint src/"
     },
     "dependencies": {
         "@pantheon/shared": "workspace:*",
-        "better-sqlite3": "^13.0.3",
+        "@types/better-sqlite3": "^9.6.0",
+        "better-sqlite3": "11.9.1",
+        "drizzle-orm": "^0.45.2",
         "js-yaml": "^4.1.0",
         "openai": "^4.52.0"
     },
     "devDependencies": {
-        "@types/better-sqlite3": "^9.6.0",
         "@types/js-yaml": "^4.0.9",
         "@types/node": "^22.0.0",
+        "drizzle-kit": "^0.31.10",
         "typescript": "^5.5.0"
     }
 }

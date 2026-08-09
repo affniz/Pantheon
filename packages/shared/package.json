@@ -1,6 +1,6 @@
 {
     "name": "@pantheon/shared",
-    "version": "0.1.0",
+    "version": "0.4.0",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -14,8 +14,7 @@
         "build": "tsc",
         "dev": "tsc --watch",
         "clean": "rm -rf dist",
-        "lint": "eslint src/",
-        "test": "vitest run"
+        "lint": "eslint src/"
     },
     "devDependencies": {
         "typescript": "^5.5.0"

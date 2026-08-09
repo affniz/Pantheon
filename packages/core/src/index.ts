@@ -12,3 +12,7 @@ export type { Tool, OpenAITool } from "./tools/tool-registry.js";
 export { registerBuiltinTools } from "./tools/builtin/index.js";
 export { AgentRuntime } from "./agent/agent-runtime.js";
 export type { AgentConfig, AgentTurnResult } from "./agent/agent-runtime.js";
+export { getDb, createTestDb, closeDb } from "./db/client.js";
+export type { PantheonDatabase } from "./db/client.js";
+export { SessionManager } from "./session/session-manager.js";
+export { SessionSummarizer } from "./session/summarizer.js";
