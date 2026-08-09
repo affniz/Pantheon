@@ -25,3 +25,4 @@ Thumbs.db
 
 # Pantheon local config
 .pantheon/
+pantheon_context.md

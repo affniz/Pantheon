@@ -15,7 +15,7 @@ export function StatusBar({ modelId, isManual, tier }: StatusBarProps) {
   return (
     <Box justifyContent="space-between" width="100%">
       <Text color={theme.colors.textMuted}>{currentDir}</Text>
-      <Text color={theme.colors.textMuted}>v0.3.0</Text>
+      <Text color={theme.colors.textMuted}>v0.4.0</Text>
     </Box>
   );
 }

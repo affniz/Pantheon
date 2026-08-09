@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef, useCallback } from "react";
+import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { render, Box, useInput } from "ink";
 import chalk from "chalk";
 import {
@@ -9,6 +9,8 @@ import {
     ToolRegistry,
     registerBuiltinTools,
     AgentRuntime,
+    SessionManager,
+    SessionSummarizer,
 } from "@pantheon/core";
 import type { PermissionDecision } from "@pantheon/core";
 import type { ChatMessage, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
@@ -19,6 +21,19 @@ import { StatusBar } from "../ui/status-bar.js";
 import { ToolCallDisplay, ToolResultDisplay } from "../ui/tool-call.js";
 import { ToolPermission } from "../ui/tool-permission.js";
 
+function timeAgo(isoString: string): string {
+    const seconds = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+    if (seconds < 60) return "just now";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "yesterday";
+    if (days < 30) return `${days}d ago`;
+    return new Date(isoString).toLocaleDateString();
+}
+
 /** Events rendered inline during an agent turn */
 type AgentEvent =
     | { type: "tool_call"; call: ToolCall; safety: "safe" | "destructive" }
@@ -28,11 +43,33 @@ type AgentEvent =
 interface Props {
     modelId?: string;
     noTools?: boolean | undefined;
+    resume?: string | boolean | undefined;
+    noSave?: boolean | undefined;
 }
 
-function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
+function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: Props) {
     const registry = useMemo(() => new ModelRegistry(), []);
     const gateway = useMemo(() => new Gateway(registry), []);
+
+    // Session management
+    const sessionManager = useMemo(() => new SessionManager(), []);
+    const [sessionId, setSessionId] = useState<string | null>(null);
+    const summaryFiredRef = useRef(false);
+
+    // Build episodic memory context (recent session summaries)
+    const episodicMemory = useMemo(() => {
+        try {
+            const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
+            if (!fastModelId) return "";
+            const summarizer = new SessionSummarizer(gateway, fastModelId);
+            const summaries = summarizer.getRecentSummaries(5);
+            if (summaries.length === 0) return "";
+            const lines = summaries.map(s => `- [${timeAgo(s.createdAt)}] "${s.title}" — ${s.summary}`);
+            return `\n\nYou have had these recent conversations with the user:\n${lines.join("\n")}`;
+        } catch {
+            return "";
+        }
+    }, []);
 
     // Tool system — only initialized when tools are enabled
     const sandbox = useMemo(
@@ -71,6 +108,29 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
     // message and the assistant response to preserve chronological order.
     const [completedEvents, setCompletedEvents] = useState<AgentEvent[]>([]);
 
+    // Initialize session on mount
+    useEffect(() => {
+        if (noSave) return;
+
+        if (resume) {
+            const session = typeof resume === "string"
+                ? sessionManager.get(resume)
+                : sessionManager.getLatest();
+
+            if (session) {
+                setSessionId(session.id);
+                const savedMessages = sessionManager.getMessages(session.id);
+                setMessages(savedMessages);
+            } else {
+                const id = sessionManager.create();
+                setSessionId(id);
+            }
+        } else {
+            const id = sessionManager.create();
+            setSessionId(id);
+        }
+    }, []);
+
     const currentOption = modelOptions[selectedIndex]!;
     const effectiveModelId = currentOption === "auto" ? undefined : currentOption;
     const isManual = currentOption !== "auto";
@@ -89,6 +149,21 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
     // once per Enter keypress when the terminal echoes stdin back to Node.
     const submittingRef = useRef(false);
 
+    /** Fire-and-forget background summary after enough messages */
+    const maybeGenerateSummary = useCallback((sid: string, msgs: ChatMessage[]) => {
+        if (noSave || summaryFiredRef.current) return;
+        // Only summarize after 4+ user/assistant messages
+        const turnCount = msgs.filter(m => m.role === "user" || m.role === "assistant").length;
+        if (turnCount < 4) return;
+        summaryFiredRef.current = true;
+
+        const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
+        if (!fastModelId) return;
+
+        const summarizer = new SessionSummarizer(gateway, fastModelId);
+        summarizer.saveForSession(sid, msgs).catch(() => { /* best-effort */ });
+    }, [noSave, registry, gateway]);
+
     const handleSubmit = useCallback(async (value: string) => {
         if (!value.trim() || isStreaming || submittingRef.current) return;
         submittingRef.current = true;
@@ -98,6 +173,11 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
             content: value.trim(),
             timestamp: new Date(),
         };
+
+        // Persist user message
+        if (sessionId && !noSave) {
+            sessionManager.addMessage(sessionId, userMessage);
+        }
 
         const updated = [...messages, userMessage];
         setMessages(updated);
@@ -110,8 +190,13 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
 
         if (noTools || !sandbox || !toolRegistry) {
             // Pure chat mode — v0.2 behavior
+            // Inject episodic memory into the message stream
+            const msgsForStream = episodicMemory
+                ? [{ role: "system" as const, content: episodicMemory }, ...updated]
+                : updated;
+
             const { generator, decision: newDecision } = await gateway.stream(
-                updated,
+                msgsForStream,
                 effectiveModelId,
             );
             setDecision(newDecision);
@@ -122,13 +207,25 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
                 setStreamedText(accumulated);
             }
 
+            const assistantMsg: ChatMessage = {
+                role: "assistant",
+                content: accumulated,
+                timestamp: new Date(),
+            };
+
+            // Persist assistant message
+            if (sessionId && !noSave) {
+                sessionManager.addMessage(sessionId, assistantMsg);
+            }
+
+            const newMessages = [...updated, assistantMsg];
             setLastOutputChars(accumulated.length);
-            setMessages([
-                ...updated,
-                { role: "assistant", content: accumulated, timestamp: new Date() },
-            ]);
+            setMessages(newMessages);
             setStreamedText("");
             setIsStreaming(false);
+
+            // Try background summary
+            if (sessionId) maybeGenerateSummary(sessionId, newMessages);
         } else {
             // Agentic mode — tool use enabled
             const permissionManager = new PermissionManager(
@@ -146,6 +243,7 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
                 maxIterations: 10,
                 sandbox,
                 permissionManager,
+                ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
                 onToolCall: (call: ToolCall, safety: "safe" | "destructive") => {
                     setAgentEvents((prev) => [
                         ...prev,
@@ -163,6 +261,17 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
             try {
                 const turnResult = await agentRuntime.run(updated, effectiveModelId);
 
+                const assistantMsg: ChatMessage = {
+                    role: "assistant",
+                    content: turnResult.response,
+                    timestamp: new Date(),
+                };
+
+                // Persist assistant message
+                if (sessionId && !noSave) {
+                    sessionManager.addMessage(sessionId, assistantMsg);
+                }
+
                 setDecision(turnResult.decision);
                 setLastOutputChars(turnResult.response.length);
                 // Freeze the events from this turn so they render in the correct
@@ -170,15 +279,13 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
                 // Use the functional updater form to capture the current events
                 // without relying on the stale closure value of `agentEvents`.
                 setCompletedEvents((currentEvents) => currentEvents);
-                setMessages([
-                    ...updated,
-                    {
-                        role: "assistant",
-                        content: turnResult.response,
-                        timestamp: new Date(),
-                    },
-                ]);
+
+                const newMessages = [...updated, assistantMsg];
+                setMessages(newMessages);
                 setAgentEvents([]);
+
+                // Try background summary
+                if (sessionId) maybeGenerateSummary(sessionId, newMessages);
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : String(error);
                 setMessages([
@@ -196,7 +303,7 @@ function ChatApp({ modelId: initialModelId, noTools = false }: Props) {
         }
 
         submittingRef.current = false;
-    }, [messages, isStreaming, effectiveModelId, gateway, noTools, sandbox, toolRegistry]);
+    }, [messages, isStreaming, effectiveModelId, gateway, noTools, sandbox, toolRegistry, sessionId, noSave, episodicMemory, maybeGenerateSummary, sessionManager]);
 
     return (
         <Box flexDirection="column" padding={1}>
@@ -297,19 +404,34 @@ const LOGO_LINES: readonly [string, string][] = [
     [" ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝", "#C68A1A"],
 ];
 
-export function chatCommand(modelId?: string, noTools?: boolean) {
+export function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean) {
     // Print logo to stdout before Ink takes over — static text
     // that Ink's re-render cycle will never touch
     console.log("");
     for (const [line, color] of LOGO_LINES) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.3.0"));
+    console.log(chalk.hex("#6B7280")("                              v0.4.0"));
     console.log("");
+
+    if (resume) {
+        const sm = new SessionManager();
+        const session = typeof resume === "string" ? sm.get(resume) : sm.getLatest();
+        if (session) {
+            console.log(chalk.hex("#56B6C2")(`  Resuming: ${session.title} (${session.id.slice(0, 8)}…)\n`));
+        }
+    }
 
     if (noTools) {
         console.log(chalk.hex("#6B7280")("  Tools disabled — running in pure chat mode\n"));
     }
 
-    render(<ChatApp {...(modelId ? { modelId } : {})} noTools={noTools ?? false} />);
+    render(
+        <ChatApp
+            {...(modelId ? { modelId } : {})}
+            noTools={noTools ?? false}
+            resume={resume}
+            noSave={noSave}
+        />
+    );
 }
