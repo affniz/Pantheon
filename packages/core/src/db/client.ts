@@ -47,8 +47,26 @@ const INIT_SQL = `
         created_at  TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS spans (
+        id              TEXT PRIMARY KEY,
+        trace_id        TEXT NOT NULL,
+        parent_span_id  TEXT,
+        session_id      TEXT,
+        name            TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        start_time      INTEGER NOT NULL,
+        end_time        INTEGER NOT NULL,
+        duration_ms     INTEGER NOT NULL,
+        status          TEXT NOT NULL,
+        error_message   TEXT,
+        attributes      TEXT,
+        created_at      INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
+    CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id);
+    CREATE INDEX IF NOT EXISTS idx_spans_session_id ON spans(session_id);
 `;
 
 let _db: PantheonDatabase | null = null;
@@ -78,6 +96,24 @@ export function getDb(): PantheonDatabase {
     _sqlite.exec(INIT_SQL);
 
     _db = drizzle(_sqlite, { schema });
+
+    // Background pruning: delete trace spans older than 7 days.
+    // Runs via queueMicrotask so it never blocks the getDb() caller.
+    // Raw SQL is used here to avoid a circular import with TraceStore.
+    queueMicrotask(() => {
+        try {
+            const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+            const result = _sqlite!.prepare(
+                "DELETE FROM spans WHERE created_at < ?"
+            ).run(cutoff);
+            if (result.changes > 0) {
+                process.stderr.write(`[db] pruned ${result.changes} old trace span(s)\n`);
+            }
+        } catch {
+            // Best-effort — pruning failures must never crash the startup path
+        }
+    });
+
     return _db;
 }
 

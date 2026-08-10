@@ -1,18 +1,12 @@
 import chalk from "chalk";
-import * as readline from "node:readline";
-import { SessionManager } from "@pantheon/core";
+import readline from "node:readline";
+import { PantheonApiClient } from "../api-client.js";
+import { ensureServerRunning } from "../server-manager.js";
 
-// Brand colors matching theme.ts
-const brand = chalk.hex("#F5A623");
-const accent = chalk.hex("#56B6C2");
 const dim = chalk.hex("#6B7280");
+const accent = chalk.hex("#56B6C2");
+const brand = chalk.hex("#F5A623");
 const muted = chalk.hex("#4B5563");
-const success = chalk.hex("#4ADE80");
-const warning = chalk.hex("#FBBF24");
-const border = chalk.hex("#3A3A3A");
-
-const BRAND_MARK = `${brand.bold("◆")} ${brand("Pantheon")}`;
-const HR = border("─".repeat(50));
 
 function timeAgo(isoString: string): string {
     const seconds = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
@@ -27,132 +21,111 @@ function timeAgo(isoString: string): string {
     return new Date(isoString).toLocaleDateString();
 }
 
-export function sessionsList(opts: { num?: string; all?: boolean }) {
-    const manager = new SessionManager();
-    const limit = opts.num ? parseInt(opts.num, 10) : 10;
-    const sessions = manager.list({ limit, includeArchived: opts.all ?? false });
-
-    console.log(`\n  ${BRAND_MARK} ${dim("— Sessions")}\n`);
-    console.log(`  ${HR}\n`);
+export async function sessionsList(opts: { num?: string; all?: boolean }) {
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
+    const limit = Number(opts.num ?? 10);
+    const sessions = await client.listSessions({
+        limit,
+        ...(opts.all ? { all: true } : {}),
+    });
 
     if (sessions.length === 0) {
-        console.log(`  ${dim("No sessions yet. Start one with")} ${accent("pantheon chat")}\n`);
+        console.log(dim("\n  No sessions found. Run `pantheon chat` to start one.\n"));
         return;
     }
 
-    for (const session of sessions) {
-        const shortId = dim(session.id.slice(0, 8));
-        const time = muted(timeAgo(session.createdAt));
-        const msgs = muted(`${session.messageCount ?? 0} msgs`);
-        const archived = session.isArchived ? ` ${warning("[archived]")}` : "";
+    console.log("");
+    console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Recent Sessions")}`);
+    console.log(`  ${dim("─".repeat(75))}`);
+    console.log(
+        `  ${dim("ID".padEnd(10))} ${"TITLE".padEnd(35)} ${"UPDATED".padEnd(12)} MSGS`
+    );
+    console.log(`  ${dim("─".repeat(75))}`);
 
-        // Truncate title to fit terminal
-        const maxTitleLen = Math.min(40, (process.stdout.columns || 80) - 45);
-        const title = session.title.length > maxTitleLen
-            ? session.title.slice(0, maxTitleLen - 1) + "…"
-            : session.title.padEnd(maxTitleLen);
-
-        console.log(`  ${brand("◆")} ${chalk.white(title)}${archived}  ${shortId}  ${time}  ${msgs}`);
+    for (const s of sessions) {
+        const id = accent(s.id.slice(0, 8));
+        const title = s.title.slice(0, 34).padEnd(35);
+        const when = timeAgo(s.updatedAt).padEnd(12);
+        const msgs = String(s.messageCount ?? 0);
+        const archived = s.isArchived ? dim(" [archived]") : "";
+        console.log(`  ${id}  ${title} ${dim(when)} ${msgs}${archived}`);
     }
 
-    console.log(`\n  ${HR}\n`);
+    console.log(`  ${dim("─".repeat(75))}`);
+    console.log("");
 }
 
-export function sessionsShow(id: string) {
-    const manager = new SessionManager();
+export async function sessionsShow(id: string) {
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
 
-    // Support partial IDs — search for matching session
-    let session = manager.get(id);
-    if (!session) {
-        // Try to match by prefix
-        const allSessions = manager.list({ limit: 100, includeArchived: true });
-        const match = allSessions.find(s => s.id.startsWith(id));
-        if (match) {
-            session = manager.get(match.id);
+    let session;
+    try {
+        session = await client.getSession(id);
+    } catch {
+        console.error(chalk.red(`  Session "${id}" not found.`));
+        process.exit(1);
+    }
+
+    const messages = await client.getSessionMessages(session.id);
+
+    console.log("");
+    console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Session Details")}`);
+    console.log(`  ${dim("─".repeat(60))}`);
+    console.log(`  ${dim("ID:")}      ${accent(session.id)}`);
+    console.log(`  ${dim("Title:")}   ${session.title}`);
+    console.log(`  ${dim("Created:")} ${new Date(session.createdAt).toLocaleString()}`);
+    console.log(`  ${dim("Updated:")} ${new Date(session.updatedAt).toLocaleString()}`);
+    console.log(`  ${dim("Model:")}   ${session.modelId ?? dim("(auto)")}`);
+    console.log(`  ${dim("Status:")}  ${session.isArchived ? dim("archived") : chalk.green("active")}`);
+    console.log(`  ${dim("Messages:")} ${messages.length}`);
+
+    if (messages.length > 0) {
+        console.log(`\n  ${dim("─".repeat(60))}`);
+        console.log(`  ${dim("Last exchange:")}`);
+        const last = messages.filter((m) => m.role === "user" || m.role === "assistant").slice(-2);
+        for (const m of last) {
+            const label = m.role === "user" ? chalk.hex("#56B6C2")("User") : chalk.hex("#F5A623")("Pantheon");
+            const preview = m.content.replace(/\n/g, " ").slice(0, 120);
+            console.log(`  ${label}: ${preview}${m.content.length > 120 ? dim("…") : ""}`);
         }
     }
 
-    if (!session) {
-        console.log(`\n  ${warning("⚠")} Session not found: ${muted(id)}\n`);
-        return;
-    }
-
-    console.log(`\n  ${BRAND_MARK} ${dim("— Session Details")}\n`);
-    console.log(`  ${HR}\n`);
-
-    const labelWidth = 16;
-    const label = (s: string) => accent(s.padEnd(labelWidth));
-
-    console.log(`  ${label("ID")}${chalk.white(session.id)}`);
-    console.log(`  ${label("Title")}${chalk.white.bold(session.title)}`);
-    console.log(`  ${label("Created")}${chalk.white(new Date(session.createdAt).toLocaleString())}  ${muted(timeAgo(session.createdAt))}`);
-    console.log(`  ${label("Updated")}${chalk.white(new Date(session.updatedAt).toLocaleString())}  ${muted(timeAgo(session.updatedAt))}`);
-    if (session.modelId) {
-        console.log(`  ${label("Model")}${chalk.white(session.modelId)}`);
-    }
-    console.log(`  ${label("Messages")}${chalk.white(String(session.messageCount ?? 0))}`);
-    console.log(`  ${label("Archived")}${session.isArchived ? warning("yes") : dim("no")}`);
-
-    console.log(`\n  ${HR}\n`);
+    console.log("");
 }
 
 export async function sessionsDelete(id: string) {
-    const manager = new SessionManager();
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) =>
+        rl.question(chalk.yellow(`  Permanently delete session ${id.slice(0, 8)}…? [y/N] `), resolve)
+    );
+    rl.close();
 
-    // Support partial IDs — search for matching session
-    let session = manager.get(id);
-    if (!session) {
-        const allSessions = manager.list({ limit: 100, includeArchived: true });
-        const match = allSessions.find(s => s.id.startsWith(id));
-        if (match) {
-            session = manager.get(match.id);
-        }
-    }
-
-    if (!session) {
-        console.log(`\n  ${warning("⚠")} Session not found: ${muted(id)}\n`);
+    if (answer.trim().toLowerCase() !== "y") {
+        console.log(dim("  Cancelled."));
         return;
     }
 
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-    await new Promise<void>((resolve) => {
-        rl.question(`  ${warning("⚠")} Delete "${session.title}"? This cannot be undone. ${dim("(y/N)")} `, (answer) => {
-            rl.close();
-            if (answer.trim().toLowerCase() === "y") {
-                manager.delete(session.id);
-                console.log(`  ${success("✓")} Session deleted.\n`);
-            } else {
-                console.log(`  ${dim("Cancelled.")}\n`);
-            }
-            resolve();
-        });
-    });
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
+    try {
+        await client.deleteSession(id);
+        console.log(chalk.green(`  ✓ Session deleted.`));
+    } catch (err) {
+        console.error(chalk.red(`  Error: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+    }
 }
 
-export function sessionsArchive(id: string) {
-    const manager = new SessionManager();
-
-    // Support partial IDs — search for matching session
-    let session = manager.get(id);
-    if (!session) {
-        const allSessions = manager.list({ limit: 100, includeArchived: true });
-        const match = allSessions.find(s => s.id.startsWith(id));
-        if (match) {
-            session = manager.get(match.id);
-        }
+export async function sessionsArchive(id: string) {
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
+    try {
+        await client.archiveSession(id);
+        console.log(chalk.green(`  ✓ Session archived.`));
+    } catch (err) {
+        console.error(chalk.red(`  Error: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
     }
-
-    if (!session) {
-        console.log(`\n  ${warning("⚠")} Session not found: ${muted(id)}\n`);
-        return;
-    }
-
-    if (session.isArchived) {
-        console.log(`\n  ${dim("Session is already archived.")}\n`);
-        return;
-    }
-
-    manager.archive(session.id);
-    console.log(`\n  ${success("✓")} Session "${session.title}" archived.\n`);
 }

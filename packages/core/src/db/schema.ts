@@ -45,3 +45,21 @@ export const sessionSummaries = sqliteTable("session_summaries", {
     summary: text("summary").notNull(),
     createdAt: text("created_at").notNull(),
 });
+
+// ─── Trace Spans ─────────────────────────────────────────────────────────────
+
+export const spans = sqliteTable("spans", {
+    id: text("id").primaryKey(),                          // spanId (UUID)
+    traceId: text("trace_id").notNull(),
+    parentSpanId: text("parent_span_id"),                 // null on root span
+    sessionId: text("session_id"),
+    name: text("name").notNull(),                         // e.g. "llm.completion"
+    kind: text("kind").notNull(),                         // routing | llm | tool | agent | http
+    startTime: integer("start_time").notNull(),           // epoch ms
+    endTime: integer("end_time").notNull(),
+    durationMs: integer("duration_ms").notNull(),
+    status: text("status").notNull(),                     // ok | error
+    errorMessage: text("error_message"),
+    attributes: text("attributes"),                       // JSON stringified
+    createdAt: integer("created_at").notNull(),           // epoch ms
+});

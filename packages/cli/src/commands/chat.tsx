@@ -1,17 +1,8 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { render, Box, useInput } from "ink";
 import chalk from "chalk";
-import {
-    ModelRegistry,
-    Gateway,
-    Sandbox,
-    PermissionManager,
-    ToolRegistry,
-    registerBuiltinTools,
-    AgentRuntime,
-    SessionManager,
-    SessionSummarizer,
-} from "@pantheon/core";
+import { ensureServerRunning, getServerUrl } from "../server-manager.js";
+import { PantheonApiClient } from "../api-client.js";
 import type { PermissionDecision } from "@pantheon/core";
 import type { ChatMessage, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 import { Message, StreamingMessage } from "../ui/message.js";
@@ -21,24 +12,11 @@ import { StatusBar } from "../ui/status-bar.js";
 import { ToolCallDisplay, ToolResultDisplay } from "../ui/tool-call.js";
 import { ToolPermission } from "../ui/tool-permission.js";
 
-function timeAgo(isoString: string): string {
-    const seconds = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
-    if (seconds < 60) return "just now";
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    if (days === 1) return "yesterday";
-    if (days < 30) return `${days}d ago`;
-    return new Date(isoString).toLocaleDateString();
-}
-
 /** Events rendered inline during an agent turn */
 type AgentEvent =
     | { type: "tool_call"; call: ToolCall; safety: "safe" | "destructive" }
     | { type: "tool_result"; result: ToolResult }
-    | { type: "permission_prompt"; toolName: string; args: Record<string, unknown>; safety: "safe" | "destructive"; resolve: (decision: PermissionDecision) => void };
+    | { type: "permission_prompt"; toolCallId: string; toolName: string; args: Record<string, unknown>; safety: "safe" | "destructive"; resolve: (decision: PermissionDecision) => void };
 
 interface Props {
     modelId?: string;
@@ -48,95 +26,80 @@ interface Props {
 }
 
 function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: Props) {
-    const registry = useMemo(() => new ModelRegistry(), []);
-    const gateway = useMemo(() => new Gateway(registry), []);
+    const client = useMemo(() => new PantheonApiClient(getServerUrl()), []);
 
-    // Session management
-    const sessionManager = useMemo(() => new SessionManager(), []);
+    // Session state
     const [sessionId, setSessionId] = useState<string | null>(null);
-    const summaryFiredRef = useRef(false);
-
-    // Build episodic memory context (recent session summaries)
-    const episodicMemory = useMemo(() => {
-        try {
-            const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
-            if (!fastModelId) return "";
-            const summarizer = new SessionSummarizer(gateway, fastModelId);
-            const summaries = summarizer.getRecentSummaries(5);
-            if (summaries.length === 0) return "";
-            const lines = summaries.map(s => `- [${timeAgo(s.createdAt)}] "${s.title}" — ${s.summary}`);
-            return `\n\nYou have had these recent conversations with the user:\n${lines.join("\n")}`;
-        } catch {
-            return "";
-        }
-    }, []);
-
-    // Tool system — only initialized when tools are enabled
-    const sandbox = useMemo(
-        () => (noTools ? null : Sandbox.create(process.cwd())),
-        [noTools],
-    );
-    const toolRegistry = useMemo(() => {
-        if (noTools) return null;
-        const tr = new ToolRegistry();
-        registerBuiltinTools(tr);
-        return tr;
-    }, [noTools]);
-
-    const models = useMemo(() => registry.list(), [registry]);
-    const modelOptions = useMemo(
-        () => ["auto", ...models.map((m) => m.id)],
-        [models],
-    );
-
-    const [selectedIndex, setSelectedIndex] = useState(() => {
-        if (initialModelId) {
-            const idx = modelOptions.indexOf(initialModelId);
-            return idx >= 0 ? idx : 0;
-        }
-        return 0; // auto
-    });
-
     const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [isInitializing, setIsInitializing] = useState(true);
+
+    // Model selector (kept client-side for display only — routing happens server-side)
+    const [modelOptions, setModelOptions] = useState<string[]>(["auto"]);
+    const [selectedIndex, setSelectedIndex] = useState(0);
+
     const [input, setInput] = useState("");
     const [isStreaming, setIsStreaming] = useState(false);
     const [streamedText, setStreamedText] = useState("");
     const [decision, setDecision] = useState<RoutingDecision | null>(null);
     const [lastOutputChars, setLastOutputChars] = useState<number | null>(null);
     const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
-    // Events from the last completed agentic turn — rendered between the user
-    // message and the assistant response to preserve chronological order.
     const [completedEvents, setCompletedEvents] = useState<AgentEvent[]>([]);
 
-    // Initialize session on mount
+    const submittingRef = useRef(false);
+
+    // Fetch models and initialize session on mount
     useEffect(() => {
-        if (noSave) return;
+        (async () => {
+            try {
+                // Load model list from API
+                const { models, defaultModel } = await client.listModels();
+                const ids = models.map((m) => m.id);
+                setModelOptions(["auto", ...ids]);
 
-        if (resume) {
-            const session = typeof resume === "string"
-                ? sessionManager.get(resume)
-                : sessionManager.getLatest();
+                if (initialModelId) {
+                    const idx = ["auto", ...ids].indexOf(initialModelId);
+                    if (idx >= 0) setSelectedIndex(idx);
+                }
 
-            if (session) {
-                setSessionId(session.id);
-                const savedMessages = sessionManager.getMessages(session.id);
-                setMessages(savedMessages);
-            } else {
-                const id = sessionManager.create();
-                setSessionId(id);
+                // Resolve session
+                if (!noSave) {
+                    if (resume) {
+                        const targetId = typeof resume === "string" ? resume : undefined;
+                        if (targetId) {
+                            try {
+                                const session = await client.getSession(targetId);
+                                setSessionId(session.id);
+                                const msgs = await client.getSessionMessages(session.id);
+                                setMessages(msgs);
+                            } catch {
+                                // Session not found — start fresh
+                                setSessionId(null);
+                            }
+                        } else {
+                            // --resume with no id — get latest from list
+                            const sessions = await client.listSessions({ limit: 1 });
+                            if (sessions[0]) {
+                                const session = sessions[0];
+                                setSessionId(session.id);
+                                const msgs = await client.getSessionMessages(session.id);
+                                setMessages(msgs);
+                            }
+                        }
+                    }
+                    // Session ID will be assigned by the server on first chat call
+                }
+            } catch (err) {
+                // Server not reachable — we'll get an error when submitting
+            } finally {
+                setIsInitializing(false);
             }
-        } else {
-            const id = sessionManager.create();
-            setSessionId(id);
-        }
+        })();
     }, []);
 
-    const currentOption = modelOptions[selectedIndex]!;
+    const currentOption = modelOptions[selectedIndex] ?? "auto";
     const effectiveModelId = currentOption === "auto" ? undefined : currentOption;
     const isManual = currentOption !== "auto";
-    const displayModelId = isManual
-        ? currentOption
-        : (registry.getDefault()?.id ?? "auto");
+    const displayModelId = currentOption;
 
     useInput((ch, key) => {
         if (key.ctrl && ch.toLowerCase() === "c") process.exit(0);
@@ -145,27 +108,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
         }
     });
 
-    // Guard against double-submit: ink-text-input can fire onSubmit more than
-    // once per Enter keypress when the terminal echoes stdin back to Node.
-    const submittingRef = useRef(false);
-
-    /** Fire-and-forget background summary after enough messages */
-    const maybeGenerateSummary = useCallback((sid: string, msgs: ChatMessage[]) => {
-        if (noSave || summaryFiredRef.current) return;
-        // Only summarize after 4+ user/assistant messages
-        const turnCount = msgs.filter(m => m.role === "user" || m.role === "assistant").length;
-        if (turnCount < 4) return;
-        summaryFiredRef.current = true;
-
-        const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
-        if (!fastModelId) return;
-
-        const summarizer = new SessionSummarizer(gateway, fastModelId);
-        summarizer.saveForSession(sid, msgs).catch(() => { /* best-effort */ });
-    }, [noSave, registry, gateway]);
-
     const handleSubmit = useCallback(async (value: string) => {
-        if (!value.trim() || isStreaming || submittingRef.current) return;
+        if (!value.trim() || isStreaming || submittingRef.current || isInitializing) return;
         submittingRef.current = true;
 
         const userMessage: ChatMessage = {
@@ -173,11 +117,6 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
             content: value.trim(),
             timestamp: new Date(),
         };
-
-        // Persist user message
-        if (sessionId && !noSave) {
-            sessionManager.addMessage(sessionId, userMessage);
-        }
 
         const updated = [...messages, userMessage];
         setMessages(updated);
@@ -188,131 +127,117 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
         setAgentEvents([]);
         setCompletedEvents([]);
 
-        if (noTools || !sandbox || !toolRegistry) {
-            // Pure chat mode — v0.2 behavior
-            // Inject episodic memory into the message stream
-            const msgsForStream = episodicMemory
-                ? [{ role: "system" as const, content: episodicMemory }, ...updated]
-                : updated;
+        try {
+            let accumulatedText = "";
+            let finalSessionId = sessionId;
+            let iterations = 1;
 
-            const { generator, decision: newDecision } = await gateway.stream(
-                msgsForStream,
-                effectiveModelId,
-            );
-            setDecision(newDecision);
+            const stream = client.chat({
+                ...((!noSave && sessionId) ? { sessionId } : {}),
+                prompt: value.trim(),
+                ...(effectiveModelId ? { model: effectiveModelId } : {}),
+                ...((noTools) ? { noTools: true } : {}),
+                workingDir: process.cwd(),
+            });
 
-            let accumulated = "";
-            for await (const chunk of generator) {
-                accumulated += chunk;
-                setStreamedText(accumulated);
+            for await (const evt of stream) {
+                switch (evt.event) {
+                    case "routing":
+                        setDecision(evt.data as RoutingDecision);
+                        break;
+
+                    case "text":
+                        accumulatedText += evt.data.content;
+                        setStreamedText(accumulatedText);
+                        break;
+
+                    case "tool_call": {
+                        const d = evt.data;
+                        const call: ToolCall = { id: d.id, name: d.name, arguments: d.arguments };
+                        setAgentEvents((prev) => [...prev, { type: "tool_call", call, safety: d.safety }]);
+                        break;
+                    }
+
+                    case "tool_permission_required": {
+                        const d = evt.data;
+                        // Render permission prompt in TUI, resolve on user input
+                        await new Promise<void>((outerResolve) => {
+                            setAgentEvents((prev) => [
+                                ...prev,
+                                {
+                                    type: "permission_prompt",
+                                    toolCallId: d.toolCallId,
+                                    toolName: d.toolName,
+                                    args: d.args,
+                                    safety: d.safety,
+                                    resolve: async (decision: PermissionDecision) => {
+                                        await client.respondToToolPermission(d.toolCallId, decision);
+                                        outerResolve();
+                                    },
+                                },
+                            ]);
+                        });
+                        break;
+                    }
+
+                    case "tool_result": {
+                        const d = evt.data;
+                        const result: ToolResult = {
+                            toolCallId: d.toolCallId,
+                            name: "",
+                            content: d.content,
+                            isError: d.isError,
+                        };
+                        setAgentEvents((prev) => [...prev, { type: "tool_result", result }]);
+                        break;
+                    }
+
+                    case "done":
+                        finalSessionId = evt.data.sessionId;
+                        iterations = evt.data.iterations;
+                        break;
+
+                    case "error":
+                        accumulatedText = `Error: ${evt.data.message}`;
+                        setStreamedText(accumulatedText);
+                        break;
+                }
             }
+
+            // Update session id from server response
+            if (finalSessionId && !noSave) setSessionId(finalSessionId);
 
             const assistantMsg: ChatMessage = {
                 role: "assistant",
-                content: accumulated,
+                content: accumulatedText,
                 timestamp: new Date(),
             };
 
-            // Persist assistant message
-            if (sessionId && !noSave) {
-                sessionManager.addMessage(sessionId, assistantMsg);
-            }
+            setLastOutputChars(accumulatedText.length);
+            setCompletedEvents((current) => current);
+            setMessages([...updated, assistantMsg]);
+            setAgentEvents([]);
 
-            const newMessages = [...updated, assistantMsg];
-            setLastOutputChars(accumulated.length);
-            setMessages(newMessages);
-            setStreamedText("");
-            setIsStreaming(false);
-
-            // Try background summary
-            if (sessionId) maybeGenerateSummary(sessionId, newMessages);
-        } else {
-            // Agentic mode — tool use enabled
-            const permissionManager = new PermissionManager(
-                (toolName: string, args: Record<string, unknown>, safety: "safe" | "destructive") => {
-                    return new Promise<PermissionDecision>((resolve) => {
-                        setAgentEvents((prev) => [
-                            ...prev,
-                            { type: "permission_prompt", toolName, args, safety, resolve },
-                        ]);
-                    });
-                }
-            );
-
-            const agentRuntime = new AgentRuntime(gateway, toolRegistry, {
-                maxIterations: 10,
-                sandbox,
-                permissionManager,
-                ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
-                onToolCall: (call: ToolCall, safety: "safe" | "destructive") => {
-                    setAgentEvents((prev) => [
-                        ...prev,
-                        { type: "tool_call", call, safety },
-                    ]);
-                },
-                onToolResult: (result: ToolResult) => {
-                    setAgentEvents((prev) => [
-                        ...prev,
-                        { type: "tool_result", result },
-                    ]);
-                },
-            });
-
-            try {
-                const turnResult = await agentRuntime.run(updated, effectiveModelId);
-
-                const assistantMsg: ChatMessage = {
-                    role: "assistant",
-                    content: turnResult.response,
-                    timestamp: new Date(),
-                };
-
-                // Persist assistant message
-                if (sessionId && !noSave) {
-                    sessionManager.addMessage(sessionId, assistantMsg);
-                }
-
-                setDecision(turnResult.decision);
-                setLastOutputChars(turnResult.response.length);
-                // Freeze the events from this turn so they render in the correct
-                // order (before the assistant response) once the turn is done.
-                // Use the functional updater form to capture the current events
-                // without relying on the stale closure value of `agentEvents`.
-                setCompletedEvents((currentEvents) => currentEvents);
-
-                const newMessages = [...updated, assistantMsg];
-                setMessages(newMessages);
-                setAgentEvents([]);
-
-                // Try background summary
-                if (sessionId) maybeGenerateSummary(sessionId, newMessages);
-            } catch (error) {
-                const errorMsg = error instanceof Error ? error.message : String(error);
-                setMessages([
-                    ...updated,
-                    {
-                        role: "assistant",
-                        content: `Error: ${errorMsg}`,
-                        timestamp: new Date(),
-                    },
-                ]);
-            }
-
-            setStreamedText("");
-            setIsStreaming(false);
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            setMessages([
+                ...updated,
+                { role: "assistant", content: `Error: ${errorMsg}`, timestamp: new Date() },
+            ]);
         }
 
+        setStreamedText("");
+        setIsStreaming(false);
         submittingRef.current = false;
-    }, [messages, isStreaming, effectiveModelId, gateway, noTools, sandbox, toolRegistry, sessionId, noSave, episodicMemory, maybeGenerateSummary, sessionManager]);
+    }, [messages, isStreaming, effectiveModelId, client, noTools, sessionId, noSave, isInitializing]);
 
     return (
         <Box flexDirection="column" padding={1}>
-            {/* Message history — interleave completed tool events before the last assistant response */}
+            {/* Message history */}
             {messages.map((msg, i) => {
                 const isLastAssistant = msg.role === "assistant" && i === messages.length - 1;
                 return (
                     <React.Fragment key={i}>
-                        {/* Render completed tool events just before the last assistant message */}
                         {isLastAssistant && completedEvents.map((event, ei) => {
                             switch (event.type) {
                                 case "tool_call":
@@ -337,24 +262,13 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                 );
             })}
 
-            {/* Agent events (tool calls, results, permission prompts) */}
+            {/* Live agent events */}
             {agentEvents.map((event, i) => {
                 switch (event.type) {
                     case "tool_call":
-                        return (
-                            <ToolCallDisplay
-                                key={`tc-${i}`}
-                                call={event.call}
-                                safety={event.safety}
-                            />
-                        );
+                        return <ToolCallDisplay key={`tc-${i}`} call={event.call} safety={event.safety} />;
                     case "tool_result":
-                        return (
-                            <ToolResultDisplay
-                                key={`tr-${i}`}
-                                result={event.result}
-                            />
-                        );
+                        return <ToolResultDisplay key={`tr-${i}`} result={event.result} />;
                     case "permission_prompt":
                         return (
                             <ToolPermission
@@ -368,10 +282,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                 }
             })}
 
-            {/* Streaming in progress */}
             {isStreaming && <StreamingMessage text={streamedText} />}
 
-            {/* Input box */}
             <InputBox
                 value={input}
                 onChange={setInput}
@@ -382,7 +294,6 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                 isStreaming={isStreaming}
             />
 
-            {/* Keyboard hints + Status bar */}
             <KeyHints />
             <StatusBar
                 modelId={displayModelId}
@@ -393,8 +304,7 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
     );
 }
 
-// Logo is printed ONCE to stdout before Ink mounts.
-// This prevents re-render artifacts — Ink never touches these lines.
+// Logo printed once before Ink mounts
 const LOGO_LINES: readonly [string, string][] = [
     [" ██████╗  █████╗ ███╗   ██╗████████╗██╗  ██╗███████╗ ██████╗ ███╗   ██╗", "#FFD700"],
     [" ██╔══██╗██╔══██╗████╗  ██║╚══██╔══╝██║  ██║██╔════╝██╔═══██╗████╗  ██║", "#F9BD18"],
@@ -404,22 +314,25 @@ const LOGO_LINES: readonly [string, string][] = [
     [" ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝", "#C68A1A"],
 ];
 
-export function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean) {
-    // Print logo to stdout before Ink takes over — static text
-    // that Ink's re-render cycle will never touch
+export async function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean) {
+    // Auto-start the server if not running
+    try {
+        await ensureServerRunning();
+    } catch (err) {
+        console.error(chalk.red(`\n  ✗ Cannot start Pantheon server: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(chalk.hex("#6B7280")("  Run `pnpm turbo build` to build the server, then try again.\n"));
+        process.exit(1);
+    }
+
     console.log("");
     for (const [line, color] of LOGO_LINES) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.4.0"));
+    console.log(chalk.hex("#6B7280")("                              v0.5.0"));
     console.log("");
 
     if (resume) {
-        const sm = new SessionManager();
-        const session = typeof resume === "string" ? sm.get(resume) : sm.getLatest();
-        if (session) {
-            console.log(chalk.hex("#56B6C2")(`  Resuming: ${session.title} (${session.id.slice(0, 8)}…)\n`));
-        }
+        console.log(chalk.hex("#56B6C2")(`  Resuming session...\n`));
     }
 
     if (noTools) {

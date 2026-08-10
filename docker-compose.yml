@@ -10,3 +10,18 @@ services:
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
     restart: unless-stopped
+
+  pantheon-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: pantheon-server
+    ports:
+      - "3000:3000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - NODE_ENV=${NODE_ENV:-production}
+    depends_on:
+      - litellm
+    restart: unless-stopped

@@ -20,6 +20,18 @@ const BLOCKED_COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string 
     { pattern: />\s*\/dev\/sd[a-z]/, reason: "writing to block devices is not allowed" },
     { pattern: /\bcurl\b.*\|\s*(bash|sh|zsh)/, reason: "piping curl to shell is not allowed" },
     { pattern: /\bwget\b.*\|\s*(bash|sh|zsh)/, reason: "piping wget to shell is not allowed" },
+    // --- Bypass / code-execution patterns ---
+    { pattern: /\beval\b/, reason: "eval is not allowed — potential code injection" },
+    { pattern: /`[^`]+`/, reason: "backtick sub-shell substitution is not allowed" },
+    { pattern: /\$\([^)]+\)/, reason: "command substitution $(...) is not allowed" },
+    { pattern: /\bbase64\b.*\|\s*(bash|sh|zsh|python|perl|ruby|node)/, reason: "base64 decode-exec pipeline is not allowed" },
+    { pattern: /\bpython[23]?\s+(-c|-m)/, reason: "python -c/-m exec is not allowed" },
+    { pattern: /\bperl\s+-e/, reason: "perl -e exec is not allowed" },
+    { pattern: /\bruby\s+-e/, reason: "ruby -e exec is not allowed" },
+    { pattern: /\bnode\s+-e/, reason: "node -e exec is not allowed" },
+    { pattern: />\s*\/proc\/self/, reason: "writing to /proc/self is not allowed" },
+    { pattern: /\bchroot\b/, reason: "chroot is not allowed" },
+    { pattern: /\bnsenter\b/, reason: "nsenter is not allowed" },
 ];
 
 /**
@@ -73,12 +85,22 @@ export class Sandbox {
         // verify the resolved path itself is within the jail
         this._assertWithinJail(resolved, inputPath);
 
-        // Also check the parent directory (if it exists) for symlink escapes
-        const parentDir = path.dirname(resolved);
-        if (fs.existsSync(parentDir)) {
-            const realParent = fs.realpathSync(parentDir);
-            // The real parent must still be within the project root
-            this._assertWithinJail(realParent, inputPath);
+        // Walk every existing ancestor segment to catch multi-hop symlink escapes.
+        // e.g. if projectRoot/a/b is a symlink chain pointing outside, and c.txt doesn't
+        // exist yet, we need to detect the escape via 'b' or 'a' before it's too late.
+        let ancestor = path.dirname(resolved);
+        while (true) {
+            if (fs.existsSync(ancestor)) {
+                const realAncestor = fs.realpathSync(ancestor);
+                this._assertWithinJail(realAncestor, inputPath);
+                // Once we've verified an ancestor that is within the jail we can stop;
+                // parent directories further up are implicitly within the jail if this one is.
+                break;
+            }
+            const parent = path.dirname(ancestor);
+            // Reached filesystem root without finding an existing segment—stop.
+            if (parent === ancestor) break;
+            ancestor = parent;
         }
 
         return resolved;

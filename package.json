@@ -1,7 +1,7 @@
 {
   "name": "Pantheon",
-  "version": "0.4.0",
-  "packageManager": "pnpm@9.15.9",
+  "version": "0.5.0",
+  "packageManager": "pnpm@11.20.0",
   "description": "",
   "main": "index.js",
   "scripts": {

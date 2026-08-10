@@ -10,6 +10,8 @@ import { chatCommand } from "./commands/chat.js";
 import { listModels, addModel, removeModel, setDefaultModel } from "./commands/models.js";
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
 import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./commands/sessions.js";
+import { traceList, traceShow, traceClear } from "./commands/trace.js";
+import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 
 // Brand colors matching theme.ts
 const brand = chalk.hex("#F5A623");
@@ -32,7 +34,7 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(`${dim("                              v0.4.0")}`);
+    console.log(`${dim("                              v0.5.0")}`);
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
@@ -47,13 +49,18 @@ function showWelcome() {
     console.log(`  ${accent("sessions archive")} ${muted("<id>")} ${dim("Archive a session")}`);
     console.log("");
     console.log(`  ${accent("models list")}         ${dim("List configured models")}`);
-    console.log(`  ${accent("models add")}          ${dim("Add a new model")}`);
-    console.log(`  ${accent("models remove")} ${muted("<id>")}  ${dim("Remove a model")}`);
     console.log(`  ${accent("models default")} ${muted("<id>")} ${dim("Set the default model")}`);
     console.log("");
     console.log(`  ${accent("cost")}                ${dim("Show usage summary")}`);
     console.log(`  ${accent("cost recent")}         ${dim("Show recent calls")}`);
     console.log(`  ${accent("cost reset")}          ${dim("Clear all usage data")}`);
+    console.log("");
+    console.log(`  ${accent("trace list")}          ${dim("List recent execution traces")}`);
+    console.log(`  ${accent("trace show")} ${muted("<id>")}      ${dim("Show trace waterfall")}`);
+    console.log(`  ${accent("trace clear")}         ${dim("Clear all trace data")}`);
+    console.log("");
+    console.log(`  ${accent("server status")}       ${dim("Check if the API server is running")}`);
+    console.log(`  ${accent("server stop")}         ${dim("Stop the background API server")}`);
     console.log("");
     console.log(`  ${dim("Run")} ${accent("pantheon <command> --help")} ${dim("for more info")}`);
     console.log("");
@@ -64,7 +71,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.4.0")
+    .version("0.5.0")
     .action(() => {
         showWelcome();
     });
@@ -83,24 +90,26 @@ program
         opts.save === false ? true : undefined,
     ));
 
+// ── Models ────────────────────────────────────────────────────────────────────
+
 const modelsCmd = program.command("models").description("Manage models");
 
 modelsCmd
-    .command("list")
+    .command("list", { isDefault: true })
     .description("List configured models")
     .action(listModels);
 
 modelsCmd
     .command("add")
-    .description("Add a model")
-    .requiredOption("--id <id>", "Model ID (must match LiteLLM config)")
+    .description("Add a model (edit ~/.pantheon/config.yml directly in v0.5)")
+    .requiredOption("--id <id>", "Model ID")
     .requiredOption("--provider <provider>", "Provider name")
     .option("--name <name>", "Display name")
     .action((opts) => addModel(opts.id, opts.provider, opts.name));
 
 modelsCmd
     .command("remove")
-    .description("Remove a model")
+    .description("Remove a model (edit ~/.pantheon/config.yml directly in v0.5)")
     .argument("<id>", "Model ID to remove")
     .action(removeModel);
 
@@ -109,6 +118,8 @@ modelsCmd
     .description("Set the default model")
     .argument("<id>", "Model ID to set as default")
     .action(setDefaultModel);
+
+// ── Cost ──────────────────────────────────────────────────────────────────────
 
 const costCmd = program.command("cost").description("View usage and cost stats");
 
@@ -127,6 +138,8 @@ costCmd
     .command("reset")
     .description("Clear all usage data")
     .action(costReset);
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
 
 const sessionsCmd = program.command("sessions").description("Manage chat sessions");
 
@@ -154,5 +167,61 @@ sessionsCmd
     .description("Archive a session")
     .argument("<id>", "Session ID")
     .action(sessionsArchive);
+
+// ── Trace ─────────────────────────────────────────────────────────────────────
+
+const traceCmd = program.command("trace").description("View execution traces");
+
+traceCmd
+    .command("list", { isDefault: true })
+    .description("List recent traces")
+    .option("-n, --limit <n>", "Number of traces to show", "20")
+    .action((opts) => traceList({ limit: Number(opts.limit) }));
+
+traceCmd
+    .command("show")
+    .description("Show trace waterfall for a trace ID")
+    .argument("<id>", "Trace ID")
+    .action(traceShow);
+
+traceCmd
+    .command("clear")
+    .description("Clear all trace data")
+    .action(traceClear);
+
+// ── Server ────────────────────────────────────────────────────────────────────
+
+const serverCmd = program.command("server").description("Manage the Pantheon API server");
+
+serverCmd
+    .command("start")
+    .description("Start the Pantheon API server in the background")
+    .action(async () => {
+        try {
+            await ensureServerRunning();
+            console.log(chalk.green(`  ✓ Pantheon server is running on ${getServerUrl()}`));
+        } catch (err) {
+            console.error(chalk.red(`  ✗ ${err instanceof Error ? err.message : String(err)}`));
+            process.exit(1);
+        }
+    });
+
+serverCmd
+    .command("stop")
+    .description("Stop the background Pantheon API server")
+    .action(() => stopServer());
+
+serverCmd
+    .command("status")
+    .description("Check if the Pantheon API server is running")
+    .action(async () => {
+        const running = await isServerRunning();
+        const pid = getServerPid();
+        if (running) {
+            console.log(chalk.green(`  ✓ Pantheon server is running on ${getServerUrl()}${pid ? ` (PID ${pid})` : ""}`));
+        } else {
+            console.log(dim("  Pantheon server is not running. Use `pantheon server start` or `pantheon chat`."));
+        }
+    });
 
 program.parse();
