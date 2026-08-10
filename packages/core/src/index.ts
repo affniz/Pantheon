@@ -16,3 +16,6 @@ export { getDb, createTestDb, closeDb } from "./db/client.js";
 export type { PantheonDatabase } from "./db/client.js";
 export { SessionManager } from "./session/session-manager.js";
 export { SessionSummarizer } from "./session/summarizer.js";
+export { Tracer } from "./tracing/tracer.js";
+export { TraceCollector } from "./tracing/collector.js";
+export { TraceStore } from "./tracing/store.js";

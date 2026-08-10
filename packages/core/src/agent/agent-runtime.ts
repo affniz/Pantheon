@@ -8,6 +8,7 @@ import type { Gateway } from "../gateway/gateway.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
+import { Tracer } from "../tracing/tracer.js";
 
 const BASE_SYSTEM_PROMPT = `You are Pantheon, an AI assistant with access to tools for interacting with the local filesystem and shell.
 
@@ -35,6 +36,15 @@ export interface AgentConfig {
     onToolCall?: (call: ToolCall, safety: "safe" | "destructive") => void;
     /** Called when a tool returns a result (for UI rendering) */
     onToolResult?: (result: ToolResult) => void;
+    /**
+     * Optional traceId to associate this agent turn with an existing trace.
+     * If provided, spans from this turn are recorded under that traceId.
+     */
+    traceId?: string;
+    /**
+     * Optional sessionId to attach to spans for cross-referencing with sessions.
+     */
+    sessionId?: string;
 }
 
 export interface AgentTurnResult {
@@ -44,10 +54,12 @@ export interface AgentTurnResult {
     toolCalls: ToolCall[];
     /** All tool results received during this turn */
     toolResults: ToolResult[];
-    /** The routing decision used */
+    /** The routing decision used (may differ from the initial decision if escalated) */
     decision: RoutingDecision;
     /** Number of loop iterations used */
     iterations: number;
+    /** Whether the model was escalated mid-turn due to repeated errors */
+    escalated: boolean;
 }
 
 /**
@@ -76,183 +88,269 @@ export class AgentRuntime {
 
     /**
      * Run a single agent turn. Handles the full ReAct loop.
+     * Wraps the entire turn in an "agent.turn" span; each tool execution
+     * gets a child "tool.<name>" span.
      */
     async run(
         messages: ChatMessage[],
         modelId?: string
     ): Promise<AgentTurnResult> {
-        // Resolve routing once for the entire turn
-        const decision = await this.gateway.resolveRouting(messages, modelId);
-        const effectiveModelId = decision.selectedModelId;
+        const runFn = async (): Promise<AgentTurnResult> => {
+            // Resolve routing once for the entire turn
+            const decision = await this.gateway.resolveRouting(messages, modelId);
 
-        const systemPrompt = this.config.systemPrompt
-            ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
-            : BASE_SYSTEM_PROMPT;
+            const systemPrompt = this.config.systemPrompt
+                ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
+                : BASE_SYSTEM_PROMPT;
 
-        // Build the working message list with system prompt
-        const workingMessages: ChatMessage[] = [
-            { role: "system", content: systemPrompt },
-            ...messages,
-        ];
+            // Build the working message list with system prompt
+            const workingMessages: ChatMessage[] = [
+                { role: "system", content: systemPrompt },
+                ...messages,
+            ];
 
-        const allToolCalls: ToolCall[] = [];
-        const allToolResults: ToolResult[] = [];
-        const tools = this.toolRegistry.toOpenAITools();
+            const allToolCalls: ToolCall[] = [];
+            const allToolResults: ToolResult[] = [];
+            const tools = this.toolRegistry.toOpenAITools();
 
-        let iterations = 0;
+            let iterations = 0;
+            let errorIterations = 0; // consecutive iterations ending in tool errors/denials
+            const ESCALATION_THRESHOLD = 3; // escalate after this many error iterations
+            let escalated = false;
+            let currentDecision = decision; // may be updated mid-turn on escalation
 
-        while (iterations < this.config.maxIterations) {
-            iterations++;
+            while (iterations < this.config.maxIterations) {
+                iterations++;
 
-            // Send to LLM with tool definitions
-            let message: import("@pantheon/shared").ChatMessage;
-            try {
-                const result = await this.gateway.complete(
-                    workingMessages,
-                    effectiveModelId,
-                    tools.length > 0 ? tools : undefined
-                );
-                message = result.message;
-            } catch (apiError) {
-                // The LLM generated a malformed/hallucinated tool call that the API rejected.
-                // Inject the error into the conversation and try to get a graceful text response.
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError);
-                workingMessages.push({
-                    role: "user",
-                    content:
-                        `A tool call attempt failed with an API error: ${errMsg}\n` +
-                        "Please summarize what you accomplished so far and provide a final response without calling any more tools.",
-                });
-                const fallback = await this.gateway.complete(
-                    workingMessages,
-                    effectiveModelId
-                    // No tools — force plain text
-                );
-                return {
-                    response: fallback.message.content,
-                    toolCalls: allToolCalls,
-                    toolResults: allToolResults,
-                    decision,
-                    iterations,
-                };
-            }
-
-            // If no tool calls → this is the final response
-            if (!message.toolCalls || message.toolCalls.length === 0) {
-                return {
-                    response: message.content,
-                    toolCalls: allToolCalls,
-                    toolResults: allToolResults,
-                    decision,
-                    iterations,
-                };
-            }
-
-            // LLM wants to call tools — add the assistant message to history
-            workingMessages.push(message);
-
-            // Execute each tool call
-            for (const toolCall of message.toolCalls) {
-                allToolCalls.push(toolCall);
-
-                const tool = this.toolRegistry.get(toolCall.name);
-                if (!tool) {
-                    // Unknown tool — return error to LLM
-                    const result: ToolResult = {
-                        toolCallId: toolCall.id,
-                        name: toolCall.name,
-                        content: `Error: Unknown tool "${toolCall.name}". Available tools: ${this.toolRegistry.list().map((t) => t.definition.name).join(", ")}`,
-                        isError: true,
-                    };
-                    allToolResults.push(result);
-                    this.config.onToolResult?.(result);
-                    workingMessages.push({
-                        role: "tool",
-                        content: result.content,
-                        toolCallId: toolCall.id,
-                    });
-                    continue;
+                // Mid-turn escalation: if repeated errors, re-route to the complex tier
+                if (!escalated && errorIterations >= ESCALATION_THRESHOLD) {
+                    try {
+                        const escalatedDecision = await this.gateway.resolveRouting(messages, undefined);
+                        // Only escalate if the complex tier gives us a different (better) model
+                        const routingConfig = (this.gateway as any).registry?.getRoutingConfig?.();
+                        const complexModelId = routingConfig?.tiers?.complex;
+                        if (complexModelId && complexModelId !== currentDecision.selectedModelId) {
+                            currentDecision = {
+                                tier: "complex",
+                                selectedModelId: complexModelId,
+                                reason: `auto-escalated after ${errorIterations} error iterations`,
+                            };
+                            escalated = true;
+                            process.stderr.write(
+                                `[agent] escalating to ${complexModelId} after ${errorIterations} error iterations\n`
+                            );
+                        }
+                    } catch {
+                        // If escalation routing fails, continue with current model
+                    }
+                    errorIterations = 0; // reset counter after escalation attempt
                 }
 
-                const safety = tool.definition.safety;
-
-                // Notify UI about the tool call
-                this.config.onToolCall?.(toolCall, safety);
-
-                // Check permissions
-                const permitted = await this.config.permissionManager.check(
-                    toolCall.name,
-                    toolCall.arguments,
-                    safety
-                );
-
-                if (!permitted) {
-                    // User denied — tell the LLM
-                    const result: ToolResult = {
-                        toolCallId: toolCall.id,
-                        name: toolCall.name,
-                        content: "Tool call denied by user. Please try a different approach or ask the user for guidance.",
-                        isError: true,
-                    };
-                    allToolResults.push(result);
-                    this.config.onToolResult?.(result);
-                    workingMessages.push({
-                        role: "tool",
-                        content: result.content,
-                        toolCallId: toolCall.id,
-                    });
-                    continue;
-                }
-
-                // Execute the tool through the sandbox
-                let content: string;
-                let isError = false;
+                // Send to LLM with tool definitions
+                let message: import("@pantheon/shared").ChatMessage;
                 try {
-                    content = await tool.execute(toolCall.arguments, this.config.sandbox);
-                } catch (error) {
-                    content = `Error executing tool: ${error instanceof Error ? error.message : String(error)}`;
-                    isError = true;
+                    const result = await this.gateway.complete(
+                        workingMessages,
+                        currentDecision.selectedModelId,
+                        tools.length > 0 ? tools : undefined
+                    );
+                    message = result.message;
+                } catch (apiError) {
+                    // The LLM generated a malformed/hallucinated tool call that the API rejected.
+                    // Inject the error as role:"tool" with a synthetic toolCallId so the
+                    // conversation history stays semantically correct (not as role:"user").
+                    const errMsg = apiError instanceof Error ? apiError.message : String(apiError);
+                    const syntheticId = `api_error_${Date.now()}`;
+                    workingMessages.push({
+                        role: "tool",
+                        content:
+                            `API error: ${errMsg}. ` +
+                            "Please summarize what you accomplished so far and provide a final response without calling any more tools.",
+                        toolCallId: syntheticId,
+                    });
+                    const fallback = await this.gateway.complete(
+                        workingMessages,
+                        currentDecision.selectedModelId
+                        // No tools — force plain text
+                    );
+                    return {
+                        response: fallback.message.content,
+                        toolCalls: allToolCalls,
+                        toolResults: allToolResults,
+                        decision: currentDecision,
+                        iterations,
+                        escalated,
+                    };
                 }
 
-                const result: ToolResult = {
-                    toolCallId: toolCall.id,
-                    name: toolCall.name,
-                    content,
-                    isError,
-                };
+                // If no tool calls → this is the final response
+                if (!message.toolCalls || message.toolCalls.length === 0) {
+                    return {
+                        response: message.content,
+                        toolCalls: allToolCalls,
+                        toolResults: allToolResults,
+                        decision: currentDecision,
+                        iterations,
+                        escalated,
+                    };
+                }
 
-                allToolResults.push(result);
-                this.config.onToolResult?.(result);
+                // LLM wants to call tools — add the assistant message to history
+                workingMessages.push(message);
 
-                // Add tool result to message history for the next LLM turn
-                workingMessages.push({
-                    role: "tool",
-                    content: result.content,
-                    toolCallId: toolCall.id,
-                });
+                // Track whether this iteration produced any errors
+                let iterationHadErrors = false;
+
+                // Execute each tool call
+                for (const toolCall of message.toolCalls) {
+                    allToolCalls.push(toolCall);
+
+                    const tool = this.toolRegistry.get(toolCall.name);
+                    if (!tool) {
+                        // Unknown tool — return error to LLM
+                        const result: ToolResult = {
+                            toolCallId: toolCall.id,
+                            name: toolCall.name,
+                            content: `Error: Unknown tool "${toolCall.name}". Available tools: ${this.toolRegistry.list().map((t) => t.definition.name).join(", ")}`,
+                            isError: true,
+                        };
+                        allToolResults.push(result);
+                        this.config.onToolResult?.(result);
+                        workingMessages.push({
+                            role: "tool",
+                            content: result.content,
+                            toolCallId: toolCall.id,
+                        });
+                        iterationHadErrors = true;
+                        continue;
+                    }
+
+                    const safety = tool.definition.safety;
+
+                    // Notify UI about the tool call
+                    this.config.onToolCall?.(toolCall, safety);
+
+                    // Check permissions
+                    const permitted = await this.config.permissionManager.check(
+                        toolCall.name,
+                        toolCall.arguments,
+                        safety
+                    );
+
+                    if (!permitted) {
+                        // User denied — tell the LLM
+                        const result: ToolResult = {
+                            toolCallId: toolCall.id,
+                            name: toolCall.name,
+                            content: "Tool call denied by user. Please try a different approach or ask the user for guidance.",
+                            isError: true,
+                        };
+                        allToolResults.push(result);
+                        this.config.onToolResult?.(result);
+                        workingMessages.push({
+                            role: "tool",
+                            content: result.content,
+                            toolCallId: toolCall.id,
+                        });
+                        iterationHadErrors = true;
+                        continue;
+                    }
+
+                    // Execute the tool through the sandbox — wrapped in a tracing span
+                    let content: string;
+                    let isError = false;
+                    await Tracer.startSpan(
+                        `tool.${toolCall.name}`,
+                        "tool",
+                        async (toolSpan) => {
+                            toolSpan.attributes.toolName = toolCall.name;
+                            toolSpan.attributes.safety = safety;
+                            toolSpan.attributes.args = toolCall.arguments;
+                            try {
+                                content = await tool.execute(toolCall.arguments, this.config.sandbox);
+                                toolSpan.attributes.outputLength = content.length;
+                            } catch (error) {
+                                content = `Error executing tool: ${error instanceof Error ? error.message : String(error)}`;
+                                isError = true;
+                                throw error; // Let Tracer mark span as error
+                            }
+                        }
+                    ).catch(() => {
+                        // Error already captured in span; isError already set
+                    });
+
+                    const result: ToolResult = {
+                        toolCallId: toolCall.id,
+                        name: toolCall.name,
+                        content: content!,
+                        isError,
+                    };
+
+                    if (isError) iterationHadErrors = true;
+
+                    allToolResults.push(result);
+                    this.config.onToolResult?.(result);
+
+                    // Add tool result to message history for the next LLM turn
+                    workingMessages.push({
+                        role: "tool",
+                        content: result.content,
+                        toolCallId: toolCall.id,
+                    });
+                }
+
+                // Track consecutive error iterations for escalation
+                if (iterationHadErrors) {
+                    errorIterations++;
+                } else {
+                    errorIterations = 0; // reset on a clean iteration
+                }
             }
-        }
 
-        // Max iterations reached — ask the LLM for a final summary
-        workingMessages.push({
-            role: "user",
-            content:
-                "You have reached the maximum number of tool-call iterations. " +
-                "Please provide your final response based on the information gathered so far.",
-        });
+            // Max iterations reached — ask the LLM for a final summary
+            workingMessages.push({
+                role: "user",
+                content:
+                    "You have reached the maximum number of tool-call iterations. " +
+                    "Please provide your final response based on the information gathered so far.",
+            });
 
-        const { message: finalMessage } = await this.gateway.complete(
-            workingMessages,
-            effectiveModelId
-            // No tools — force a text response
+            const { message: finalMessage } = await this.gateway.complete(
+                workingMessages,
+                currentDecision.selectedModelId
+                // No tools — force a text response
+            );
+
+            return {
+                response: finalMessage.content,
+                toolCalls: allToolCalls,
+                toolResults: allToolResults,
+                decision: currentDecision,
+                iterations,
+                escalated,
+            };
+        }; // end runFn
+
+
+        // Wrap the entire agent turn in a trace context + root span
+        return Tracer.startTrace(
+            this.config.sessionId,
+            async (traceId) => {
+                return Tracer.startSpan(
+                    "agent.turn",
+                    "agent",
+                    async (span) => {
+                        span.attributes.modelId = modelId ?? "auto";
+                        const result = await runFn();
+                        span.attributes.iterations = result.iterations;
+                        span.attributes.toolCallCount = result.toolCalls.length;
+                        span.attributes.selectedModelId = result.decision.selectedModelId;
+                        span.attributes.routingTier = result.decision.tier;
+                        span.attributes.escalated = result.escalated;
+                        return result;
+                    }
+                );
+            }
         );
-
-        return {
-            response: finalMessage.content,
-            toolCalls: allToolCalls,
-            toolResults: allToolResults,
-            decision,
-            iterations,
-        };
     }
 }

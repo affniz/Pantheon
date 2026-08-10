@@ -10,6 +10,34 @@ Pantheon is an orchestration layer for AI models. Rather than locking you into a
 
 ---
 
+## v0.5 — Observability & API Server
+
+Every LLM call, tool invocation, and routing decision is now **fully traced**. A lightweight Hono API server replaces direct core imports in the CLI — the CLI is now a thin HTTP client. Rate limiting and Sentry error monitoring are built in from the start.
+
+### What's new in v0.5
+
+- **Pantheon API server** — Hono on `:3000`. All CLI commands go through the API. The server auto-starts in the background on the first `pantheon chat` and persists across terminal sessions.
+- **Structured tracing** — Every agent turn, LLM call, routing decision, and tool execution is wrapped in an OpenTelemetry-style span. Spans are persisted to SQLite non-blockingly via `queueMicrotask`.
+- **Trace explorer** — Browse and inspect traces from the CLI. The waterfall view shows the full span tree with offsets, durations, and status.
+- **Rate limiting** — `hono-rate-limiter`: 100 req/IP/min globally, 15 req/IP/min on the LLM endpoint.
+- **Sentry integration** — Error monitoring from day one of network exposure. No-op in local dev if `SENTRY_DSN` is unset.
+- **Server lifecycle commands** — `pantheon server start/stop/status`.
+
+### New commands
+
+```bash
+pantheon trace list               # list recent execution traces (default: 20)
+pantheon trace list --limit 50    # list more
+pantheon trace show <id>          # show trace waterfall for a specific trace
+pantheon trace clear              # clear all trace data
+
+pantheon server start             # start the API server in the background
+pantheon server stop              # stop the background server
+pantheon server status            # check if the server is running (shows PID + URL)
+```
+
+---
+
 ## v0.4 — Memory & Persistence
 
 Sessions are now **automatically saved**. Every conversation is stored in a local SQLite database (`~/.pantheon/pantheon.db`) and can be resumed at any time. Previous conversations are summarized by the LLM and injected as **episodic memory context** into future chats — so Pantheon remembers what you've worked on before.
@@ -24,48 +52,47 @@ Sessions are now **automatically saved**. Every conversation is stored in a loca
 - **Drizzle ORM** — All database access now goes through Drizzle, making the future Postgres migration (v0.9) a configuration change, not a rewrite.
 - **CI fix** — Resolved `pnpm/action-setup@v4` version resolution; tests now run from the monorepo root via `pnpm vitest run`.
 
-### New commands
-
-```bash
-pantheon sessions list              # list recent sessions (default: 10)
-pantheon sessions list -n 20        # list more sessions
-pantheon sessions list --all        # include archived sessions
-pantheon sessions show <id>         # show session details + summary
-pantheon sessions delete <id>       # permanently delete (with confirmation)
-pantheon sessions archive <id>      # soft-delete a session
-
-pantheon chat --resume              # resume the latest session
-pantheon chat --resume <id>         # resume a specific session
-pantheon chat --no-save             # run without saving the session
-```
-
 ---
 
-## v0.3 — Tool Use, Agent Runtime & Sandboxing
-
-Pantheon is an **agentic system**. The LLM can call tools — read files, write files, list directories, and run shell commands — with a ReAct-style agent loop that handles multi-step reasoning autonomously.
-
-**Safety-first**: All tools are sandboxed to the project root. Destructive tools (`writeFile`, `shell`) always require user confirmation. Safe tools (`readFile`, `listDirectory`) prompt on first use with the option to allow once or always allow for the session.
-
-### All commands
+## All Commands
 
 ```bash
 pantheon                          # branded welcome screen
+
+# Chat
 pantheon chat                     # agentic chat — tools enabled, session saved
 pantheon chat --resume            # resume the last session
 pantheon chat --resume <id>       # resume a specific session
 pantheon chat --no-save           # chat without saving
 pantheon chat --no-tools          # pure chat mode (no tool access)
 pantheon chat --model llama-fast  # manual model override
-pantheon sessions list            # list recent sessions
-pantheon sessions show <id>       # show session details
-pantheon sessions delete <id>     # delete a session
-pantheon sessions archive <id>    # archive a session
+
+# Sessions
+pantheon sessions list            # list recent sessions (default: 10)
+pantheon sessions list -n 20      # list more sessions
+pantheon sessions list --all      # include archived sessions
+pantheon sessions show <id>       # show session details + summary
+pantheon sessions delete <id>     # permanently delete (with confirmation)
+pantheon sessions archive <id>    # soft-delete a session
+
+# Models
 pantheon models list              # list configured models
 pantheon models default <id>      # change the default model
+
+# Cost
 pantheon cost                     # show total usage summary
 pantheon cost recent              # show last 10 calls
 pantheon cost reset               # clear usage data
+
+# Traces (v0.5)
+pantheon trace list               # list recent execution traces
+pantheon trace show <id>          # show trace waterfall
+pantheon trace clear              # clear all trace data
+
+# Server (v0.5)
+pantheon server start             # start API server in the background
+pantheon server stop              # stop the background server
+pantheon server status            # check server status
 ```
 
 ### Chat TUI
@@ -127,43 +154,54 @@ docker compose up -d
 pantheon chat
 ```
 
+The Pantheon API server starts automatically in the background on the first `pantheon chat`. You can also start it manually with `pantheon server start`.
+
 ---
 
 ## Architecture
 
 ```
-pantheon chat "Read src/index.ts and explain it"
+pantheon chat
      │
      ▼
-  CLI (Ink TUI)
-     │
-     ├── SessionManager              ← create / resume / persist sessions
-     ├── SessionSummarizer           ← episodic memory injection
-     ├── Sandbox(projectRoot: cwd)   ← path jail + command validation
-     ├── PermissionManager           ← two-tier confirmation
-     │
+ensureServerRunning()           ← spawns server as detached background process
+     │                            writes ~/.pantheon/server-port
      ▼
-  AgentRuntime (@pantheon/core)
+PantheonApiClient (HTTP)
      │
-     ├── 1. Classify → Route to model
-     │
-     ├── 2. Gateway.complete() ──→ LiteLLM ──→ Groq
-     │        │
-     │        ▼
-     ├── 3. LLM returns tool_calls?
-     │     YES → PermissionManager → Sandbox → ToolRegistry
-     │           ├── readFile()      (safe)
-     │           ├── writeFile()     (destructive)
-     │           ├── listDirectory() (safe)
-     │           └── shell()         (destructive)
-     │           → Append results → Loop to step 2
-     │     NO  → Stream final text response
-     │
+     │  POST /api/chat  (SSE stream)
      ▼
-  Persist messages + trigger background summarization
-     │
-     ▼
-  Display in TUI
+┌─────────────────────────────────────────┐
+│         Hono API Server (:3000)         │
+│                                         │
+│  ├── sentryMiddleware                   │
+│  ├── requestLogger                      │
+│  ├── globalRateLimiter  (100/IP/min)    │
+│  └── llmRateLimiter     (15/IP/min)     │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+            AgentRuntime
+                   │
+     Tracer.startTrace(sessionId)
+                   │
+       ┌───────────▼────────────┐
+       │   span: agent.turn     │
+       │                        │
+       │  ┌─────────────────┐   │
+       │  │ router.classify │   │   ← routing span
+       │  └─────────────────┘   │
+       │                        │
+       │  ┌─────────────────┐   │
+       │  │ llm.completion  │   │   ← LLM span (tokens, model)
+       │  └─────────────────┘   │
+       │                        │
+       │  ┌─────────────────┐   │
+       │  │ tool.<name>     │   │   ← tool span (args, safety)
+       │  └─────────────────┘   │
+       └────────────────────────┘
+                   │
+     TraceCollector.record(span)  ← queueMicrotask → SQLite (non-blocking)
 ```
 
 ### Packages
@@ -171,13 +209,20 @@ pantheon chat "Read src/index.ts and explain it"
 ```
 packages/
 ├── shared/   # Shared types: ModelConfig, ChatMessage, Session, SessionSummary,
-│             #   ToolDefinition, ToolCall, ToolResult, UsageRecord, etc.
+│             #   ToolCall, ToolResult, UsageRecord, Span, Trace, etc.
 ├── core/     # ModelRegistry, Gateway, Classifier, CostTracker, Sandbox,
 │             #   PermissionManager, ToolRegistry, AgentRuntime,
 │             #   SessionManager, SessionSummarizer, Drizzle DB layer,
+│             #   Tracer, TraceCollector, TraceStore,
 │             #   built-in tools (readFile, writeFile, listDirectory, shell)
-└── cli/      # pantheon binary (Commander + Ink) — chat, sessions, models, cost
-               #   ui/  theme, logo, input-box, message, status-bar, tool-call, tool-permission
+├── server/   # @pantheon/server — Hono API server (:3000)
+│             #   routes: /api/chat, /api/sessions, /api/models,
+│             #           /api/cost, /api/traces, /api/health
+│             #   middleware: rate-limiter, sentry, request-logger
+└── cli/      # pantheon binary (Commander + Ink) — thin API client
+              #   commands: chat, sessions, models, cost, trace, server
+              #   ui: theme, logo, input-box, message, status-bar,
+              #       tool-call, tool-permission, trace-waterfall
 ```
 
 ### Database
@@ -190,6 +235,7 @@ Pantheon uses **SQLite** (via Drizzle ORM) for local-first persistence. The data
 | `messages` | All messages per session (role, content, tool calls, timestamps) |
 | `usage_records` | Per-call token usage and cost tracking |
 | `session_summaries` | LLM-generated summaries for episodic memory |
+| `spans` | Trace spans — one row per LLM call / tool use / routing decision (v0.5) |
 
 > **v0.9** will introduce a PostgreSQL migration path — Drizzle makes this a driver swap, not a rewrite.
 
@@ -203,10 +249,6 @@ Pantheon is built around **role-based model assignment** — rather than picking
 | `llama-smart` | Llama 3.3 70B Versatile | Planner — reasoning, decomposition |
 
 As Pantheon grows, more providers will be added across roles — including models from Anthropic, OpenAI, DeepSeek, and others. The gateway (LiteLLM) already supports all of them; it's a matter of plugging in API keys and config.
-
-### Configuration
-
-Pantheon reads config from `.pantheon/config.yml` in the current directory, or `~/.pantheon/config.yml` globally. If neither exists, built-in defaults are used.
 
 ---
 
@@ -230,3 +272,4 @@ pnpm turbo clean      # remove build artifacts
 | **v0.2** | Intelligent routing, LLM complexity classifier, SQLite cost tracker, polished TUI |
 | **v0.3** | Tool use (readFile, writeFile, listDirectory, shell), agent runtime (ReAct loop), sandbox + two-tier permissions, CI pipeline |
 | **v0.4** | Session persistence, resume sessions, episodic memory (LLM summaries), `pantheon sessions` command, Drizzle ORM, CI fixes (`packageManager` field, root-level Vitest) |
+| **v0.5** | Hono API server, CLI becomes thin HTTP client, OpenTelemetry-style tracing (LLM + tool + routing spans), `pantheon trace` command, waterfall view, rate limiting, Sentry |

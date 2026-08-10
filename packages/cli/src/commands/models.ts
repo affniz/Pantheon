@@ -1,57 +1,51 @@
 import chalk from "chalk";
-import { ModelRegistry } from "@pantheon/core";
+import { PantheonApiClient } from "../api-client.js";
+import { ensureServerRunning } from "../server-manager.js";
 
-// Brand colors matching theme.ts
+const dim = chalk.hex("#6B7280");
 const brand = chalk.hex("#F5A623");
 const accent = chalk.hex("#56B6C2");
-const dim = chalk.hex("#6B7280");
-const muted = chalk.hex("#4B5563");
-const success = chalk.hex("#4ADE80");
-const border = chalk.hex("#3A3A3A");
 
-const BRAND_MARK = `${brand.bold("◆")} ${brand("Pantheon")}`;
-const HR = border("─".repeat(50));
+export async function listModels() {
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
+    const { models, defaultModel } = await client.listModels();
 
-export function listModels() {
-    const registry = new ModelRegistry();
-    const models = registry.list();
-    const defaultModel = registry.getDefault();
+    console.log("");
+    console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Configured Models")}`);
+    console.log(`  ${dim("─".repeat(55))}`);
 
-    console.log(`\n  ${BRAND_MARK} ${dim("— Models")}\n`);
-    console.log(`  ${HR}\n`);
-
-    if (models.length === 0) {
-        console.log(`  ${dim("No models configured.")}\n`);
-        return;
+    for (const m of models) {
+        const isDefault = m.id === defaultModel;
+        const marker = isDefault ? chalk.green(" ✓ default") : "";
+        console.log(`  ${accent(m.id)}${marker}`);
+        if (m.displayName) console.log(`    ${dim("Name:")} ${m.displayName}`);
+        console.log(`    ${dim("Provider:")} ${m.provider}`);
     }
 
-    for (const model of models) {
-        const isDefault = defaultModel?.id === model.id;
-        const marker = isDefault ? success("  ✓ default") : "";
-        const name = model.displayName
-            ? dim(` — ${model.displayName}`)
-            : "";
-
-        console.log(`  ${accent("•")} ${chalk.white.bold(model.id)} ${muted(`(${model.provider})`)}${name}${marker}`);
-    }
-
-    console.log(`\n  ${HR}\n`);
+    console.log(`  ${dim("─".repeat(55))}`);
+    console.log("");
 }
 
-export function addModel(id: string, provider: string, displayName?: string) {
-    const registry = new ModelRegistry();
-    registry.add({ id, provider, ...(displayName ? { displayName } : {}) });
-    console.log(`\n  ${success("✓")} Added model ${accent.bold(id)}\n`);
+export async function setDefaultModel(id: string) {
+    await ensureServerRunning();
+    const client = new PantheonApiClient();
+    try {
+        await client.setDefaultModel(id);
+        console.log(chalk.green(`  ✓ Default model set to "${id}".`));
+    } catch (err) {
+        console.error(chalk.red(`  Error: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+    }
+}
+
+// Stubs for add/remove — not yet backed by API (v0.5 defers model management to config file)
+export function addModel(id: string, provider: string, name?: string) {
+    console.log(dim(`\n  Model management via CLI is deferred to v0.6.`));
+    console.log(dim(`  To add a model, edit ~/.pantheon/config.yml and restart the server.\n`));
 }
 
 export function removeModel(id: string) {
-    const registry = new ModelRegistry();
-    registry.remove(id);
-    console.log(`\n  ${success("✓")} Removed model ${accent.bold(id)}\n`);
-}
-
-export function setDefaultModel(id: string) {
-    const registry = new ModelRegistry();
-    registry.setDefault(id);
-    console.log(`\n  ${success("✓")} Default model set to ${accent.bold(id)}\n`);
+    console.log(dim(`\n  Model management via CLI is deferred to v0.6.`));
+    console.log(dim(`  To remove a model, edit ~/.pantheon/config.yml and restart the server.\n`));
 }

@@ -4,6 +4,7 @@ import type { ModelRegistry } from "../registry/model-registry.js";
 import type { OpenAITool } from "../tools/tool-registry.js";
 import { Classifier } from "../router/classifier.js";
 import { CostTracker } from "../cost/tracker.js";
+import { Tracer } from "../tracing/tracer.js";
 
 export class Gateway {
     private client: OpenAI;
@@ -89,118 +90,133 @@ export class Gateway {
         message: ChatMessage;
         usage: { inputTokens: number; outputTokens: number };
     }> {
-        const openaiMessages = messages.map((m) => {
-            if (m.role === "tool") {
-                return {
-                    role: "tool" as const,
-                    content: m.content,
-                    tool_call_id: m.toolCallId ?? "",
+        return Tracer.startSpan(
+            "llm.completion",
+            "llm",
+            async (span) => {
+                span.attributes.model = modelId;
+                span.attributes.toolCount = tools?.length ?? 0;
+                span.attributes.messageCount = messages.length;
+
+                const openaiMessages = messages.map((m) => {
+                    if (m.role === "tool") {
+                        return {
+                            role: "tool" as const,
+                            content: m.content,
+                            tool_call_id: m.toolCallId ?? "",
+                        };
+                    }
+                    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+                        return {
+                            role: "assistant" as const,
+                            content: m.content || null,
+                            tool_calls: m.toolCalls.map((tc) => ({
+                                id: tc.id,
+                                type: "function" as const,
+                                function: {
+                                    name: tc.name,
+                                    arguments: JSON.stringify(tc.arguments),
+                                },
+                            })),
+                        };
+                    }
+                    return {
+                        role: m.role as "system" | "user" | "assistant",
+                        content: m.content,
+                    };
+                });
+
+                const requestParams: Record<string, unknown> = {
+                    model: modelId,
+                    messages: openaiMessages,
                 };
-            }
-            if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
-                return {
-                    role: "assistant" as const,
-                    content: m.content || null,
-                    tool_calls: m.toolCalls.map((tc) => ({
-                        id: tc.id,
-                        type: "function" as const,
-                        function: {
-                            name: tc.name,
-                            arguments: JSON.stringify(tc.arguments),
-                        },
-                    })),
-                };
-            }
-            return {
-                role: m.role as "system" | "user" | "assistant",
-                content: m.content,
-            };
-        });
 
-        const requestParams: Record<string, unknown> = {
-            model: modelId,
-            messages: openaiMessages,
-        };
-
-        if (tools && tools.length > 0) {
-            requestParams["tools"] = tools;
-            requestParams["tool_choice"] = "auto";
-            // Force one tool call per turn. Some Groq Llama variants produce
-            // malformed JSON when generating multiple tool calls simultaneously.
-            requestParams["parallel_tool_calls"] = false;
-        }
-
-        let response;
-        let lastError: unknown;
-        // Retry up to 3 times total. Groq/Llama models occasionally generate
-        // malformed tool-call output that causes a 400; retrying usually succeeds.
-        const client = this.clientFor(modelId);
-        const upstreamModel = this.upstreamModelName(modelId);
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                response = await client.chat.completions.create(
-                    { ...requestParams, model: upstreamModel } as any
-                );
-                break; // success
-            } catch (err) {
-                lastError = err;
-                const msg = err instanceof Error ? err.message : String(err);
-                process.stderr.write(`[gateway] attempt ${attempt} failed: ${msg}\n`);
-                if (attempt < 3) {
-                    // Small backoff before retry
-                    await new Promise((r) => setTimeout(r, 500 * attempt));
+                if (tools && tools.length > 0) {
+                    requestParams["tools"] = tools;
+                    requestParams["tool_choice"] = "auto";
+                    // Force one tool call per turn. Some Groq Llama variants produce
+                    // malformed JSON when generating multiple tool calls simultaneously.
+                    requestParams["parallel_tool_calls"] = false;
                 }
+
+                let response;
+                let lastError: unknown;
+                // Retry up to 3 times total. Groq/Llama models occasionally generate
+                // malformed tool-call output that causes a 400; retrying usually succeeds.
+                const client = this.clientFor(modelId);
+                const upstreamModel = this.upstreamModelName(modelId);
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        response = await client.chat.completions.create(
+                            { ...requestParams, model: upstreamModel } as any
+                        );
+                        break; // success
+                    } catch (err) {
+                        lastError = err;
+                        const msg = err instanceof Error ? err.message : String(err);
+                        process.stderr.write(`[gateway] attempt ${attempt} failed: ${msg}\n`);
+                        if (attempt < 3) {
+                            // Small backoff before retry
+                            await new Promise((r) => setTimeout(r, 500 * attempt));
+                        }
+                    }
+                }
+
+                if (!response) {
+                    // All tool-enabled attempts failed. Fall back to plain text so the
+                    // model can at least give a useful response from its knowledge.
+                    process.stderr.write(`[gateway] all tool-call attempts failed, falling back to text-only\n`);
+                    if (tools && tools.length > 0) {
+                        const fallbackParams = { model: upstreamModel, messages: openaiMessages };
+                        response = await client.chat.completions.create(
+                            fallbackParams as any
+                        );
+                    } else {
+                        throw lastError;
+                    }
+                }
+
+
+                const choice = response.choices[0];
+                if (!choice) throw new Error("No response from model.");
+
+                const inputTokens = response.usage?.prompt_tokens ?? 0;
+                const outputTokens = response.usage?.completion_tokens ?? 0;
+
+                // Capture token usage in span attributes
+                span.attributes.inputTokens = inputTokens;
+                span.attributes.outputTokens = outputTokens;
+
+                // Parse tool calls from the response
+                let toolCalls: ToolCall[] | undefined;
+                if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+                    toolCalls = choice.message.tool_calls.map((tc) => ({
+                        id: tc.id,
+                        name: tc.function.name,
+                        arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
+                    }));
+                    span.attributes.returnedToolCalls = toolCalls.map((tc) => tc.name);
+                }
+
+                const message: ChatMessage = {
+                    role: "assistant",
+                    content: choice.message.content ?? "",
+                    ...(toolCalls ? { toolCalls } : {}),
+                };
+
+                // Record usage
+                this.tracker.record({
+                    timestamp: new Date().toISOString(),
+                    modelId,
+                    inputTokens,
+                    outputTokens,
+                    costUsd: 0,
+                    promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
+                });
+
+                return { message, usage: { inputTokens, outputTokens } };
             }
-        }
-
-        if (!response) {
-            // All tool-enabled attempts failed. Fall back to plain text so the
-            // model can at least give a useful response from its knowledge.
-            process.stderr.write(`[gateway] all tool-call attempts failed, falling back to text-only\n`);
-            if (tools && tools.length > 0) {
-                const fallbackParams = { model: upstreamModel, messages: openaiMessages };
-                response = await client.chat.completions.create(
-                    fallbackParams as any
-                );
-            } else {
-                throw lastError;
-            }
-        }
-
-
-        const choice = response.choices[0];
-        if (!choice) throw new Error("No response from model.");
-
-        const inputTokens = response.usage?.prompt_tokens ?? 0;
-        const outputTokens = response.usage?.completion_tokens ?? 0;
-
-        // Parse tool calls from the response
-        let toolCalls: ToolCall[] | undefined;
-        if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
-            toolCalls = choice.message.tool_calls.map((tc) => ({
-                id: tc.id,
-                name: tc.function.name,
-                arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-            }));
-        }
-
-        const message: ChatMessage = {
-            role: "assistant",
-            content: choice.message.content ?? "",
-            ...(toolCalls ? { toolCalls } : {}),
-        };
-
-        // Record usage
-        this.tracker.record({
-            timestamp: new Date().toISOString(),
-            modelId,
-            inputTokens,
-            outputTokens,
-            costUsd: 0,
-            promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-        });
-
-        return { message, usage: { inputTokens, outputTokens } };
+        );
     }
 
     private async *_streamCompletion(
