@@ -64,11 +64,11 @@ describe("Sandbox", () => {
         });
 
         it("truncates long output", () => {
-            const longOutput = "a".repeat(11_000);
+            const longOutput = "a".repeat(51_000);
             const truncated = sandbox.truncateOutput(longOutput);
-            expect(truncated.length).toBeLessThan(11_000);
-            expect(truncated).toContain("--- Output truncated at 10,000 characters ---");
-            expect(truncated.startsWith("a".repeat(10_000))).toBe(true);
+            expect(truncated.length).toBeLessThan(51_000);
+            expect(truncated).toContain("--- Output truncated at 50,000 characters ---");
+            expect(truncated.startsWith("a".repeat(50_000))).toBe(true);
         });
     });
 
@@ -80,7 +80,7 @@ describe("Sandbox", () => {
                 ? fs.realpathSync("/tmp/test")
                 : path.resolve("/tmp/test");
             expect(s.projectRoot).toBe(expectedRoot);
-            expect(s.maxOutputSize).toBe(10_000);
+            expect(s.maxOutputSize).toBe(50_000);
             expect(s.shellTimeout).toBe(30_000);
         });
     });

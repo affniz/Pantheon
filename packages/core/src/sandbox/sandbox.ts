@@ -58,7 +58,7 @@ export class Sandbox {
     static create(projectRoot: string): Sandbox {
         return new Sandbox({
             projectRoot,
-            maxOutputSize: 10_000,
+            maxOutputSize: 50_000,
             shellTimeout: 30_000,
         });
     }

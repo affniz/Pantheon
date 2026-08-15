@@ -19,8 +19,8 @@ export const readFileTool: Tool = {
                 maxLines: {
                     type: "number",
                     description:
-                        "Maximum number of lines to return. Defaults to 200. " +
-                        "Use a smaller value for large files to avoid flooding the context.",
+                        "Maximum number of lines to return. Omit to read the entire file. " +
+                        "Use a smaller value for very large files to limit context usage.",
                 },
             },
             required: ["path"],
@@ -34,7 +34,7 @@ export const readFileTool: Tool = {
             return "Error: 'path' argument must be a string.";
         }
 
-        const maxLines = typeof args["maxLines"] === "number" ? args["maxLines"] : 200;
+        const maxLines = typeof args["maxLines"] === "number" ? args["maxLines"] : Infinity;
 
         try {
             const resolved = sandbox.resolvePath(filePath);

@@ -10,9 +10,10 @@ import {
     AgentRuntime,
     SessionManager,
     SessionSummarizer,
+    Orchestrator,
 } from "@pantheon/core";
 import type { PermissionDecision } from "@pantheon/core";
-import type { ChatMessage } from "@pantheon/shared";
+import type { ChatMessage, OrchestrationEvent } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
 
@@ -28,16 +29,25 @@ const pendingPermissions = new Map<string, { resolve: (decision: PermissionDecis
  * POST /api/chat — Start an agentic chat turn over SSE.
  *
  * Request body:
- *   { sessionId?: string, prompt: string, model?: string, noTools?: boolean, workingDir?: string }
+ *   { sessionId?, prompt, model?, noTools?, workingDir?, orchestrate? }
  *
- * SSE event stream:
+ * SSE event stream (existing):
  *   routing  → { tier, selectedModelId, reason }
- *   text     → { content: string }              (streaming text chunks)
+ *   text     → { content: string }
  *   tool_call → { id, name, arguments, safety }
  *   tool_permission_required → { toolCallId, toolName, safety }
  *   tool_result → { toolCallId, content, isError }
- *   done     → { traceId?, iterations }
+ *   done     → { sessionId, iterations }
  *   error    → { message }
+ *
+ * SSE event stream (v0.6 orchestration):
+ *   orchestration_start → { planId, taskCount }
+ *   agent_spawned → { agent: AgentNode }
+ *   agent_completed → { agentId, result }
+ *   agent_failed → { agentId, error }
+ *   plan_created → { plan: TaskPlan }
+ *   review_result → { approved, feedback, finalResponse }
+ *   orchestration_done → { planId, finalResponse }
  */
 chatRouter.post("/", async (c) => {
     const body = await c.req.json<{
@@ -46,9 +56,18 @@ chatRouter.post("/", async (c) => {
         model?: string;
         noTools?: boolean;
         workingDir?: string;
+        /** "auto" (default) = orchestrate complex tasks; true = always; false = never */
+        orchestrate?: boolean | "auto";
     }>();
 
-    const { sessionId, prompt, model, noTools = false, workingDir = process.cwd() } = body;
+    const {
+        sessionId,
+        prompt,
+        model,
+        noTools = false,
+        workingDir = process.env["PANTHEON_WORKSPACE"] ?? process.cwd(),
+        orchestrate = "auto",
+    } = body;
 
     if (!prompt?.trim()) {
         return c.json({ error: "prompt is required" }, 400);
@@ -106,18 +125,30 @@ chatRouter.post("/", async (c) => {
 
                 await sendEvent("done", { sessionId: effectiveSessionId, iterations: 1 });
             } else {
-                // Agentic mode
+                // Determine if we should use multi-agent orchestration
+                let useOrchestration = false;
+
+                if (orchestrate === true) {
+                    useOrchestration = true;
+                } else if (orchestrate === false) {
+                    useOrchestration = false;
+                } else {
+                    // "auto" — classify the prompt and orchestrate if complex
+                    const routingDecision = await gateway.resolveRouting(messages, model);
+                    if (routingDecision.tier === "complex" && !model) {
+                        useOrchestration = true;
+                    }
+                    // Emit routing decision for the CLI
+                    await sendEvent("routing", routingDecision);
+                }
+
                 const sandbox = Sandbox.create(workingDir);
-                const toolRegistry = new ToolRegistry();
-                registerBuiltinTools(toolRegistry);
 
                 const permissionManager = new PermissionManager(
                     (toolName, args, safety) => {
                         return new Promise<PermissionDecision>((resolve) => {
-                            // Emit an SSE event so the CLI can render the permission prompt
                             const toolCallId = `perm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-                            // Auto-deny if no response arrives within the timeout
                             const timer = setTimeout(() => {
                                 if (pendingPermissions.has(toolCallId)) {
                                     pendingPermissions.delete(toolCallId);
@@ -127,53 +158,116 @@ chatRouter.post("/", async (c) => {
                                     resolve("deny");
                                 }
                             }, PERMISSION_TIMEOUT_MS);
-                            timer.unref(); // Don't keep the process alive for this timer alone
+                            timer.unref();
 
                             pendingPermissions.set(toolCallId, { resolve, timer });
-                            // Fire-and-forget — the client will POST back
                             sendEvent("tool_permission_required", { toolCallId, toolName, args, safety }).catch(() => {});
                         });
-                    }
+                    },
+                    // Pre-approve read-only tools — no prompt needed for safe reads
+                    ["read_file", "list_directory"]
                 );
 
-                const agentRuntime = new AgentRuntime(gateway, toolRegistry, {
-                    maxIterations: 10,
-                    sandbox,
-                    permissionManager,
-                    sessionId: effectiveSessionId,
-                    ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
-                    onToolCall: (call, safety) => {
-                        sendEvent("tool_call", { id: call.id, name: call.name, arguments: call.arguments, safety }).catch(() => {});
-                    },
-                    onToolResult: (result) => {
-                        sendEvent("tool_result", { toolCallId: result.toolCallId, content: result.content, isError: result.isError }).catch(() => {});
-                    },
-                });
+                const onToolCall = (call: import("@pantheon/shared").ToolCall, safety: "safe" | "destructive") => {
+                    sendEvent("tool_call", { id: call.id, name: call.name, arguments: call.arguments, safety }).catch(() => {});
+                };
+                const onToolResult = (result: import("@pantheon/shared").ToolResult) => {
+                    sendEvent("tool_result", { toolCallId: result.toolCallId, content: result.content, isError: result.isError }).catch(() => {});
+                };
 
-                const turnResult = await agentRuntime.run(messages, model);
+                if (useOrchestration) {
+                    // ── Multi-agent orchestration path ──────────────────────────
+                    const routingConfig = registry.getRoutingConfig();
 
-                // Emit the final text response
-                await sendEvent("routing", turnResult.decision);
-                await sendEvent("text", { content: turnResult.response });
+                    const orchestrator = new Orchestrator({
+                        gateway,
+                        toolRegistry: new ToolRegistry(), // orchestrator creates its own per executor
+                        sandbox,
+                        permissionManager,
+                        sessionId: effectiveSessionId,
+                        plannerModelId: routingConfig.tiers.complex,   // deepseek-v4-pro
+                        agentModelId: routingConfig.tiers.complex,     // deepseek-v4-pro (coder, debugger, executor)
+                        reviewerModelId: routingConfig.tiers.complex,  // deepseek-v4-pro
+                        maxConcurrency: 5,
+                        ...(episodicMemory ? { episodicMemory } : {}),
+                        onEvent: (event: OrchestrationEvent) => {
+                            sendEvent(event.type, event).catch(() => {});
+                        },
+                        onToolCall,
+                        onToolResult,
+                    });
 
-                // Persist assistant message
-                const assistantMsg: ChatMessage = { role: "assistant", content: turnResult.response, timestamp: new Date() };
-                sm.addMessage(effectiveSessionId, assistantMsg);
+                    const result = await orchestrator.run(prompt.trim(), messages);
 
-                // Background summarization
-                if (fastModelId) {
-                    const allMsgs = sm.getMessages(effectiveSessionId);
-                    const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
-                    if (turnCount >= 4) {
-                        const summarizer = new SessionSummarizer(gateway, fastModelId);
-                        summarizer.saveForSession(effectiveSessionId, allMsgs).catch(() => {});
+                    // Emit the final text as a standard text event for CLI rendering
+                    await sendEvent("text", { content: result.finalResponse });
+
+                    // Persist assistant message
+                    const assistantMsg: ChatMessage = {
+                        role: "assistant",
+                        content: result.finalResponse,
+                        timestamp: new Date(),
+                    };
+                    sm.addMessage(effectiveSessionId, assistantMsg);
+
+                    // Background summarization
+                    if (fastModelId) {
+                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
+                        if (turnCount >= 4) {
+                            const summarizer = new SessionSummarizer(gateway, fastModelId);
+                            summarizer.saveForSession(effectiveSessionId, allMsgs).catch(() => {});
+                        }
                     }
-                }
 
-                await sendEvent("done", {
-                    sessionId: effectiveSessionId,
-                    iterations: turnResult.iterations,
-                });
+                    await sendEvent("done", {
+                        sessionId: effectiveSessionId,
+                        iterations: 0,
+                        orchestrated: true,
+                        planId: result.planId,
+                    });
+                } else {
+                    // ── Single-agent path (unchanged from v0.5) ──────────────────
+                    const toolRegistry = new ToolRegistry();
+                    registerBuiltinTools(toolRegistry);
+
+                    const agentRuntime = new AgentRuntime(gateway, toolRegistry, {
+                        maxIterations: 20,
+                        sandbox,
+                        permissionManager,
+                        sessionId: effectiveSessionId,
+                        ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
+                        onToolCall,
+                        onToolResult,
+                    });
+
+                    const turnResult = await agentRuntime.run(messages, model);
+
+                    // Emit the routing decision (if we didn't emit it above during auto-detection)
+                    if (orchestrate !== "auto") {
+                        await sendEvent("routing", turnResult.decision);
+                    }
+                    await sendEvent("text", { content: turnResult.response });
+
+                    // Persist assistant message
+                    const assistantMsg: ChatMessage = { role: "assistant", content: turnResult.response, timestamp: new Date() };
+                    sm.addMessage(effectiveSessionId, assistantMsg);
+
+                    // Background summarization
+                    if (fastModelId) {
+                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
+                        if (turnCount >= 4) {
+                            const summarizer = new SessionSummarizer(gateway, fastModelId);
+                            summarizer.saveForSession(effectiveSessionId, allMsgs).catch(() => {});
+                        }
+                    }
+
+                    await sendEvent("done", {
+                        sessionId: effectiveSessionId,
+                        iterations: turnResult.iterations,
+                    });
+                }
             }
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);

@@ -14,6 +14,8 @@ export interface ChatRequestOptions {
     model?: string;
     noTools?: boolean;
     workingDir?: string;
+    /** "auto" (default) = orchestrate complex tasks; true = always; false = never */
+    orchestrate?: boolean | "auto";
 }
 
 /** Union of all SSE event payloads the chat endpoint can emit */
@@ -23,8 +25,16 @@ export type ChatSSEEvent =
     | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; safety: "safe" | "destructive" } }
     | { event: "tool_permission_required"; data: { toolCallId: string; toolName: string; args: Record<string, unknown>; safety: "safe" | "destructive" } }
     | { event: "tool_result"; data: { toolCallId: string; content: string; isError: boolean } }
-    | { event: "done"; data: { sessionId: string; iterations: number } }
-    | { event: "error"; data: { message: string } };
+    | { event: "done"; data: { sessionId: string; iterations: number; orchestrated?: boolean; planId?: string } }
+    | { event: "error"; data: { message: string } }
+    // v0.6 orchestration events
+    | { event: "orchestration_start"; data: { type: string; planId: string; taskCount: number } }
+    | { event: "agent_spawned"; data: { type: string; agent: Record<string, unknown> } }
+    | { event: "agent_completed"; data: { type: string; agentId: string; result: string } }
+    | { event: "agent_failed"; data: { type: string; agentId: string; error: string } }
+    | { event: "plan_created"; data: { type: string; plan: Record<string, unknown> } }
+    | { event: "review_result"; data: { type: string; approved: boolean; feedback: string; finalResponse: string } }
+    | { event: "orchestration_done"; data: { type: string; planId: string; finalResponse: string } };
 
 /**
  * Typed HTTP client for the Pantheon API server.
@@ -154,6 +164,26 @@ export class PantheonApiClient {
 
     async clearTraces(): Promise<void> {
         await this.del("/api/traces");
+    }
+
+    // ── Agents ───────────────────────────────────────────────────────────────
+
+    async listAgents(opts?: { limit?: number; sessionId?: string }): Promise<any[]> {
+        const result = await this.get<{ agents: any[] }>("/api/agents", {
+            ...(opts?.limit ? { limit: opts.limit } : {}),
+            ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+        });
+        return result.agents;
+    }
+
+    async getAgent(id: string): Promise<any> {
+        const result = await this.get<{ agent: any }>(`/api/agents/${id}`);
+        return result.agent;
+    }
+
+    async getAgentPlan(id: string): Promise<any> {
+        const result = await this.get<{ plan: any }>(`/api/agents/${id}/plan`);
+        return result.plan;
     }
 
     // ── Chat (SSE) ───────────────────────────────────────────────────────────

@@ -7,7 +7,8 @@ export interface ModelProfile {
     costPer1kOutputTokens: number;
     strengths: string[];
 }
-export type ComplexityTier = "simple" | "standard" | "complex";
+
+export type ComplexityTier = "general" | "simple" | "standard" | "complex";
 
 export interface RoutingDecision {
     tier: ComplexityTier;

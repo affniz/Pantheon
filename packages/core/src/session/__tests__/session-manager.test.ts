@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { createTestDb } from '../../db/client.js';
 import { SessionManager } from '../session-manager.js';
@@ -30,8 +30,15 @@ describe('SessionManager', () => {
     });
 
     it('list returns sessions ordered by createdAt desc', () => {
+        // Ensure sessions have distinct timestamps by controlling time
+        const base = new Date('2024-01-01T00:00:00.000Z').getTime();
+        vi.useFakeTimers();
+        vi.setSystemTime(base);
         manager.create('session-1');
+        vi.setSystemTime(base + 1000); // 1 second later
         const sid2 = manager.create('session-2');
+        vi.useRealTimers();
+
         const sessions = manager.list();
         expect(sessions).toHaveLength(2);
         expect(sessions[0]?.id).toBe(sid2);

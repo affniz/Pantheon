@@ -1,5 +1,5 @@
 /** The category of work a span represents */
-export type SpanKind = "http" | "routing" | "llm" | "tool" | "agent" | "internal";
+export type SpanKind = "http" | "routing" | "llm" | "tool" | "agent" | "orchestrator" | "planner" | "reviewer" | "executor" | "internal";
 
 /** Whether the span completed successfully or with an error */
 export type SpanStatus = "ok" | "error";

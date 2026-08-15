@@ -34,7 +34,22 @@ export class Gateway {
     }
 
     /**
+     * Extra parameters required by DeepSeek V4 Pro (reasoning model).
+     * Returns an empty object for all other models.
+     */
+    private deepseekProParams(modelId: string): Record<string, unknown> {
+        if (modelId === "deepseek-v4-pro") {
+            return {
+                thinking: { type: "enabled" },
+                reasoning_effort: "high",
+            };
+        }
+        return {};
+    }
+
+    /**
      * Resolve routing decision based on modelId override, auto-routing, or default.
+     * Passes previous messages as context so the classifier can judge cumulative complexity.
      * Shared between stream() and complete().
      */
     async resolveRouting(
@@ -54,9 +69,12 @@ export class Gateway {
         const routingConfig = this.registry.getRoutingConfig();
 
         if (routingConfig.enabled) {
-            const lastUserMessage =
-                [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-            return this.classifier.classify(lastUserMessage);
+            // The last user message is the prompt to classify.
+            // All earlier messages provide conversation history for context.
+            const lastUserIdx = [...messages].map((m, i) => ({ m, i })).reverse().find(({ m }) => m.role === "user")?.i ?? -1;
+            const currentPrompt = lastUserIdx >= 0 ? messages[lastUserIdx]!.content : "";
+            const recentHistory = lastUserIdx > 0 ? messages.slice(0, lastUserIdx) : [];
+            return this.classifier.classify(currentPrompt, recentHistory);
         }
 
         const model = this.registry.getDefault();
@@ -129,6 +147,8 @@ export class Gateway {
                 const requestParams: Record<string, unknown> = {
                     model: modelId,
                     messages: openaiMessages,
+                    // Inject DeepSeek V4 Pro thinking params when applicable
+                    ...this.deepseekProParams(modelId),
                 };
 
                 if (tools && tools.length > 0) {
@@ -227,12 +247,15 @@ export class Gateway {
         const client = this.clientFor(modelId);
         const upstreamModel = this.upstreamModelName(modelId);
 
-        const stream = await client.chat.completions.create({
+        const extraParams = this.deepseekProParams(modelId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const stream = (await (client.chat.completions.create as any)({
             model: upstreamModel,
-            messages: messages.map((m) => ({ role: m.role, content: m.content })) as any,
+            messages: messages.map((m) => ({ role: m.role, content: m.content })),
             stream: true,
             stream_options: { include_usage: true },
-        });
+            ...extraParams,
+        })) as import("openai/streaming").Stream<import("openai/resources").ChatCompletionChunk>;
 
         let inputTokens = 0;
         let outputTokens = 0;

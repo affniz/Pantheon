@@ -54,7 +54,7 @@ export const spans = sqliteTable("spans", {
     parentSpanId: text("parent_span_id"),                 // null on root span
     sessionId: text("session_id"),
     name: text("name").notNull(),                         // e.g. "llm.completion"
-    kind: text("kind").notNull(),                         // routing | llm | tool | agent | http
+    kind: text("kind").notNull(),                         // routing | llm | tool | agent | orchestrator | ...
     startTime: integer("start_time").notNull(),           // epoch ms
     endTime: integer("end_time").notNull(),
     durationMs: integer("duration_ms").notNull(),
@@ -63,3 +63,45 @@ export const spans = sqliteTable("spans", {
     attributes: text("attributes"),                       // JSON stringified
     createdAt: integer("created_at").notNull(),           // epoch ms
 });
+
+// ─── Agent Nodes (Multi-Agent Orchestration) ─────────────────────────────────
+
+export const agentNodes = sqliteTable("agent_nodes", {
+    agentId: text("agent_id").primaryKey(),
+    role: text("role").notNull(),                         // planner | executor | reviewer | orchestrator
+    modelId: text("model_id").notNull(),
+    parentAgentId: text("parent_agent_id"),               // null for root orchestrator
+    sessionId: text("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+    taskId: text("task_id"),                              // links to sub_tasks.id (executors only)
+    status: text("status").notNull(),                     // pending | running | completed | failed | cancelled
+    result: text("result"),
+    error: text("error"),
+    startTime: integer("start_time").notNull(),           // epoch ms
+    endTime: integer("end_time"),
+    createdAt: text("created_at").notNull(),
+});
+
+// ─── Task Plans (Planner output) ─────────────────────────────────────────────
+
+export const taskPlans = sqliteTable("task_plans", {
+    planId: text("plan_id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+    originalPrompt: text("original_prompt").notNull(),
+    createdAt: text("created_at").notNull(),
+});
+
+// ─── Sub-Tasks (individual decomposed tasks) ─────────────────────────────────
+
+export const subTasks = sqliteTable("sub_tasks", {
+    id: text("id").primaryKey(),
+    planId: text("plan_id").notNull().references(() => taskPlans.planId, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    description: text("description").notNull(),
+    dependencies: text("dependencies"),                   // JSON array of task IDs
+    status: text("status").notNull(),                     // pending | running | completed | failed | cancelled
+    result: text("result"),
+    error: text("error"),
+    agentId: text("agent_id"),                            // references agent_nodes.agentId
+    createdAt: text("created_at").notNull(),
+});
+
