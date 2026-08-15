@@ -46,9 +46,29 @@ export const shellTool: Tool = {
             return `Error: ${message}`;
         }
 
+        // Resolve shell at runtime: honour $SHELL, then try common paths.
+        // /bin/sh is not guaranteed in distroless / Alpine Docker images.
+        const shellBin =
+            process.env["SHELL"] ??
+            (() => {
+                const candidates = ["/bin/sh", "/bin/bash", "/usr/bin/sh", "/busybox/sh"];
+                for (const c of candidates) {
+                    try {
+                        // Use statSync from node:fs (already in scope via sandbox)
+                        // We do a sync probe once per invocation — acceptable for a CLI tool.
+                        // eslint-disable-next-line @typescript-eslint/no-require-imports
+                        require("node:fs").statSync(c);
+                        return c;
+                    } catch {
+                        // not found, try next
+                    }
+                }
+                return "/bin/sh"; // last resort — will surface a clear error if missing
+            })();
+
         return new Promise<string>((resolve) => {
             execFile(
-                "/bin/sh",
+                shellBin,
                 ["-c", command],
                 {
                     cwd: sandbox.projectRoot,

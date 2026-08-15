@@ -6,22 +6,25 @@ import type { PantheonConfig } from "@pantheon/shared";
 
 const DEFAULTS: PantheonConfig = {
     models: [
-        { id: "llama-fast", provider: "groq", displayName: "Llama 3.1 8B (Fast)" },
         { id: "llama-smart", provider: "groq", displayName: "Llama 3.3 70B (Smart)" },
+        { id: "deepseek-v4-flash", provider: "deepseek", displayName: "DeepSeek V4 Flash" },
+        { id: "deepseek-v4-pro", provider: "deepseek", displayName: "DeepSeek V4 Pro" },
     ],
     gateway: {
-        baseUrl: "http://localhost:4000",
-        masterKey: "sk-pantheon-local",
+        baseUrl: process.env["LITELLM_BASE_URL"] ?? "http://localhost:4000",
+        masterKey: process.env["LITELLM_MASTER_KEY"] ?? "sk-pantheon-local",
     },
     routing: {
         enabled: true,
         tiers: {
-            simple: "llama-fast",
-            standard: "llama-smart",
-            complex: "llama-smart",
+            general:  "llama-smart",       // greetings, general Q&A
+            simple:   "deepseek-v4-flash", // simple & moderate coding
+            standard: "deepseek-v4-flash", // multi-step moderate tasks
+            complex:  "deepseek-v4-pro",   // complex coding, debugging, architecture
         },
+        routingContextDepth: 5,
     },
-    defaultModel: "llama-smart",
+    defaultModel: "deepseek-v4-flash",
 };
 
 function findConfigPath(): string | null {

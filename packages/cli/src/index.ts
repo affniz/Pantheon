@@ -11,6 +11,7 @@ import { listModels, addModel, removeModel, setDefaultModel } from "./commands/m
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
 import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./commands/sessions.js";
 import { traceList, traceShow, traceClear } from "./commands/trace.js";
+import { agentsList, agentsShow, agentsPlan } from "./commands/agents.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 
 // Brand colors matching theme.ts
@@ -34,7 +35,7 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(`${dim("                              v0.5.0")}`);
+    console.log(`${dim("                              v0.6.0")}`);
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
@@ -47,6 +48,10 @@ function showWelcome() {
     console.log(`  ${accent("sessions show")} ${muted("<id>")}   ${dim("Show session details")}`);
     console.log(`  ${accent("sessions delete")} ${muted("<id>")} ${dim("Delete a session permanently")}`);
     console.log(`  ${accent("sessions archive")} ${muted("<id>")} ${dim("Archive a session")}`);
+    console.log("");
+    console.log(`  ${accent("agents list")}           ${dim("List recent orchestration runs")}`);
+    console.log(`  ${accent("agents show")} ${muted("<id>")}    ${dim("Show agent details")}`);
+    console.log(`  ${accent("agents plan")} ${muted("<id>")}    ${dim("Show task plan for a session")}`);
     console.log("");
     console.log(`  ${accent("models list")}         ${dim("List configured models")}`);
     console.log(`  ${accent("models default")} ${muted("<id>")} ${dim("Set the default model")}`);
@@ -71,7 +76,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.5.0")
+    .version("0.6.0")
     .action(() => {
         showWelcome();
     });
@@ -167,6 +172,28 @@ sessionsCmd
     .description("Archive a session")
     .argument("<id>", "Session ID")
     .action(sessionsArchive);
+
+// ── Agents ────────────────────────────────────────────────────────────────────
+
+const agentsCmd = program.command("agents").description("Manage orchestration agents");
+
+agentsCmd
+    .command("list", { isDefault: true })
+    .description("List recent orchestration runs")
+    .option("-n, --limit <n>", "Number of agents to show", "20")
+    .action((opts) => agentsList({ limit: Number(opts.limit) }));
+
+agentsCmd
+    .command("show")
+    .description("Show agent details")
+    .argument("<id>", "Agent ID")
+    .action(agentsShow);
+
+agentsCmd
+    .command("plan")
+    .description("Show task plan for a session")
+    .argument("<sessionId>", "Session ID")
+    .action(agentsPlan);
 
 // ── Trace ─────────────────────────────────────────────────────────────────────
 

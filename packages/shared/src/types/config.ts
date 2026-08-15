@@ -14,11 +14,22 @@ export interface GatewayConfig {
 export interface RoutingConfig {
     enabled: boolean;
     tiers: {
+        /** Greetings, small talk, general questions → llama-smart */
+        general: string;
+        /** Simple & moderate coding tasks → deepseek-v4-flash */
         simple: string;
+        /** Moderate multi-step tasks → deepseek-v4-flash */
         standard: string;
+        /** Complex coding, architecture, debugging → deepseek-v4-pro */
         complex: string;
     };
     classifierPrompt?: string;
+    /**
+     * Number of recent user messages to include as context when classifying a prompt.
+     * Allows "debug this" to be routed correctly when prior messages describe a complex task.
+     * Default: 5
+     */
+    routingContextDepth?: number;
 }
 
 export interface PantheonConfig {

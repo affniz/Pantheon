@@ -9,6 +9,7 @@ services:
     command: [ "--config", "/app/config.yaml", "--port", "4000" ]
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
     restart: unless-stopped
 
   pantheon-server:
@@ -18,10 +19,20 @@ services:
     container_name: pantheon-server
     ports:
       - "3000:3000"
+    volumes:
+      # Mount the host home directory so the server can read/write user project files.
+      # The CLI sends its process.cwd() (e.g. /Users/foo/project) as workingDir;
+      # that path must exist inside the container at the same location.
+      - ${HOME}:${HOME}
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - LITELLM_BASE_URL=http://litellm:4000
       - SENTRY_DSN=${SENTRY_DSN:-}
       - NODE_ENV=${NODE_ENV:-production}
+      # Fallback workspace root used when the CLI doesn't send workingDir.
+      # Override this to point at a specific project if needed.
+      - PANTHEON_WORKSPACE=${PANTHEON_WORKSPACE:-${HOME}}
     depends_on:
       - litellm
     restart: unless-stopped

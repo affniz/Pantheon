@@ -67,6 +67,46 @@ const INIT_SQL = `
     CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
     CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id);
     CREATE INDEX IF NOT EXISTS idx_spans_session_id ON spans(session_id);
+
+    CREATE TABLE IF NOT EXISTS agent_nodes (
+        agent_id        TEXT PRIMARY KEY,
+        role            TEXT NOT NULL,
+        model_id        TEXT NOT NULL,
+        parent_agent_id TEXT,
+        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        task_id         TEXT,
+        status          TEXT NOT NULL,
+        result          TEXT,
+        error           TEXT,
+        start_time      INTEGER NOT NULL,
+        end_time        INTEGER,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_plans (
+        plan_id         TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        original_prompt TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sub_tasks (
+        id              TEXT PRIMARY KEY,
+        plan_id         TEXT NOT NULL REFERENCES task_plans(plan_id) ON DELETE CASCADE,
+        title           TEXT NOT NULL,
+        description     TEXT NOT NULL,
+        dependencies    TEXT,
+        status          TEXT NOT NULL,
+        result          TEXT,
+        error           TEXT,
+        agent_id        TEXT,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agent_nodes_session_id ON agent_nodes(session_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_nodes_parent ON agent_nodes(parent_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_task_plans_session_id ON task_plans(session_id);
+    CREATE INDEX IF NOT EXISTS idx_sub_tasks_plan_id ON sub_tasks(plan_id);
 `;
 
 let _db: PantheonDatabase | null = null;

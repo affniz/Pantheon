@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Classifier } from "../classifier.js";
-import type { RoutingConfig } from "@pantheon/shared";
+import type { RoutingConfig, ChatMessage } from "@pantheon/shared";
 
 describe("Classifier", () => {
     let mockOpenAI: any;
@@ -19,13 +19,25 @@ describe("Classifier", () => {
         config = {
             enabled: true,
             tiers: {
-                simple: "model-simple",
+                general:  "model-general",
+                simple:   "model-simple",
                 standard: "model-standard",
-                complex: "model-complex"
-            }
+                complex:  "model-complex",
+            },
+            routingContextDepth: 5,
         };
 
         classifier = new Classifier(mockOpenAI as any, config);
+    });
+
+    it("classifies 'general' response (greetings, Q&A)", async () => {
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: "general" } }]
+        });
+
+        const result = await classifier.classify("Hello, how are you?");
+        expect(result.tier).toBe("general");
+        expect(result.selectedModelId).toBe("model-general");
     });
 
     it("classifies 'simple' response", async () => {
@@ -33,7 +45,7 @@ describe("Classifier", () => {
             choices: [{ message: { content: "simple" } }]
         });
 
-        const result = await classifier.classify("Hello");
+        const result = await classifier.classify("Write a function to add two numbers");
         expect(result.tier).toBe("simple");
         expect(result.selectedModelId).toBe("model-simple");
     });
@@ -56,5 +68,65 @@ describe("Classifier", () => {
         const result = await classifier.classify("What is this?");
         expect(result.tier).toBe("standard");
         expect(result.selectedModelId).toBe("model-standard");
+    });
+
+    it("passes conversation history as context when recentMessages provided", async () => {
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: "complex" } }]
+        });
+
+        const recentMessages: ChatMessage[] = [
+            { role: "user", content: "I'm working on a distributed microservices architecture" },
+            { role: "assistant", content: "I can help with that." },
+            { role: "user", content: "The service mesh is failing under load" },
+        ];
+
+        const result = await classifier.classify("debug this", recentMessages);
+        expect(result.tier).toBe("complex");
+
+        // Verify the API was called with context in the user message
+        const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
+        const userMessage = callArgs.messages.find((m: any) => m.role === "user");
+        expect(userMessage.content).toContain("Recent conversation history");
+        expect(userMessage.content).toContain("distributed microservices architecture");
+        expect(userMessage.content).toContain("debug this");
+    });
+
+    it("includes reason with context depth in the routing decision", async () => {
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: "simple" } }]
+        });
+
+        const recentMessages: ChatMessage[] = [
+            { role: "user", content: "prior message" },
+        ];
+
+        const result = await classifier.classify("short question", recentMessages);
+        expect(result.reason).toContain("context depth: 1");
+    });
+
+    it("classifies without context when no recentMessages provided", async () => {
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: "simple" } }]
+        });
+
+        const result = await classifier.classify("Quick question");
+
+        const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
+        const userMessage = callArgs.messages.find((m: any) => m.role === "user");
+        expect(userMessage.content).toBe("Quick question");
+        expect(userMessage.content).not.toContain("Recent conversation history");
+    });
+
+    it("uses general tier model for classification (llama-smart, not removed llama-fast)", async () => {
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: "simple" } }]
+        });
+
+        await classifier.classify("test prompt");
+
+        const callArgs = mockOpenAI.chat.completions.create.mock.calls[0][0];
+        // Classifier should use tiers.general (llama-smart) not a removed model
+        expect(callArgs.model).toBe("model-general");
     });
 });

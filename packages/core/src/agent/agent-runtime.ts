@@ -3,6 +3,7 @@ import type {
     RoutingDecision,
     ToolCall,
     ToolResult,
+    AgentRole,
 } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
@@ -45,6 +46,16 @@ export interface AgentConfig {
      * Optional sessionId to attach to spans for cross-referencing with sessions.
      */
     sessionId?: string;
+    /** Unique identifier for this agent instance (for multi-agent tracing) */
+    agentId?: string;
+    /** Role this agent plays in the orchestration graph */
+    agentRole?: AgentRole;
+    /**
+     * If set, the agent joins this existing trace context instead of creating
+     * a new trace. Used by sub-agents so their spans appear as children of the
+     * orchestrator's trace.
+     */
+    joinTrace?: boolean;
 }
 
 export interface AgentTurnResult {
@@ -269,6 +280,14 @@ export class AgentRuntime {
                             try {
                                 content = await tool.execute(toolCall.arguments, this.config.sandbox);
                                 toolSpan.attributes.outputLength = content.length;
+                                // Builtin tools return error messages as strings (e.g.
+                                // "Error writing file: ...") instead of throwing. Detect
+                                // them here so isError is set correctly and the model gets
+                                // an accurate signal to retry or report the failure.
+                                if (content.startsWith("Error:") || content.startsWith("Error ")) {
+                                    isError = true;
+                                    toolSpan.attributes["error"] = content;
+                                }
                             } catch (error) {
                                 content = `Error executing tool: ${error instanceof Error ? error.message : String(error)}`;
                                 isError = true;
@@ -332,25 +351,37 @@ export class AgentRuntime {
         }; // end runFn
 
 
-        // Wrap the entire agent turn in a trace context + root span
+        // Wrap the entire agent turn in a trace context + root span.
+        // Sub-agents (joinTrace=true) use startSpan directly so their spans
+        // appear as children of the orchestrator's existing trace.
+        const wrapInSpan = async (): Promise<AgentTurnResult> => {
+            return Tracer.startSpan(
+                "agent.turn",
+                "agent",
+                async (span) => {
+                    span.attributes.modelId = modelId ?? "auto";
+                    if (this.config.agentId) span.attributes.agentId = this.config.agentId;
+                    if (this.config.agentRole) span.attributes.agentRole = this.config.agentRole;
+                    const result = await runFn();
+                    span.attributes.iterations = result.iterations;
+                    span.attributes.toolCallCount = result.toolCalls.length;
+                    span.attributes.selectedModelId = result.decision.selectedModelId;
+                    span.attributes.routingTier = result.decision.tier;
+                    span.attributes.escalated = result.escalated;
+                    return result;
+                }
+            );
+        };
+
+        if (this.config.joinTrace) {
+            // Sub-agent: join the existing trace context (set by the orchestrator)
+            return wrapInSpan();
+        }
+
+        // Top-level agent: create a new trace
         return Tracer.startTrace(
             this.config.sessionId,
-            async (traceId) => {
-                return Tracer.startSpan(
-                    "agent.turn",
-                    "agent",
-                    async (span) => {
-                        span.attributes.modelId = modelId ?? "auto";
-                        const result = await runFn();
-                        span.attributes.iterations = result.iterations;
-                        span.attributes.toolCallCount = result.toolCalls.length;
-                        span.attributes.selectedModelId = result.decision.selectedModelId;
-                        span.attributes.routingTier = result.decision.tier;
-                        span.attributes.escalated = result.escalated;
-                        return result;
-                    }
-                );
-            }
+            async (_traceId) => wrapInSpan()
         );
     }
 }

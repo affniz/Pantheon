@@ -23,7 +23,19 @@ export class PermissionManager {
     /** Tools the user has "always allow"-ed for this session */
     private alwaysAllowed = new Set<string>();
 
-    constructor(private promptUser: PermissionCallback) {}
+    /**
+     * @param promptUser  Callback that prompts the user for a permission decision.
+     * @param autoApprove Tool names to pre-approve for the entire session (no prompts).
+     *                    Only use for safe tools — destructive tools always prompt regardless.
+     */
+    constructor(
+        private promptUser: PermissionCallback,
+        autoApprove: string[] = []
+    ) {
+        for (const name of autoApprove) {
+            this.alwaysAllowed.add(name);
+        }
+    }
 
     /**
      * Check if a tool call is permitted.

@@ -201,6 +201,62 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                         accumulatedText = `Error: ${evt.data.message}`;
                         setStreamedText(accumulatedText);
                         break;
+
+                    // ── v0.6 orchestration events ────────────────────────────
+                    case "orchestration_start": {
+                        const d = evt.data;
+                        const prefix = `\n⚙  Orchestrating with ${d.taskCount} parallel tasks (plan: ${d.planId.slice(0, 8)})\n`;
+                        accumulatedText += prefix;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "plan_created": {
+                        const plan = evt.data.plan as { tasks?: Array<{ id: string; title: string }> };
+                        if (plan?.tasks) {
+                            const taskList = plan.tasks
+                                .map((t: { id: string; title: string }, i: number) => `  ${i + 1}. ${t.title}`)
+                                .join("\n");
+                            accumulatedText += `\n📋 Task Plan:\n${taskList}\n`;
+                            setStreamedText(accumulatedText);
+                        }
+                        break;
+                    }
+
+                    case "agent_spawned": {
+                        const agent = evt.data.agent as { taskId?: string };
+                        if (agent?.taskId) {
+                            accumulatedText += `\n  ▶ [executor] started task ${agent.taskId}`;
+                            setStreamedText(accumulatedText);
+                        }
+                        break;
+                    }
+
+                    case "agent_completed": {
+                        const d = evt.data;
+                        accumulatedText += `\n  ✓ [executor:${d.agentId.slice(0, 6)}] completed`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "agent_failed": {
+                        const d = evt.data;
+                        accumulatedText += `\n  ✗ [executor:${d.agentId.slice(0, 6)}] failed: ${d.error}`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "review_result": {
+                        const d = evt.data;
+                        const icon = d.approved ? "✅" : "⚠️";
+                        accumulatedText += `\n\n${icon} Review: ${d.feedback}\n\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "orchestration_done":
+                        // Final response arrives via the "text" event — nothing extra needed here
+                        break;
                 }
             }
 
@@ -328,7 +384,7 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
     for (const [line, color] of LOGO_LINES) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.5.0"));
+    console.log(chalk.hex("#6B7280")("                              v0.6.0"));
     console.log("");
 
     if (resume) {
