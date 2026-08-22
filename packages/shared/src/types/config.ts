@@ -37,4 +37,35 @@ export interface PantheonConfig {
     gateway: GatewayConfig;
     routing: RoutingConfig;
     defaultModel?: string;
+    sandbox?: SandboxConfig;
+    plugins?: PluginsConfig;
+}
+
+export interface ShellAllowlistEntry {
+    /** Command binary name (e.g. "git", "ls", "npm") */
+    command: string;
+    /** Allowed subcommands. Empty array = all subcommands allowed. */
+    subcommands?: string[];
+    /** Additional argument patterns to block even when command is allowed */
+    blockedArgs?: string[]; // stored as string patterns, compiled to RegExp at runtime
+    /** Human-readable description for audit logging */
+    description: string;
+}
+
+export interface SandboxConfig {
+    /** Whether to use allowlist mode (true) or bypass all checks (false). Default: true */
+    allowlistEnabled: boolean;
+    /** Additional entries to add to the default allowlist */
+    additionalAllowlist: ShellAllowlistEntry[];
+    /** Command binary names to remove from the default allowlist */
+    denyFromDefault: string[];
+}
+
+export interface PluginsConfig {
+    /** Directory where plugins are installed. Default: ~/.pantheon/plugins */
+    directory: string;
+    /** Whether to auto-start MCP servers on boot. Default: false */
+    autoStart: boolean;
+    /** Keepalive timeout for MCP servers in ms. Default: 300000 (5 min) */
+    keepaliveTimeout: number;
 }

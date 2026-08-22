@@ -1,0 +1,31 @@
+{
+  "name": "@pantheon-plugins/jira",
+  "version": "0.1.0",
+  "description": "Jira integration via MCP — manage issues, sprints, and boards",
+  "author": "Pantheon Contributors",
+  "license": "MIT",
+  "mcp": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@sooperset/mcp-atlassian"],
+    "env": {
+      "JIRA_URL": "${JIRA_URL}",
+      "JIRA_USERNAME": "${JIRA_USERNAME}",
+      "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
+    }
+  },
+  "env": {
+    "JIRA_URL": {
+      "description": "Your Jira instance URL (e.g. https://your-org.atlassian.net)",
+      "required": true
+    },
+    "JIRA_USERNAME": {
+      "description": "Your Jira account email address",
+      "required": true
+    },
+    "JIRA_API_TOKEN": {
+      "description": "Jira API token (create at https://id.atlassian.com/manage-profile/security/api-tokens)",
+      "required": true
+    }
+  }
+}

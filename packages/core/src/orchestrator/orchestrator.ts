@@ -40,6 +40,8 @@ export interface OrchestratorConfig {
     reviewerModelId: string;
     /** Max concurrent executor agents. Default: 5 */
     maxConcurrency?: number;
+    /** Max sub-tasks the Planner may generate. Default: 3. Range: 1–6. */
+    maxSubTasks?: number;
     /** Callback for orchestration events (streamed as SSE to the CLI) */
     onEvent?: (event: OrchestrationEvent) => void;
     /** Forwarded to sub-agents for UI rendering */
@@ -108,6 +110,7 @@ export class Orchestrator {
                         plannerModelId: this.config.plannerModelId,
                         sessionId: this.config.sessionId,
                         parentAgentId: orchestratorAgentId,
+                        maxSubTasks: this.config.maxSubTasks ?? 3,
                     });
 
                     const plan = await planner.plan(prompt);
@@ -155,6 +158,7 @@ export class Orchestrator {
                         reviewerModelId: this.config.reviewerModelId,
                         sessionId: this.config.sessionId,
                         parentAgentId: orchestratorAgentId,
+                        sandbox: this.config.sandbox,
                     });
 
                     const reviewResult = await reviewer.review(plan, completedTasks);
@@ -256,14 +260,45 @@ export class Orchestrator {
             return true;
         });
 
+        // Map from task id → toolResults from the agent that executed it
+        const taskToolResults = new Map<string, ToolResult[]>();
+
         // Build context from previous task results
-        const contextSuffix = previousResults.size > 0
-            ? "\n\nResults from previously completed tasks:\n" +
-              [...previousResults.values()]
-                  .filter((t) => t.status === "completed" && t.result)
-                  .map((t) => `- ${t.title}: ${t.result}`)
-                  .join("\n")
-            : "";
+        const buildContextSuffix = (): string => {
+            if (previousResults.size === 0) return "";
+
+            const lines: string[] = ["\n\nContext from previously completed tasks:"];
+            for (const t of previousResults.values()) {
+                if (t.status !== "completed") continue;
+                lines.push(`\n### Task: ${t.title} [${t.status}]`);
+                if (t.result) {
+                    lines.push(`Summary: ${t.result}`);
+                }
+                // Extract files written or modified by this task's agent
+                const tResults = taskToolResults.get(t.id) ?? [];
+                const writtenFiles = tResults
+                    .filter(
+                        (r) =>
+                            !r.isError &&
+                            (r.name === "write_file" || r.name === "edit_file") &&
+                            typeof r.content === "string",
+                    )
+                    .map((r) => {
+                        // Output format: "Successfully wrote N lines to /abs/path/file.ts"
+                        //               "Successfully edited /abs/path: replaced ..."
+                        const match = r.content.match(/(?:wrote \d+ lines to|edited)\s+(\S+)/);
+                        return match ? match[1] : null;
+                    })
+                    .filter((p): p is string => p !== null);
+
+                if (writtenFiles.length > 0) {
+                    lines.push(`Files written/modified:\n${writtenFiles.map((f) => `  - ${f}`).join("\n")}`);
+                }
+            }
+            return lines.join("\n");
+        };
+
+        const contextSuffix = buildContextSuffix();
 
         // Execute in batches of maxConcurrency
         const results: SubTask[] = [];
@@ -301,12 +336,15 @@ export class Orchestrator {
                         sessionId: this.config.sessionId,
                         parentAgentId: orchestratorAgentId,
                         sandbox: this.config.sandbox,
-                        permissionManager: this.config.permissionManager,
+                        // Each sub-agent gets its own PermissionManager forked from the parent,
+                        // pre-seeded with the session's existing grants so previously approved
+                        // tools don't re-prompt — but concurrent agents don't race on shared state.
+                        permissionManager: this.config.permissionManager.fork(),
                         ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
                         ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
                     };
 
-                    let execResult: { taskId: string; agentId: string; result: string; toolCalls: ToolCall[]; iterations: number };
+                    let execResult: { taskId: string; agentId: string; result: string; toolCalls: ToolCall[]; toolResults: ToolResult[]; iterations: number };
 
                     // Role-based dispatch
                     if (taskRole === "code") {
@@ -319,6 +357,9 @@ export class Orchestrator {
                         const agent = new ExecutorAgent({ ...commonConfig, executorModelId: this.config.agentModelId });
                         execResult = await agent.execute(task, contextMessages);
                     }
+
+                    // Stash tool results so the context builder can extract file paths
+                    taskToolResults.set(task.id, execResult.toolResults);
 
                     this.emit({
                         type: "agent_completed",

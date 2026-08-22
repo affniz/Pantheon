@@ -23,9 +23,10 @@ interface Props {
     noTools?: boolean | undefined;
     resume?: string | boolean | undefined;
     noSave?: boolean | undefined;
+    budget?: "low" | "medium" | "high";
 }
 
-function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: Props) {
+function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, budget = "medium" }: Props) {
     const client = useMemo(() => new PantheonApiClient(getServerUrl()), []);
 
     // Session state
@@ -133,11 +134,15 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
             let iterations = 1;
 
             const stream = client.chat({
-                ...((!noSave && sessionId) ? { sessionId } : {}),
+                ...(((!noSave && sessionId) ? { sessionId } : {})),
                 prompt: value.trim(),
                 ...(effectiveModelId ? { model: effectiveModelId } : {}),
                 ...((noTools) ? { noTools: true } : {}),
                 workingDir: process.cwd(),
+                // Budget controls
+                ...(budget === "low" ? { orchestrate: false } : {}),
+                ...(budget === "high" ? { maxSubTasks: 6 } : {}),
+                ...(budget === "medium" ? { maxSubTasks: 3 } : {}),
             });
 
             for await (const evt of stream) {
@@ -202,7 +207,12 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                         setStreamedText(accumulatedText);
                         break;
 
-                    // ── v0.6 orchestration events ────────────────────────────
+                    case "warning":
+                        accumulatedText += `\n⚠  ${evt.data.message}\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+
+
                     case "orchestration_start": {
                         const d = evt.data;
                         const prefix = `\n⚙  Orchestrating with ${d.taskCount} parallel tasks (plan: ${d.planId.slice(0, 8)})\n`;
@@ -212,12 +222,16 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave }: P
                     }
 
                     case "plan_created": {
-                        const plan = evt.data.plan as { tasks?: Array<{ id: string; title: string }> };
-                        if (plan?.tasks) {
+                        const plan = evt.data.plan as {
+                            tasks?: Array<{ id: string; title: string; taskRole?: string }>;
+                        };
+                        if (plan?.tasks && plan.tasks.length > 0) {
+                            const roleIcon = (r?: string) =>
+                                r === "code" ? "[code]" : r === "debug" ? "[debug]" : "[general]";
                             const taskList = plan.tasks
-                                .map((t: { id: string; title: string }, i: number) => `  ${i + 1}. ${t.title}`)
+                                .map((t, i) => `  ${i + 1}. ${roleIcon(t.taskRole)} ${t.title}`)
                                 .join("\n");
-                            accumulatedText += `\n📋 Task Plan:\n${taskList}\n`;
+                            accumulatedText += `\n◆ Plan (${plan.tasks.length} sub-task${plan.tasks.length !== 1 ? "s" : ""}):\n${taskList}\n`;
                             setStreamedText(accumulatedText);
                         }
                         break;
@@ -370,7 +384,7 @@ const LOGO_LINES: readonly [string, string][] = [
     [" ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝", "#C68A1A"],
 ];
 
-export async function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean) {
+export async function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean, budget?: "low" | "medium" | "high") {
     // Auto-start the server if not running
     try {
         await ensureServerRunning();
@@ -384,7 +398,7 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
     for (const [line, color] of LOGO_LINES) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.6.0"));
+    console.log(chalk.hex("#6B7280")("                              v0.7.0"));
     console.log("");
 
     if (resume) {
@@ -395,12 +409,19 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
         console.log(chalk.hex("#6B7280")("  Tools disabled — running in pure chat mode\n"));
     }
 
+    if (budget === "low") {
+        console.log(chalk.hex("#6B7280")("  Budget: low — orchestration disabled\n"));
+    } else if (budget === "high") {
+        console.log(chalk.hex("#6B7280")("  Budget: high — up to 6 parallel sub-tasks\n"));
+    }
+
     render(
         <ChatApp
             {...(modelId ? { modelId } : {})}
             noTools={noTools ?? false}
             resume={resume}
             noSave={noSave}
+            budget={budget ?? "medium"}
         />
     );
 }

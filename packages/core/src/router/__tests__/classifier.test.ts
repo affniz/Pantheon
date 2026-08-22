@@ -1,6 +1,25 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import Database from "better-sqlite3";
+import { createTestDb } from "../../db/client.js";
 import { Classifier } from "../classifier.js";
 import type { RoutingConfig, ChatMessage } from "@pantheon/shared";
+
+// ── DB mock — redirect getDb() to an in-memory DB so TraceCollector never
+// touches the on-disk ~/.pantheon/pantheon.db during tests. ──────────────────
+let _testDb: ReturnType<typeof createTestDb> | null = null;
+
+vi.mock("../../db/client.js", async (importOriginal) => {
+    const original = await importOriginal<typeof import("../../db/client.js")>();
+    return {
+        ...original,
+        getDb: () => {
+            if (!_testDb) {
+                _testDb = createTestDb(new Database(":memory:"));
+            }
+            return _testDb;
+        },
+    };
+});
 
 describe("Classifier", () => {
     let mockOpenAI: any;

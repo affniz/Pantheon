@@ -46,11 +46,21 @@ export class ToolRegistry {
         return this.tools.get(name);
     }
 
+    /** Check if a tool name is registered */
+    has(name: string): boolean {
+        return this.tools.has(name);
+    }
+
     /**
      * List all registered tools.
      */
     list(): Tool[] {
         return [...this.tools.values()];
+    }
+
+    /** Get all tools registered by a specific plugin (matched via definition.pluginName) */
+    getByPlugin(pluginName: string): Tool[] {
+        return this.list().filter((t) => t.definition.pluginName === pluginName);
     }
 
     /**
@@ -62,13 +72,17 @@ export class ToolRegistry {
 
     /**
      * Format tools for the OpenAI chat completions API `tools` parameter.
+     * Plugin tools have their plugin name prepended to the description so the LLM
+     * knows where each tool comes from.
      */
     toOpenAITools(): OpenAITool[] {
         return this.list().map((t) => ({
             type: "function" as const,
             function: {
                 name: t.definition.name,
-                description: t.definition.description,
+                description: t.definition.pluginName
+                    ? `[${t.definition.pluginName}] ${t.definition.description}`
+                    : t.definition.description,
                 parameters: t.definition.parameters,
             },
         }));

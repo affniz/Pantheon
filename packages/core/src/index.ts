@@ -1,4 +1,5 @@
-export { loadConfig, saveConfig } from "./config/loader.js";
+export { loadConfig, saveConfig, getCapabilities } from "./config/loader.js";
+export type { PantheonCapabilities } from "./config/loader.js";
 export { ModelRegistry } from "./registry/model-registry.js";
 export { Gateway } from "./gateway/gateway.js";
 export { Classifier } from "./router/classifier.js";
@@ -9,7 +10,9 @@ export { PermissionManager } from "./sandbox/permission-manager.js";
 export type { PermissionDecision, PermissionCallback } from "./sandbox/permission-manager.js";
 export { ToolRegistry } from "./tools/tool-registry.js";
 export type { Tool, OpenAITool } from "./tools/tool-registry.js";
-export { registerBuiltinTools } from "./tools/builtin/index.js";
+export { registerBuiltinTools, editFileTool, grepTool } from "./tools/builtin/index.js";
+export { buildRepoMap } from "./tools/repo-map/index.js";
+
 export { AgentRuntime } from "./agent/agent-runtime.js";
 export type { AgentConfig, AgentTurnResult } from "./agent/agent-runtime.js";
 export { getDb, createTestDb, closeDb } from "./db/client.js";
@@ -32,3 +35,7 @@ export { DebuggerAgent } from "./orchestrator/debugger.js";
 export type { DebuggerConfig, DebuggerResult } from "./orchestrator/debugger.js";
 export { ReviewerAgent } from "./orchestrator/reviewer.js";
 export type { ReviewerConfig, ReviewResult } from "./orchestrator/reviewer.js";
+export { PluginRegistry, loadPlugin, discoverPlugins, installPlugin, uninstallPlugin, DEFAULT_PLUGINS_DIR, validateManifest, parseManifest } from "./plugins/index.js";
+export type { PluginManifest, PluginToolConfig, MCPServerConfig, LoadedPlugin, PluginInfo, PluginStatus, PluginTransport, PluginValidationResult } from "./plugins/index.js";
+export { MCPClient, StdioTransport, SSETransport, mcpToolToDefinition, createMCPTool, createMCPTools, MCP_VERSION } from "./mcp/index.js";
+export type { MCPTransportConfig, StdioTransportConfig, SSETransportConfig, MCPToolDefinition, MCPToolCallResult, ServerCapabilities } from "./mcp/index.js";

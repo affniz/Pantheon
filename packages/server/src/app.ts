@@ -10,6 +10,7 @@ import { modelsRouter } from "./routes/models.js";
 import { costRouter } from "./routes/cost.js";
 import { tracesRouter } from "./routes/traces.js";
 import { agentsRouter } from "./routes/agents.js";
+import { pluginsRouter } from "./routes/plugins.js";
 
 // Initialize Sentry before the app is configured (no-op if SENTRY_DSN is unset)
 initSentry();
@@ -30,6 +31,7 @@ app.route("/api/models", modelsRouter);
 app.route("/api/cost", costRouter);
 app.route("/api/traces", tracesRouter);
 app.route("/api/agents", agentsRouter);
+app.route("/api/plugins", pluginsRouter);
 
 // ── Global error handler ─────────────────────────────────────────────────────
 app.onError((err, c) => {

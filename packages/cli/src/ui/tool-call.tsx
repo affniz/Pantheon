@@ -2,17 +2,19 @@ import React from "react";
 import { Box, Text } from "ink";
 import type { ToolCall, ToolResult } from "@pantheon/shared";
 import { theme } from "./theme.js";
+import { PluginBadge } from "./plugin-badge.js";
 
 interface ToolCallDisplayProps {
     call: ToolCall;
     safety: "safe" | "destructive";
+    pluginName?: string;
 }
 
 /**
  * Renders a tool call — shows the tool name and arguments
  * in a distinctive branded style.
  */
-export function ToolCallDisplay({ call, safety }: ToolCallDisplayProps) {
+export function ToolCallDisplay({ call, safety, pluginName }: ToolCallDisplayProps) {
     const argsStr = formatArgs(call.arguments);
     const safetyColor =
         safety === "destructive" ? theme.colors.warning : theme.colors.accent;
@@ -26,6 +28,7 @@ export function ToolCallDisplay({ call, safety }: ToolCallDisplayProps) {
                 <Text color={theme.colors.primary} bold>
                     {call.name}
                 </Text>
+                {pluginName && <PluginBadge pluginName={pluginName} />}
                 <Text color={theme.colors.textDim}>{"("}</Text>
                 <Text color={theme.colors.text}>{argsStr}</Text>
                 <Text color={theme.colors.textDim}>{")"}</Text>

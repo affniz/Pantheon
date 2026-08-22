@@ -105,3 +105,12 @@ export const subTasks = sqliteTable("sub_tasks", {
     createdAt: text("created_at").notNull(),
 });
 
+export const installedPlugins = sqliteTable("installed_plugins", {
+    name: text("name").primaryKey(),                         // Plugin package name (primary key)
+    version: text("version").notNull(),
+    source: text("source").notNull(),                        // npm package or local path
+    installedAt: integer("installed_at").notNull(),          // epoch ms
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    config: text("config"),                                  // JSON plugin settings
+    directory: text("directory").notNull(),                  // absolute path to plugin dir
+});

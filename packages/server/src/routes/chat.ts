@@ -11,6 +11,11 @@ import {
     SessionManager,
     SessionSummarizer,
     Orchestrator,
+    PluginRegistry,
+    loadConfig,
+    getCapabilities,
+    DEFAULT_PLUGINS_DIR,
+    buildRepoMap,
 } from "@pantheon/core";
 import type { PermissionDecision } from "@pantheon/core";
 import type { ChatMessage, OrchestrationEvent } from "@pantheon/shared";
@@ -58,6 +63,8 @@ chatRouter.post("/", async (c) => {
         workingDir?: string;
         /** "auto" (default) = orchestrate complex tasks; true = always; false = never */
         orchestrate?: boolean | "auto";
+        /** Max sub-tasks for the planner. Corresponds to --budget flag. Default: 3 */
+        maxSubTasks?: number;
     }>();
 
     const {
@@ -67,6 +74,7 @@ chatRouter.post("/", async (c) => {
         noTools = false,
         workingDir = process.env["PANTHEON_WORKSPACE"] ?? process.cwd(),
         orchestrate = "auto",
+        maxSubTasks = 3,
     } = body;
 
     if (!prompt?.trim()) {
@@ -100,13 +108,12 @@ chatRouter.post("/", async (c) => {
             // Build episodic memory context
             const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
             let episodicMemory = "";
-            if (fastModelId) {
+            if (fastModelId && effectiveSessionId) {
                 const summarizer = new SessionSummarizer(gateway, fastModelId);
-                const summaries = summarizer.getRecentSummaries(5);
-                if (summaries.length > 0) {
-                    const lines = summaries.map((s) => `- "${s.title}" — ${s.summary}`);
-                    episodicMemory = `\n\nYou have had these recent conversations with the user:\n${lines.join("\n")}`;
-                }
+                episodicMemory = summarizer.getEpisodicMemoryContext(effectiveSessionId, {
+                    recentMessageCount: 10,
+                    summaryLimit: 4,
+                });
             }
 
             if (noTools) {
@@ -136,13 +143,40 @@ chatRouter.post("/", async (c) => {
                     // "auto" — classify the prompt and orchestrate if complex
                     const routingDecision = await gateway.resolveRouting(messages, model);
                     if (routingDecision.tier === "complex" && !model) {
-                        useOrchestration = true;
+                        const caps = getCapabilities();
+                        if (caps.orchestrationEnabled) {
+                            useOrchestration = true;
+                        } else {
+                            // DEEPSEEK_API_KEY not set — warn and fall back to llama-smart
+                            await sendEvent("warning", {
+                                message:
+                                    "DEEPSEEK_API_KEY not set — complex task routed to llama-smart instead. " +
+                                    "Add DEEPSEEK_API_KEY to .env to enable full orchestration.",
+                            });
+                            // Override the decision to use llama-smart (general tier)
+                            routingDecision.tier = "general";
+                            routingDecision.selectedModelId = registry.getRoutingConfig().tiers.general;
+                            routingDecision.reason = "fallback: DEEPSEEK_API_KEY not set";
+                            useOrchestration = false;
+                        }
                     }
                     // Emit routing decision for the CLI
                     await sendEvent("routing", routingDecision);
                 }
 
                 const sandbox = Sandbox.create(workingDir);
+
+                // Build codebase map at session start — injected into agent system prompt
+                // as a ## Codebase Map section. Gives agents structural awareness without
+                // any listDirectory/readFile exploration loops.
+                let repoMapContent: string | undefined;
+                try {
+                    repoMapContent = await buildRepoMap(workingDir);
+                } catch (e) {
+                    process.stderr.write(
+                        `[chat] repo map build failed (non-fatal): ${e instanceof Error ? e.message : String(e)}\n`,
+                    );
+                }
 
                 const permissionManager = new PermissionManager(
                     (toolName, args, safety) => {
@@ -189,6 +223,7 @@ chatRouter.post("/", async (c) => {
                         agentModelId: routingConfig.tiers.complex,     // deepseek-v4-pro (coder, debugger, executor)
                         reviewerModelId: routingConfig.tiers.complex,  // deepseek-v4-pro
                         maxConcurrency: 5,
+                        maxSubTasks: Math.min(6, Math.max(1, maxSubTasks)),
                         ...(episodicMemory ? { episodicMemory } : {}),
                         onEvent: (event: OrchestrationEvent) => {
                             sendEvent(event.type, event).catch(() => {});
@@ -231,12 +266,23 @@ chatRouter.post("/", async (c) => {
                     const toolRegistry = new ToolRegistry();
                     registerBuiltinTools(toolRegistry);
 
+                    // Wire plugins
+                    const pluginCfg = loadConfig().plugins;
+                    const pluginDir = pluginCfg?.directory ?? DEFAULT_PLUGINS_DIR;
+                    const pluginReg = new PluginRegistry(toolRegistry, pluginDir);
+                    try {
+                        await pluginReg.loadFromDirectory(sandbox);
+                    } catch (e) {
+                        process.stderr.write(`[chat] plugin load error: ${e instanceof Error ? e.message : String(e)}\n`);
+                    }
+
                     const agentRuntime = new AgentRuntime(gateway, toolRegistry, {
                         maxIterations: 20,
                         sandbox,
                         permissionManager,
                         sessionId: effectiveSessionId,
                         ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
+                        ...(repoMapContent ? { repoMap: repoMapContent } : {}),
                         onToolCall,
                         onToolResult,
                     });

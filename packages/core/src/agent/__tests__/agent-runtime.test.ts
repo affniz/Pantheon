@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import Database from "better-sqlite3";
+import { createTestDb } from "../../db/client.js";
 import { AgentRuntime } from "../agent-runtime.js";
 import type { AgentConfig } from "../agent-runtime.js";
 import type { ChatMessage, ToolCall, ToolResult, RoutingDecision } from "@pantheon/shared";
@@ -7,6 +9,23 @@ import { ToolRegistry } from "../../tools/tool-registry.js";
 import type { Tool } from "../../tools/tool-registry.js";
 import type { Sandbox } from "../../sandbox/sandbox.js";
 import type { PermissionManager } from "../../sandbox/permission-manager.js";
+
+// ── DB mock — redirect getDb() to an in-memory DB so TraceCollector never
+// touches the on-disk ~/.pantheon/pantheon.db during tests. ──────────────────
+let _testDb: ReturnType<typeof createTestDb> | null = null;
+
+vi.mock("../../db/client.js", async (importOriginal) => {
+    const original = await importOriginal<typeof import("../../db/client.js")>();
+    return {
+        ...original,
+        getDb: () => {
+            if (!_testDb) {
+                _testDb = createTestDb(new Database(":memory:"));
+            }
+            return _testDb;
+        },
+    };
+});
 
 /**
  * Helper to create a mock Gateway with a configurable complete() sequence.

@@ -1,0 +1,21 @@
+{
+  "name": "@pantheon-plugins/github",
+  "version": "0.1.0",
+  "description": "GitHub integration via MCP — issues, PRs, repos, code search, file management",
+  "author": "Pantheon Contributors",
+  "license": "MIT",
+  "mcp": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+    }
+  },
+  "env": {
+    "GITHUB_TOKEN": {
+      "description": "GitHub personal access token with repo, issues, and pull_requests scopes",
+      "required": true
+    }
+  }
+}

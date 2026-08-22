@@ -27,6 +27,7 @@ export interface ExecutorResult {
     agentId: string;
     result: string;
     toolCalls: ToolCall[];
+    toolResults: ToolResult[];
     iterations: number;
 }
 
@@ -133,6 +134,7 @@ Focus only on your assigned task — do not try to complete other tasks.`;
                     agentId,
                     result: turnResult.response,
                     toolCalls: turnResult.toolCalls,
+                    toolResults: turnResult.toolResults,
                     iterations: turnResult.iterations,
                 };
             } catch (error) {
