@@ -25,7 +25,7 @@ describe("shell tool", () => {
     });
 
     it("captures stderr", async () => {
-        const result = await shellTool.execute({ command: ">&2 echo error_message" }, sandbox);
+        const result = await shellTool.execute({ command: "echo error_message >&2" }, sandbox);
         expect(result).toContain("STDERR:");
         expect(result).toContain("error_message");
         expect(result).toContain("Exit code: 0");
@@ -39,12 +39,17 @@ describe("shell tool", () => {
 
     it("blocks dangerous commands (sudo)", async () => {
         const result = await shellTool.execute({ command: "sudo ls" }, sandbox);
-        expect(result).toMatch(/Error: Blocked command: sudo is not allowed/);
+        expect(result).toMatch(/Error: .*not on the allowlist/);
     });
 
     it("truncates output", async () => {
         // Set a small max output size for testing
-        sandbox = new Sandbox({ projectRoot: tmpDir, maxOutputSize: 10, shellTimeout: 1000 });
+        sandbox = new Sandbox({
+            projectRoot: tmpDir,
+            maxOutputSize: 10,
+            shellTimeout: 1000,
+            allowlist: { enabled: true, entries: [{ command: "echo", description: "echo" }] },
+        });
         const result = await shellTool.execute({ command: "echo 123456789012345" }, sandbox);
         expect(result).toContain("Output truncated at 10 characters");
     });

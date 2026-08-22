@@ -25,6 +25,16 @@ const DEFAULTS: PantheonConfig = {
         routingContextDepth: 5,
     },
     defaultModel: "deepseek-v4-flash",
+    sandbox: {
+        allowlistEnabled: true,
+        additionalAllowlist: [],
+        denyFromDefault: [],
+    } satisfies import("@pantheon/shared").SandboxConfig,
+    plugins: {
+        directory: path.join(os.homedir(), ".pantheon", "plugins"),
+        autoStart: false,
+        keepaliveTimeout: 300_000,
+    } satisfies import("@pantheon/shared").PluginsConfig,
 };
 
 function findConfigPath(): string | null {
@@ -56,6 +66,16 @@ export function loadConfig(): PantheonConfig {
             ...parsed.routing,
             tiers: { ...DEFAULTS.routing.tiers, ...parsed.routing?.tiers },
         },
+        sandbox: {
+            allowlistEnabled: parsed.sandbox?.allowlistEnabled ?? true,
+            additionalAllowlist: parsed.sandbox?.additionalAllowlist ?? [],
+            denyFromDefault: parsed.sandbox?.denyFromDefault ?? [],
+        },
+        plugins: {
+            directory: parsed.plugins?.directory ?? path.join(os.homedir(), ".pantheon", "plugins"),
+            autoStart: parsed.plugins?.autoStart ?? false,
+            keepaliveTimeout: parsed.plugins?.keepaliveTimeout ?? 300_000,
+        },
     };
 }
 
@@ -66,4 +86,53 @@ export function saveConfig(config: PantheonConfig, global = false): void {
 
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "config.yml"), yaml.dump(config), "utf-8");
+}
+
+// ─── Capabilities ─────────────────────────────────────────────────────────────
+
+export interface PantheonCapabilities {
+    /** GROQ_API_KEY is set — routing classifier and general Q&A available */
+    routingEnabled: boolean;
+    /** DEEPSEEK_API_KEY is set — coding agents and orchestration available */
+    orchestrationEnabled: boolean;
+    /** ANTHROPIC_API_KEY is set — Claude fallback available */
+    anthropicFallbackEnabled: boolean;
+    /** OPENAI_API_KEY is set — GPT-4o fallback available */
+    openaiFallbackEnabled: boolean;
+    /** Keys that are missing and affect functionality */
+    missingKeys: string[];
+    /** Keys that are set */
+    presentKeys: string[];
+}
+
+/**
+ * Inspect environment variables and return what Pantheon features are available.
+ * Does NOT make any network calls — purely env-based.
+ */
+export function getCapabilities(): PantheonCapabilities {
+    const groqKey = process.env["GROQ_API_KEY"];
+    const deepseekKey = process.env["DEEPSEEK_API_KEY"];
+    const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+    const openaiKey = process.env["OPENAI_API_KEY"];
+
+    const missingKeys: string[] = [];
+    const presentKeys: string[] = [];
+
+    if (groqKey) presentKeys.push("GROQ_API_KEY");
+    else missingKeys.push("GROQ_API_KEY");
+
+    if (deepseekKey) presentKeys.push("DEEPSEEK_API_KEY");
+    else missingKeys.push("DEEPSEEK_API_KEY");
+
+    if (anthropicKey) presentKeys.push("ANTHROPIC_API_KEY");
+    if (openaiKey) presentKeys.push("OPENAI_API_KEY");
+
+    return {
+        routingEnabled: Boolean(groqKey),
+        orchestrationEnabled: Boolean(deepseekKey),
+        anthropicFallbackEnabled: Boolean(anthropicKey),
+        openaiFallbackEnabled: Boolean(openaiKey),
+        missingKeys,
+        presentKeys,
+    };
 }

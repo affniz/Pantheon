@@ -83,4 +83,23 @@ export class PermissionManager {
     isAlwaysAllowed(toolName: string): boolean {
         return this.alwaysAllowed.has(toolName);
     }
+
+    /**
+     * Create a child PermissionManager pre-seeded with this session's grants.
+     *
+     * Used by the Orchestrator so that each concurrent sub-agent in a wave
+     * gets its own isolated permission state — preventing shared mutable state
+     * and TUI prompt races when multiple agents run in parallel.
+     *
+     * The child inherits all current `alwaysAllowed` entries (so previously
+     * approved tools don't re-prompt), but new grants in the child do NOT
+     * propagate back to the parent.
+     */
+    fork(): PermissionManager {
+        const child = new PermissionManager(this.promptUser);
+        for (const name of this.alwaysAllowed) {
+            child.alwaysAllowed.add(name);
+        }
+        return child;
+    }
 }

@@ -22,7 +22,17 @@ IMPORTANT — tool discipline:
 - If a tool call is denied by the user, respect their decision immediately. Do NOT attempt alternative tools or shell workarounds to access the same resource — instead, ask the user what they would like you to do.
 - If you cannot complete a task with the available tools, say so clearly rather than trying unlisted tools.
 - File paths are relative to the project root unless specified as absolute.
-- Keep tool output concise — summarize large outputs instead of repeating them verbatim.`;
+- Keep tool output concise — summarize large outputs instead of repeating them verbatim.
+
+IMPORTANT — file editing discipline:
+- To MODIFY an existing file: use \`edit_file\` with the exact targetContent to replace. Never rewrite the full file just to change a few lines.
+- To CREATE a new file: use \`write_file\`.
+- Always read a file with \`read_file\` before editing it if you are not 100% certain of its current content.
+
+IMPORTANT — codebase search discipline:
+- Use the \`grep\` tool to search for symbols, patterns, or text across files. It is auto-approved and fast.
+- Avoid using \`shell\` with grep/find for codebase searches — the \`grep\` tool is purpose-built and does not require a permission prompt.`;
+
 
 export interface AgentConfig {
     /** Maximum tool-call iterations per turn. Default: 10 */
@@ -56,6 +66,19 @@ export interface AgentConfig {
      * orchestrator's trace.
      */
     joinTrace?: boolean;
+    /**
+     * Pre-built codebase symbol map produced by buildRepoMap().
+     * When provided, injected into the system prompt as a `## Codebase Map` section
+     * so the agent starts every session with structural awareness of the codebase.
+     */
+    repoMap?: string;
+    /**
+     * Maximum total character count of all messages in workingMessages before
+     * mid-turn pruning is triggered. When exceeded, the oldest tool-result
+     * messages are compressed into a single summary via an LLM call.
+     * Default: 80,000 characters (~20,000 tokens for typical code content).
+     */
+    maxContextChars?: number;
 }
 
 export interface AgentTurnResult {
@@ -110,9 +133,14 @@ export class AgentRuntime {
             // Resolve routing once for the entire turn
             const decision = await this.gateway.resolveRouting(messages, modelId);
 
-            const systemPrompt = this.config.systemPrompt
+            const systemPromptBase = this.config.systemPrompt
                 ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
                 : BASE_SYSTEM_PROMPT;
+
+            // Append the codebase repo map if provided (built at session start)
+            const systemPrompt = this.config.repoMap
+                ? `${systemPromptBase}\n\n## Codebase Map\n${this.config.repoMap}`
+                : systemPromptBase;
 
             // Build the working message list with system prompt
             const workingMessages: ChatMessage[] = [
@@ -130,8 +158,82 @@ export class AgentRuntime {
             let escalated = false;
             let currentDecision = decision; // may be updated mid-turn on escalation
 
+            const MAX_CONTEXT_CHARS = this.config.maxContextChars ?? 80_000;
+
             while (iterations < this.config.maxIterations) {
                 iterations++;
+
+                // ── Context window pruning ─────────────────────────────────────────
+                // Guard against hitting model context limits silently on long turns.
+                // When workingMessages exceeds maxContextChars, compress the oldest
+                // tool-result messages into a single summary via the fast model.
+                const totalChars = workingMessages.reduce(
+                    (sum, m) => sum + (m.content?.length ?? 0),
+                    0,
+                );
+                if (totalChars > MAX_CONTEXT_CHARS) {
+                    // Find the oldest "tool" role messages beyond the first 3 messages
+                    // (system prompt + initial user message + first assistant reply).
+                    const PRESERVE_HEAD = 3;
+                    const pruneTargets = workingMessages
+                        .slice(PRESERVE_HEAD)
+                        .map((m, i) => ({ m, i: i + PRESERVE_HEAD }))
+                        .filter(({ m }) => m.role === "tool");
+
+                    if (pruneTargets.length > 0) {
+                        // Collect the oldest half for compression
+                        const half = Math.max(1, Math.floor(pruneTargets.length / 2));
+                        const toCompress = pruneTargets.slice(0, half);
+
+                        const combinedContent = toCompress
+                            .map(({ m }) => m.content ?? "")
+                            .join("\n---\n")
+                            .slice(0, 8_000); // cap input to the summary call
+
+                        try {
+                            const summaryResp = await this.gateway.complete(
+                                [
+                                    {
+                                        role: "system",
+                                        content:
+                                            "You are a summarizer. Condense the following tool results " +
+                                            "into 1-3 sentences preserving key facts (file paths, errors, values). " +
+                                            "Be extremely concise.",
+                                    },
+                                    { role: "user", content: combinedContent },
+                                ],
+                                "llama-smart", // fast, cheap summarization model
+                            );
+
+                            const summary = summaryResp.message.content;
+                            // Replace the targeted messages' content in-place with the summary
+                            // (replace the first one, delete the rest)
+                            const firstIdx = toCompress[0]!.i;
+                            workingMessages[firstIdx] = {
+                                ...workingMessages[firstIdx]!,
+                                content: `[Context pruned] ${summary}`,
+                            };
+                            // Remove the rest from back to front to preserve indices
+                            for (let k = toCompress.length - 1; k >= 1; k--) {
+                                workingMessages.splice(toCompress[k]!.i, 1);
+                            }
+                            process.stderr.write(
+                                `[agent] context pruned: compressed ${toCompress.length} tool results (total was ${totalChars} chars)\n`,
+                            );
+                        } catch {
+                            // If summary fails, just truncate content of the oldest messages
+                            for (const { i } of toCompress) {
+                                if (workingMessages[i]) {
+                                    workingMessages[i] = {
+                                        ...workingMessages[i]!,
+                                        content: "[Context pruned — output too large to retain]",
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                // ──────────────────────────────────────────────────────────────────
 
                 // Mid-turn escalation: if repeated errors, re-route to the complex tier
                 if (!escalated && errorIterations >= ESCALATION_THRESHOLD) {

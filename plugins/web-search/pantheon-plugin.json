@@ -1,0 +1,45 @@
+{
+  "name": "@pantheon-plugins/web-search",
+  "version": "0.1.0",
+  "description": "Web search integration — search the web using Tavily or Brave Search APIs",
+  "author": "Pantheon Contributors",
+  "license": "MIT",
+  "tools": [
+    {
+      "name": "search",
+      "description": "Search the web for up-to-date information. Returns titles, URLs, and content snippets for the top results.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search query to look up"
+          },
+          "numResults": {
+            "type": "number",
+            "description": "Number of results to return (1-10). Default: 5"
+          },
+          "searchDepth": {
+            "type": "string",
+            "description": "Search depth: 'basic' (fast) or 'advanced' (thorough, costs more API credits). Default: basic",
+            "enum": ["basic", "advanced"]
+          }
+        },
+        "required": ["query"]
+      },
+      "safety": "safe",
+      "handler": "./src/search.js",
+      "exportName": "execute"
+    }
+  ],
+  "env": {
+    "TAVILY_API_KEY": {
+      "description": "Tavily Search API key (preferred). Get one at https://tavily.com",
+      "required": false
+    },
+    "BRAVE_SEARCH_API_KEY": {
+      "description": "Brave Search API key (fallback). Get one at https://brave.com/search/api",
+      "required": false
+    }
+  }
+}

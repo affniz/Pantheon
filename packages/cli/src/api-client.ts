@@ -16,6 +16,8 @@ export interface ChatRequestOptions {
     workingDir?: string;
     /** "auto" (default) = orchestrate complex tasks; true = always; false = never */
     orchestrate?: boolean | "auto";
+    /** Max sub-tasks for planner (budget control). 1-6. */
+    maxSubTasks?: number;
 }
 
 /** Union of all SSE event payloads the chat endpoint can emit */
@@ -34,7 +36,9 @@ export type ChatSSEEvent =
     | { event: "agent_failed"; data: { type: string; agentId: string; error: string } }
     | { event: "plan_created"; data: { type: string; plan: Record<string, unknown> } }
     | { event: "review_result"; data: { type: string; approved: boolean; feedback: string; finalResponse: string } }
-    | { event: "orchestration_done"; data: { type: string; planId: string; finalResponse: string } };
+    | { event: "orchestration_done"; data: { type: string; planId: string; finalResponse: string } }
+    // v0.7 additions
+    | { event: "warning"; data: { message: string } };
 
 /**
  * Typed HTTP client for the Pantheon API server.

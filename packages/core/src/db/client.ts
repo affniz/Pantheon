@@ -107,6 +107,18 @@ const INIT_SQL = `
     CREATE INDEX IF NOT EXISTS idx_agent_nodes_parent ON agent_nodes(parent_agent_id);
     CREATE INDEX IF NOT EXISTS idx_task_plans_session_id ON task_plans(session_id);
     CREATE INDEX IF NOT EXISTS idx_sub_tasks_plan_id ON sub_tasks(plan_id);
+
+    CREATE TABLE IF NOT EXISTS installed_plugins (
+        name          TEXT PRIMARY KEY,
+        version       TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        installed_at  INTEGER NOT NULL,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        config        TEXT,
+        directory     TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_installed_plugins_enabled ON installed_plugins(enabled);
 `;
 
 let _db: PantheonDatabase | null = null;

@@ -12,7 +12,9 @@ import { costSummary, costRecent, costReset } from "./commands/cost.js";
 import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./commands/sessions.js";
 import { traceList, traceShow, traceClear } from "./commands/trace.js";
 import { agentsList, agentsShow, agentsPlan } from "./commands/agents.js";
+import { pluginsList, pluginsInstall, pluginsRemove, pluginsInfo } from "./commands/plugins.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
+import { doctorCommand } from "./commands/doctor.js";
 
 // Brand colors matching theme.ts
 const brand = chalk.hex("#F5A623");
@@ -35,7 +37,7 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(`${dim("                              v0.6.0")}`);
+    console.log(chalk.hex("#6B7280")("                              v0.7.0"));
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
@@ -53,6 +55,10 @@ function showWelcome() {
     console.log(`  ${accent("agents show")} ${muted("<id>")}    ${dim("Show agent details")}`);
     console.log(`  ${accent("agents plan")} ${muted("<id>")}    ${dim("Show task plan for a session")}`);
     console.log("");
+    console.log(`  ${accent("plugins list")}       ${dim("List installed plugins")}`);
+    console.log(`  ${accent("plugins install")} ${muted("<src>")} ${dim("Install a plugin")}`);
+    console.log(`  ${accent("plugins remove")} ${muted("<name>")} ${dim("Remove a plugin")}`);
+    console.log("");
     console.log(`  ${accent("models list")}         ${dim("List configured models")}`);
     console.log(`  ${accent("models default")} ${muted("<id>")} ${dim("Set the default model")}`);
     console.log("");
@@ -67,6 +73,8 @@ function showWelcome() {
     console.log(`  ${accent("server status")}       ${dim("Check if the API server is running")}`);
     console.log(`  ${accent("server stop")}         ${dim("Stop the background API server")}`);
     console.log("");
+    console.log(`  ${accent("doctor")}              ${dim("Check prerequisites and API key health")}`);
+    console.log("");
     console.log(`  ${dim("Run")} ${accent("pantheon <command> --help")} ${dim("for more info")}`);
     console.log("");
 }
@@ -76,7 +84,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.6.0")
+    .version("0.7.0")
     .action(() => {
         showWelcome();
     });
@@ -88,11 +96,17 @@ program
     .option("--no-tools", "Disable tool use (pure chat mode)")
     .option("-r, --resume [sessionId]", "Resume a previous session")
     .option("--no-save", "Do not save this session")
+    .option(
+        "--budget <level>",
+        "Cost/latency budget: low (no orchestration), medium (default, up to 3 sub-tasks), high (up to 6 sub-tasks)",
+        "medium"
+    )
     .action((opts) => chatCommand(
         opts.model,
         opts.tools === false ? true : undefined,
         opts.resume,
         opts.save === false ? true : undefined,
+        opts.budget as "low" | "medium" | "high",
     ));
 
 // ── Models ────────────────────────────────────────────────────────────────────
@@ -195,6 +209,33 @@ agentsCmd
     .argument("<sessionId>", "Session ID")
     .action(agentsPlan);
 
+// ── Plugins ───────────────────────────────────────────────────────────────────
+
+const pluginsCmd = program.command("plugins").description("Manage Pantheon plugins");
+
+pluginsCmd
+    .command("list", { isDefault: true })
+    .description("List installed plugins")
+    .action(pluginsList);
+
+pluginsCmd
+    .command("install")
+    .description("Install a plugin from a local path or npm package")
+    .argument("<source>", "Local directory path or npm package name")
+    .action(pluginsInstall);
+
+pluginsCmd
+    .command("remove")
+    .description("Uninstall a plugin by name")
+    .argument("<name>", "Plugin name (e.g. @pantheon-plugins/github)")
+    .action(pluginsRemove);
+
+pluginsCmd
+    .command("info")
+    .description("Show detailed info about a plugin")
+    .argument("<name>", "Plugin name")
+    .action(pluginsInfo);
+
 // ── Trace ─────────────────────────────────────────────────────────────────────
 
 const traceCmd = program.command("trace").description("View execution traces");
@@ -250,5 +291,12 @@ serverCmd
             console.log(dim("  Pantheon server is not running. Use `pantheon server start` or `pantheon chat`."));
         }
     });
+
+// ── Doctor ────────────────────────────────────────────────────────────────────
+
+program
+    .command("doctor")
+    .description("Check prerequisites, API key health, and gateway reachability")
+    .action(doctorCommand);
 
 program.parse();

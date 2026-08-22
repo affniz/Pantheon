@@ -2,6 +2,23 @@ import { execFile } from "node:child_process";
 import type { Tool } from "../tool-registry.js";
 import type { Sandbox } from "../../sandbox/sandbox.js";
 
+/**
+ * Strip secrets from the environment before passing it to child processes.
+ * Prevents prompt-injection attacks from exfiltrating API keys via allowlisted
+ * commands like `echo $GROQ_API_KEY`.
+ */
+const SECRET_PATTERNS = [/_API_KEY$/i, /_TOKEN$/i, /_SECRET$/i, /_PASSWORD$/i];
+
+function filterEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const filtered: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (!SECRET_PATTERNS.some((re) => re.test(key))) {
+            filtered[key] = value;
+        }
+    }
+    return filtered;
+}
+
 export const shellTool: Tool = {
     definition: {
         name: "shell",
@@ -39,7 +56,7 @@ export const shellTool: Tool = {
                 : sandbox.shellTimeout;
 
         try {
-            // Validate command against blocklist
+            // Validate command against allowlist
             sandbox.validateCommand(command);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -74,7 +91,7 @@ export const shellTool: Tool = {
                     cwd: sandbox.projectRoot,
                     timeout,
                     maxBuffer: 1024 * 1024, // 1 MB buffer
-                    env: { ...process.env },
+                    env: filterEnv(process.env),
                 },
                 (error, stdout, stderr) => {
                     const parts: string[] = [];

@@ -6,7 +6,7 @@ import { taskPlans, subTasks, agentNodes } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 
-const PLANNER_SYSTEM_PROMPT = `You are a Planner agent for a multi-agent coding assistant system.
+const PLANNER_BASE_PROMPT = `You are a Planner agent for a multi-agent coding assistant system.
 Your job is to decompose a user request into a set of actionable sub-tasks.
 
 Output ONLY a valid JSON array of objects. Do NOT wrap it in markdown fences.
@@ -22,16 +22,22 @@ Each object must have:
 
 Guidelines:
 - Keep tasks atomic — each one should be independently executable
-- Generate typically 2–6 tasks
+- Generate AT MOST {MAX_SUB_TASKS} tasks (fewer is better if the task allows)
 - Only add dependencies when there is a genuine ordering requirement
 - Tasks without dependencies can run in parallel
 - Assign taskRole accurately — it determines which specialist agent is used`;
+
+function buildPlannerPrompt(maxSubTasks: number): string {
+    return PLANNER_BASE_PROMPT.replace("{MAX_SUB_TASKS}", String(maxSubTasks));
+}
 
 export interface PlannerConfig {
     gateway: Gateway;
     plannerModelId: string;
     sessionId: string;
     parentAgentId?: string;
+    /** Maximum number of sub-tasks to generate. Default: 3. Clamped to 1–6. */
+    maxSubTasks?: number;
 }
 
 /**
@@ -66,7 +72,7 @@ export class PlannerAgent {
             try {
                 // Call the LLM to decompose the prompt
                 const messages: ChatMessage[] = [
-                    { role: "system", content: PLANNER_SYSTEM_PROMPT },
+                    { role: "system", content: buildPlannerPrompt(Math.min(6, Math.max(1, this.config.maxSubTasks ?? 3))) },
                     { role: "user", content: prompt },
                 ];
 
@@ -132,13 +138,17 @@ export class PlannerAgent {
                     });
                 }
 
+                // Enforce the maxSubTasks cap
+                const cap = Math.min(6, Math.max(1, this.config.maxSubTasks ?? 3));
+                const cappedTasks = validTasks.slice(0, cap);
+
                 // Build the task plan
                 const planId = randomUUID();
                 const plan: TaskPlan = {
                     planId,
                     sessionId: this.config.sessionId,
                     originalPrompt: prompt,
-                    tasks: validTasks,
+                    tasks: cappedTasks,
                     createdAt: now,
                 };
 
@@ -151,7 +161,7 @@ export class PlannerAgent {
                 }).run();
 
                 // Persist each sub-task
-                for (const task of validTasks) {
+                for (const task of cappedTasks) {
                     db.insert(subTasks).values({
                         id: `${planId}_${task.id}`, // globally unique
                         planId,

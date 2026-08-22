@@ -1,8 +1,8 @@
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, ne } from "drizzle-orm";
 import type { ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import { getDb, type PantheonDatabase } from "../db/client.js";
-import { sessionSummaries, sessions } from "../db/schema.js";
+import { sessionSummaries, sessions, messages } from "../db/schema.js";
 
 const SUMMARY_PROMPT = `Summarize this conversation in 2-3 sentences. Focus on what was discussed and what was accomplished. Be concise and specific.`;
 
@@ -17,9 +17,9 @@ export class SessionSummarizer {
         this.db = db ?? getDb();
     }
 
-    async summarize(messages: ChatMessage[]): Promise<string> {
+    async summarize(msgs: ChatMessage[]): Promise<string> {
         // Filter to only user + assistant messages for summarization
-        const conversationText = messages
+        const conversationText = msgs
             .filter(m => m.role === 'user' || m.role === 'assistant')
             .map(m => `${m.role}: ${m.content}`)
             .join('\n');
@@ -33,7 +33,7 @@ export class SessionSummarizer {
         return message.content;
     }
 
-    async saveForSession(sessionId: string, messages: ChatMessage[]): Promise<void> {
+    async saveForSession(sessionId: string, msgs: ChatMessage[]): Promise<void> {
         // Check if summary already exists
         const existing = this.db
             .select()
@@ -42,7 +42,7 @@ export class SessionSummarizer {
             .get();
         if (existing) return; // Don't regenerate
 
-        const summary = await this.summarize(messages);
+        const summary = await this.summarize(msgs);
         this.db
             .insert(sessionSummaries)
             .values({
@@ -83,5 +83,69 @@ export class SessionSummarizer {
             summary: r.summary,
             createdAt: r.createdAt,
         }));
+    }
+
+    /**
+     * Builds the episodic memory context string for injection into the current session's system prompt.
+     *
+     * Strategy:
+     * - Most recent past session → inject its last N raw user+assistant messages (precise context)
+     * - Older sessions → inject their LLM-generated summaries (compact history)
+     *
+     * @param currentSessionId - The current active session (excluded from results)
+     * @param options.recentMessageCount - Number of raw messages from the most recent session. Default: 10.
+     * @param options.summaryLimit - Max older sessions to summarize. Default: 4.
+     */
+    getEpisodicMemoryContext(
+        currentSessionId: string,
+        options?: { recentMessageCount?: number; summaryLimit?: number }
+    ): string {
+        const recentMessageCount = options?.recentMessageCount ?? 10;
+        const summaryLimit = options?.summaryLimit ?? 4;
+
+        const parts: string[] = [];
+
+        // ── 1. Find most recent past session ──────────────────────────────────
+        const lastSession = this.db
+            .select()
+            .from(sessions)
+            .where(eq(sessions.isArchived, false))
+            .orderBy(desc(sessions.updatedAt))
+            .limit(10)
+            .all()
+            .find(s => s.id !== currentSessionId);
+
+        if (lastSession) {
+            const rawMsgs = this.db
+                .select()
+                .from(messages)
+                .where(eq(messages.sessionId, lastSession.id))
+                .orderBy(messages.id)
+                .all()
+                .filter(m => m.role === "user" || m.role === "assistant")
+                .slice(-recentMessageCount);
+
+            if (rawMsgs.length > 0) {
+                const lines = rawMsgs.map(m => `${m.role}: ${m.content.slice(0, 500)}`);
+                parts.push(
+                    `## Recent context (last session — "${lastSession.title}")\n${lines.join("\n")}`
+                );
+            }
+        }
+
+        // ── 2. Older session summaries ─────────────────────────────────────────
+        const allSummaries = this.getRecentSummaries(summaryLimit + 1);
+        const olderSummaries = lastSession
+            ? allSummaries.filter(s => s.sessionId !== lastSession.id)
+            : allSummaries;
+
+        const cappedOlder = olderSummaries.slice(0, summaryLimit);
+
+        if (cappedOlder.length > 0) {
+            const lines = cappedOlder.map(s => `- [${s.createdAt.slice(0, 10)}] "${s.title}" — ${s.summary}`);
+            parts.push(`## Past sessions (summaries)\n${lines.join("\n")}`);
+        }
+
+        return parts.join("\n\n");
     }
 }

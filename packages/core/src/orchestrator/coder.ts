@@ -28,6 +28,7 @@ export interface CoderResult {
     agentId: string;
     result: string;
     toolCalls: ToolCall[];
+    toolResults: ToolResult[];
     iterations: number;
 }
 
@@ -126,6 +127,7 @@ Guidelines:
                     agentId,
                     result: turnResult.response,
                     toolCalls: turnResult.toolCalls,
+                    toolResults: turnResult.toolResults,
                     iterations: turnResult.iterations,
                 };
             } catch (error) {

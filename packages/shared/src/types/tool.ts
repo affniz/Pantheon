@@ -25,6 +25,7 @@ export interface ToolDefinition {
      * - "destructive": always prompts [y/n] before every execution
      */
     safety: "safe" | "destructive";
+    pluginName?: string;
 }
 
 /** A tool call requested by the LLM */
