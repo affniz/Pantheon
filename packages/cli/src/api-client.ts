@@ -18,16 +18,20 @@ export interface ChatRequestOptions {
     orchestrate?: boolean | "auto";
     /** Max sub-tasks for planner (budget control). 1-6. */
     maxSubTasks?: number;
+    /** v0.8: Fan-out to multiple models and synthesize the best answer */
+    consensus?: boolean;
+    /** v0.8: Route through this A/B experiment ID */
+    experimentId?: string;
 }
 
 /** Union of all SSE event payloads the chat endpoint can emit */
 export type ChatSSEEvent =
-    | { event: "routing"; data: { tier: string; selectedModelId: string; reason: string } }
+    | { event: "routing"; data: { tier: string; selectedModelId: string; reason: string; confidence?: number } }
     | { event: "text"; data: { content: string } }
     | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; safety: "safe" | "destructive" } }
     | { event: "tool_permission_required"; data: { toolCallId: string; toolName: string; args: Record<string, unknown>; safety: "safe" | "destructive" } }
     | { event: "tool_result"; data: { toolCallId: string; content: string; isError: boolean } }
-    | { event: "done"; data: { sessionId: string; iterations: number; orchestrated?: boolean; planId?: string } }
+    | { event: "done"; data: { sessionId: string; iterations: number; orchestrated?: boolean; planId?: string; consensus?: boolean } }
     | { event: "error"; data: { message: string } }
     // v0.6 orchestration events
     | { event: "orchestration_start"; data: { type: string; planId: string; taskCount: number } }
@@ -38,7 +42,13 @@ export type ChatSSEEvent =
     | { event: "review_result"; data: { type: string; approved: boolean; feedback: string; finalResponse: string } }
     | { event: "orchestration_done"; data: { type: string; planId: string; finalResponse: string } }
     // v0.7 additions
-    | { event: "warning"; data: { message: string } };
+    | { event: "warning"; data: { message: string } }
+    // v0.8 additions
+    | { event: "consensus_model_start"; data: { modelId: string } }
+    | { event: "consensus_model_done"; data: { modelId: string; latencyMs: number; error?: string } }
+    | { event: "consensus_done"; data: { runId: string; responses: unknown[]; synthesizedContent: string; synthesisLatencyMs: number } }
+    | { event: "model_fallback"; data: { from: string; to: string; reason: string } };
+
 
 /**
  * Typed HTTP client for the Pantheon API server.

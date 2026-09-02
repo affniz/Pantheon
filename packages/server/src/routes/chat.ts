@@ -16,6 +16,10 @@ import {
     getCapabilities,
     DEFAULT_PLUGINS_DIR,
     buildRepoMap,
+    ConsensusEngine,
+    ABRouter,
+    ABStore,
+    QualityJudge,
 } from "@pantheon/core";
 import type { PermissionDecision } from "@pantheon/core";
 import type { ChatMessage, OrchestrationEvent } from "@pantheon/shared";
@@ -34,10 +38,11 @@ const pendingPermissions = new Map<string, { resolve: (decision: PermissionDecis
  * POST /api/chat — Start an agentic chat turn over SSE.
  *
  * Request body:
- *   { sessionId?, prompt, model?, noTools?, workingDir?, orchestrate? }
+ *   { sessionId?, prompt, model?, noTools?, workingDir?, orchestrate?,
+ *     consensus?, experimentId? }
  *
  * SSE event stream (existing):
- *   routing  → { tier, selectedModelId, reason }
+ *   routing  → { tier, selectedModelId, reason, confidence? }
  *   text     → { content: string }
  *   tool_call → { id, name, arguments, safety }
  *   tool_permission_required → { toolCallId, toolName, safety }
@@ -53,6 +58,12 @@ const pendingPermissions = new Map<string, { resolve: (decision: PermissionDecis
  *   plan_created → { plan: TaskPlan }
  *   review_result → { approved, feedback, finalResponse }
  *   orchestration_done → { planId, finalResponse }
+ *
+ * SSE event stream (v0.8 additions):
+ *   consensus_model_start → { modelId: string }
+ *   consensus_model_done  → { modelId: string; latencyMs: number; error?: string }
+ *   consensus_done        → { runId, responses, synthesizedContent, synthesisLatencyMs }
+ *   model_fallback        → { from: string; to: string; reason: string }
  */
 chatRouter.post("/", async (c) => {
     const body = await c.req.json<{
@@ -65,6 +76,10 @@ chatRouter.post("/", async (c) => {
         orchestrate?: boolean | "auto";
         /** Max sub-tasks for the planner. Corresponds to --budget flag. Default: 3 */
         maxSubTasks?: number;
+        /** v0.8: Fan-out to multiple models and synthesize the best answer */
+        consensus?: boolean;
+        /** v0.8: Route through this A/B experiment ID */
+        experimentId?: string;
     }>();
 
     const {
@@ -75,6 +90,8 @@ chatRouter.post("/", async (c) => {
         workingDir = process.env["PANTHEON_WORKSPACE"] ?? process.cwd(),
         orchestrate = "auto",
         maxSubTasks = 3,
+        consensus = false,
+        experimentId,
     } = body;
 
     if (!prompt?.trim()) {
@@ -132,6 +149,78 @@ chatRouter.post("/", async (c) => {
 
                 await sendEvent("done", { sessionId: effectiveSessionId, iterations: 1 });
             } else {
+                // ── v0.8: Consensus path ──────────────────────────────────────
+                const cfg = loadConfig();
+
+                // Wire gateway with model_fallback SSE event
+                const gatewayWithFallback = new Gateway(
+                    registry,
+                    (from, to, reason) => {
+                        sendEvent("model_fallback", { from, to, reason }).catch(() => {});
+                    }
+                );
+
+                if (consensus) {
+                    const consensusConfig = cfg.consensus ?? {
+                        models: ["deepseek-v4-flash", "deepseek-v4-pro", "llama-smart"],
+                        synthesisModelId: "deepseek-v4-pro",
+                    };
+
+                    // Emit start events for each model
+                    for (const modelId of consensusConfig.models) {
+                        await sendEvent("consensus_model_start", { modelId });
+                    }
+
+                    const engine = new ConsensusEngine(gatewayWithFallback, consensusConfig);
+                    const result = await engine.run(messages, effectiveSessionId);
+
+                    // Emit per-model done events
+                    for (const r of result.responses) {
+                        await sendEvent("consensus_model_done", {
+                            modelId: r.modelId,
+                            latencyMs: r.latencyMs,
+                            ...(r.error ? { error: r.error } : {}),
+                        });
+                    }
+
+                    await sendEvent("consensus_done", result);
+                    await sendEvent("text", { content: result.synthesizedContent });
+
+                    const assistantMsg: ChatMessage = {
+                        role: "assistant",
+                        content: result.synthesizedContent,
+                        timestamp: new Date(),
+                    };
+                    sm.addMessage(effectiveSessionId, assistantMsg);
+
+                    // Async quality scoring (fire-and-forget)
+                    const judgeModelId = "llama-smart";
+                    const judge = new QualityJudge(gatewayWithFallback, judgeModelId);
+                    judge.score(prompt.trim(), result.synthesizedContent).catch(() => {});
+
+                    await sendEvent("done", { sessionId: effectiveSessionId, iterations: 0, consensus: true });
+                    return;
+                }
+
+                // ── A/B experiment resolution ─────────────────────────────────
+                let effectiveModel = model;
+                let abResolution: import("@pantheon/core").ABResolution | null = null;
+                if (cfg.ab && cfg.ab.experiments.length > 0) {
+                    const abRouter = new ABRouter(cfg.ab);
+                    abResolution = abRouter.resolveArm(
+                        await gatewayWithFallback.resolveRouting(messages, model),
+                        effectiveSessionId
+                    );
+                    if (abResolution) {
+                        effectiveModel = abResolution.modelId;
+                    }
+                }
+
+                // Use gateway with fallback from here on
+                // (replaces the plain `gateway` used below)
+                // We reassign for type compatibility
+                (gateway as any) = gatewayWithFallback;
+
                 // Determine if we should use multi-agent orchestration
                 let useOrchestration = false;
 
@@ -141,8 +230,8 @@ chatRouter.post("/", async (c) => {
                     useOrchestration = false;
                 } else {
                     // "auto" — classify the prompt and orchestrate if complex
-                    const routingDecision = await gateway.resolveRouting(messages, model);
-                    if (routingDecision.tier === "complex" && !model) {
+                    const routingDecision = await gatewayWithFallback.resolveRouting(messages, effectiveModel);
+                    if (routingDecision.tier === "complex" && !effectiveModel) {
                         const caps = getCapabilities();
                         if (caps.orchestrationEnabled) {
                             useOrchestration = true;
@@ -287,7 +376,7 @@ chatRouter.post("/", async (c) => {
                         onToolResult,
                     });
 
-                    const turnResult = await agentRuntime.run(messages, model);
+                    const turnResult = await agentRuntime.run(messages, effectiveModel);
 
                     // Emit the routing decision (if we didn't emit it above during auto-detection)
                     if (orchestrate !== "auto") {
@@ -309,11 +398,33 @@ chatRouter.post("/", async (c) => {
                         }
                     }
 
+                    // v0.8: Record A/B run and async quality scoring
+                    if (abResolution) {
+                        const abStore = new ABStore();
+                        const savedRun = abStore.save({
+                            experimentId: abResolution.experimentId,
+                            sessionId: effectiveSessionId,
+                            promptHash: ABStore.hashPrompt(prompt.trim()),
+                            arm: abResolution.arm,
+                            modelId: abResolution.modelId,
+                            latencyMs: 0, // per-call timing not tracked at this level in v0.8
+                            inputTokens: 0,
+                            outputTokens: 0,
+                        });
+                        const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
+                        judge.score(prompt.trim(), turnResult.response).then((score) => {
+                            if (score !== null) {
+                                abStore.updateQualityScore(savedRun.id, score);
+                            }
+                        }).catch(() => {});
+                    }
+
                     await sendEvent("done", {
                         sessionId: effectiveSessionId,
                         iterations: turnResult.iterations,
                     });
                 }
+
             }
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);

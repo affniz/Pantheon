@@ -9,6 +9,12 @@ export interface ModelConfig {
 export interface GatewayConfig {
     baseUrl: string;
     masterKey: string;
+    /**
+     * Application-level failover chain for the complex tier.
+     * Models are tried in order on transient errors (4xx/5xx / network failure).
+     * Default: ["deepseek-v4-pro", "claude-fallback", "gpt-fallback"]
+     */
+    failoverChain?: string[];
 }
 
 export interface RoutingConfig {
@@ -30,6 +36,42 @@ export interface RoutingConfig {
      * Default: 5
      */
     routingContextDepth?: number;
+    /**
+     * Minimum confidence score (0–1) required for a routing tier decision.
+     * When the classifier confidence falls below this threshold, the tier is escalated
+     * to `complex` (safe escalation — never downgraded from complex).
+     * Default: 0.6
+     */
+    confidenceThreshold?: number;
+}
+
+/** Configuration for multi-model consensus (fan-out + synthesis) */
+export interface ConsensusConfig {
+    /**
+     * Model IDs to fan-out to. All are queried in parallel.
+     * Default: ["deepseek-v4-flash", "deepseek-v4-pro", "llama-smart"]
+     */
+    models: string[];
+    /** Model used to synthesize the final answer from all responses. Default: "deepseek-v4-pro" */
+    synthesisModelId: string;
+    /** Optional custom synthesis prompt override */
+    synthesisPrompt?: string;
+}
+
+/** Configuration for a single A/B traffic-splitting experiment */
+export interface ABExperimentConfig {
+    id: string;
+    name: string;
+    /** Percentage of requests (0–100) routed to the variant arm */
+    splitPercent: number;
+    controlModelId: string;
+    variantModelId: string;
+    active: boolean;
+}
+
+/** Global A/B testing configuration */
+export interface ABConfig {
+    experiments: ABExperimentConfig[];
 }
 
 export interface PantheonConfig {
@@ -39,6 +81,10 @@ export interface PantheonConfig {
     defaultModel?: string;
     sandbox?: SandboxConfig;
     plugins?: PluginsConfig;
+    /** Multi-model consensus configuration (v0.8) */
+    consensus?: ConsensusConfig;
+    /** A/B traffic-splitting configuration (v0.8) */
+    ab?: ABConfig;
 }
 
 export interface ShellAllowlistEntry {

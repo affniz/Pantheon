@@ -6,14 +6,22 @@ import { Classifier } from "../router/classifier.js";
 import { CostTracker } from "../cost/tracker.js";
 import { Tracer } from "../tracing/tracer.js";
 
+/** Default application-level failover chain for the complex tier. */
+const DEFAULT_FAILOVER_CHAIN = ["deepseek-v4-pro", "claude-fallback", "gpt-fallback"] as const;
+
+/** Callback invoked when the gateway falls back to a different model. */
+export type ModelFallbackCallback = (from: string, to: string, reason: string) => void;
+
 export class Gateway {
     private client: OpenAI;
     private registry: ModelRegistry;
     private classifier: Classifier;
     private tracker: CostTracker;
+    private onModelFallback?: ModelFallbackCallback;
 
-    constructor(registry: ModelRegistry) {
+    constructor(registry: ModelRegistry, onModelFallback?: ModelFallbackCallback) {
         this.registry = registry;
+        if (onModelFallback !== undefined) this.onModelFallback = onModelFallback;
         const { baseUrl, masterKey } = registry.getGatewayConfig();
 
         this.client = new OpenAI({ baseURL: baseUrl, apiKey: masterKey });
@@ -46,6 +54,7 @@ export class Gateway {
         }
         return {};
     }
+
 
     /**
      * Resolve routing decision based on modelId override, auto-routing, or default.
@@ -97,10 +106,68 @@ export class Gateway {
 
     /**
      * Non-streaming completion with optional tool calling support.
-     * Used by the agent runtime for tool-call turns where we need the full response
-     * to parse tool calls before proceeding.
+     * For complex-tier models, automatically falls back through the configured
+     * failover chain on transient 4xx/5xx or network errors.
+     * Used by the agent runtime for tool-call turns.
      */
     async complete(
+        messages: ChatMessage[],
+        modelId: string,
+        tools?: OpenAITool[]
+    ): Promise<{
+        message: ChatMessage;
+        usage: { inputTokens: number; outputTokens: number };
+    }> {
+        // Determine if this model is part of the failover chain
+        const gatewayConfig = this.registry.getGatewayConfig();
+        const failoverChain = gatewayConfig.failoverChain ?? [...DEFAULT_FAILOVER_CHAIN];
+        const chainIdx = failoverChain.indexOf(modelId);
+
+        // Only apply failover if the requested model is the head of the chain
+        if (chainIdx === 0 && failoverChain.length > 1) {
+            return this.completeWithFailover(messages, failoverChain, tools);
+        }
+
+        return this._completeSingleModel(messages, modelId, tools);
+    }
+
+    /**
+     * Walks the failover chain in order, trying each model until one succeeds.
+     * Calls onModelFallback when switching models so callers can emit SSE events.
+     */
+    async completeWithFailover(
+        messages: ChatMessage[],
+        chain: string[],
+        tools?: OpenAITool[]
+    ): Promise<{
+        message: ChatMessage;
+        usage: { inputTokens: number; outputTokens: number };
+    }> {
+        let lastError: unknown;
+        for (let i = 0; i < chain.length; i++) {
+            const modelId = chain[i]!;
+            try {
+                const result = await this._completeSingleModel(messages, modelId, tools);
+                return result;
+            } catch (err) {
+                lastError = err;
+                const reason = err instanceof Error ? err.message : String(err);
+                process.stderr.write(`[gateway] failover: model "${modelId}" failed: ${reason}\n`);
+
+                const nextModel = chain[i + 1];
+                if (nextModel) {
+                    process.stderr.write(`[gateway] failover: trying "${nextModel}"\n`);
+                    this.onModelFallback?.(modelId, nextModel, reason);
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    /**
+     * Internal: single-model completion with 3-attempt retry on transient errors.
+     */
+    private async _completeSingleModel(
         messages: ChatMessage[],
         modelId: string,
         tools?: OpenAITool[]
@@ -196,7 +263,6 @@ export class Gateway {
                     }
                 }
 
-
                 const choice = response.choices[0];
                 if (!choice) throw new Error("No response from model.");
 
@@ -238,6 +304,7 @@ export class Gateway {
             }
         );
     }
+
 
     private async *_streamCompletion(
         messages: ChatMessage[],

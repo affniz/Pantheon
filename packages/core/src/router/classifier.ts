@@ -3,13 +3,18 @@ import type { ChatMessage, RoutingConfig, RoutingDecision } from "@pantheon/shar
 import { Tracer } from "../tracing/tracer.js";
 
 const DEFAULT_CLASSIFIER_PROMPT = `You are a task complexity classifier for a coding assistant.
-Respond with ONLY one word — no punctuation, no explanation.
-Your options are: general, simple, standard, complex.
+Respond with ONLY one or two tokens — no punctuation, no explanation.
+Format: <tier> [confidence]
+Examples: "general", "simple 0.9", "standard 0.65", "complex 0.8"
 
+Tiers:
 general  = greetings, small talk, factual lookups, yes/no questions, short definitions, general knowledge
 simple   = short, self-contained code snippets (< 30 lines), quick fixes, minor edits, one-liner scripts
 standard = multi-step code tasks (30–100 lines), moderate refactors, API integrations, test writing, summaries
 complex  = architecture design, large-scale refactors, debugging sessions (especially with prior context), long code generation, multi-file changes, performance analysis, system design
+
+The confidence value (0.0–1.0) reflects how certain you are about this classification.
+Omit the confidence value only when you are completely certain (implicit 1.0).
 
 IMPORTANT: When conversation history is provided, use it to judge the true scope of the current request.
 For example, "debug this" alone may look simple, but if prior messages describe a complex system or a
@@ -65,18 +70,40 @@ export class Classifier {
                         { role: "system", content: systemPrompt },
                         { role: "user", content: userContent },
                     ],
-                    max_tokens: 5,
+                    // Increased from 5 to 20 to allow optional confidence suffix (e.g. "standard 0.72")
+                    max_tokens: 20,
                     temperature: 0,
                 });
 
                 const raw = response.choices[0]?.message?.content?.trim().toLowerCase() ?? "";
 
-                // Normalise — if the model goes off-script, default to standard
+                // Parse tier word (first token)
+                const parts = raw.split(/\s+/);
+                const tierWord = parts[0] ?? "";
+                const confidenceWord = parts[1];
+
+                // Parse confidence — float between 0 and 1, or undefined
+                let confidence: number | undefined;
+                if (confidenceWord !== undefined) {
+                    const parsed = parseFloat(confidenceWord);
+                    if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+                        confidence = parsed;
+                    }
+                }
+
+                // Normalise tier — if the model goes off-script, default to standard
                 let tier: RoutingDecision["tier"];
-                if (raw.startsWith("general")) tier = "general";
-                else if (raw.startsWith("simple")) tier = "simple";
-                else if (raw.startsWith("complex")) tier = "complex";
+                if (tierWord.startsWith("general")) tier = "general";
+                else if (tierWord.startsWith("simple")) tier = "simple";
+                else if (tierWord.startsWith("complex")) tier = "complex";
                 else tier = "standard";
+
+                // Confidence threshold escalation: if confidence is below threshold,
+                // escalate standard → complex (safe escalation, never downgrade from complex)
+                const threshold = this.config.confidenceThreshold ?? 0.6;
+                if (confidence !== undefined && confidence < threshold && tier === "standard") {
+                    tier = "complex";
+                }
 
                 const selectedModelId = this.config.tiers[tier];
 
@@ -84,11 +111,13 @@ export class Classifier {
                     tier,
                     selectedModelId,
                     reason: `classified as ${tier} by ${classifierModel} (context depth: ${contextMessages.length})`,
+                    ...(confidence !== undefined ? { confidence } : {}),
                 };
 
                 span.attributes.assignedTier = tier;
                 span.attributes.selectedModelId = selectedModelId;
                 span.attributes.reason = decision.reason;
+                if (confidence !== undefined) span.attributes.confidence = confidence;
 
                 return decision;
             }

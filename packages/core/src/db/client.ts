@@ -119,6 +119,35 @@ const INIT_SQL = `
     );
 
     CREATE INDEX IF NOT EXISTS idx_installed_plugins_enabled ON installed_plugins(enabled);
+
+    CREATE TABLE IF NOT EXISTS consensus_runs (
+        id                    TEXT PRIMARY KEY,
+        session_id            TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+        prompt_hash           TEXT NOT NULL,
+        synthesized_content   TEXT NOT NULL,
+        model_responses       TEXT NOT NULL,
+        synthesis_latency_ms  INTEGER NOT NULL,
+        created_at            TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_consensus_runs_session_id ON consensus_runs(session_id);
+
+    CREATE TABLE IF NOT EXISTS ab_runs (
+        id              TEXT PRIMARY KEY,
+        experiment_id   TEXT NOT NULL,
+        session_id      TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+        prompt_hash     TEXT NOT NULL,
+        arm             TEXT NOT NULL,
+        model_id        TEXT NOT NULL,
+        latency_ms      INTEGER NOT NULL,
+        input_tokens    INTEGER NOT NULL,
+        output_tokens   INTEGER NOT NULL,
+        quality_score   REAL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ab_runs_experiment_id ON ab_runs(experiment_id);
+    CREATE INDEX IF NOT EXISTS idx_ab_runs_session_id ON ab_runs(session_id);
 `;
 
 let _db: PantheonDatabase | null = null;

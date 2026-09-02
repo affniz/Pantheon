@@ -2,6 +2,7 @@ export { loadConfig, saveConfig, getCapabilities } from "./config/loader.js";
 export type { PantheonCapabilities } from "./config/loader.js";
 export { ModelRegistry } from "./registry/model-registry.js";
 export { Gateway } from "./gateway/gateway.js";
+export type { ModelFallbackCallback } from "./gateway/gateway.js";
 export { Classifier } from "./router/classifier.js";
 export { CostTracker } from "./cost/tracker.js";
 export { Sandbox } from "./sandbox/sandbox.js";
@@ -39,3 +40,8 @@ export { PluginRegistry, loadPlugin, discoverPlugins, installPlugin, uninstallPl
 export type { PluginManifest, PluginToolConfig, MCPServerConfig, LoadedPlugin, PluginInfo, PluginStatus, PluginTransport, PluginValidationResult } from "./plugins/index.js";
 export { MCPClient, StdioTransport, SSETransport, mcpToolToDefinition, createMCPTool, createMCPTools, MCP_VERSION } from "./mcp/index.js";
 export type { MCPTransportConfig, StdioTransportConfig, SSETransportConfig, MCPToolDefinition, MCPToolCallResult, ServerCapabilities } from "./mcp/index.js";
+
+// ── v0.8: Consensus & A/B ────────────────────────────────────────────────────
+export { ConsensusEngine } from "./consensus/index.js";
+export { ABRouter, QualityJudge, ABStore } from "./ab/index.js";
+export type { ABResolution } from "./ab/index.js";
