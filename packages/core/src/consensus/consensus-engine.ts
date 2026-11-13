@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
+import { eq } from "drizzle-orm";
 import type { ChatMessage, ConsensusConfig, ConsensusResult, ConsensusResponse } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import { getDb } from "../db/client.js";
@@ -145,5 +146,26 @@ export class ConsensusEngine {
             this.config.synthesisModelId
         );
         return result.message.content;
+    }
+
+    /**
+     * Write an LLM-judged quality score back to the persisted consensus run.
+     * Called asynchronously after the response has been sent to the user.
+     *
+     * @param runId - The UUID returned by `run()`.
+     * @param qualityScore - Score from 1–10 produced by `QualityJudge`.
+     */
+    updateQualityScore(runId: string, qualityScore: number): void {
+        try {
+            const db = getDb();
+            db.update(schema.consensusRuns)
+                .set({ qualityScore })
+                .where(eq(schema.consensusRuns.id, runId))
+                .run();
+        } catch (e) {
+            process.stderr.write(
+                `[consensus] failed to update quality score for run ${runId}: ${e instanceof Error ? e.message : String(e)}\n`
+            );
+        }
     }
 }

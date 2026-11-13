@@ -113,10 +113,8 @@ describe("Classifier — confidence scoring (v0.8)", () => {
     });
 
     it("uses default threshold of 0.6 when not configured", async () => {
-        const configWithoutThreshold: RoutingConfig = {
-            ...config,
-            confidenceThreshold: undefined,
-        };
+        const { confidenceThreshold: _omitted, ...configWithoutThreshold } = config;
+        void _omitted;
         const classifierDefault = new Classifier(mockOpenAI as any, configWithoutThreshold);
         mockOpenAI.chat.completions.create.mockResolvedValue({
             choices: [{ message: { content: "standard 0.55" } }],

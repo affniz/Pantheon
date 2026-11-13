@@ -33,7 +33,7 @@ export interface ExecutorResult {
 
 /**
  * Executor agent factory — creates a scoped AgentRuntime for a single sub-task.
- * Uses the fast model (8B) for quick execution with tool access.
+ * Handles "general" tasks (research, documentation, Q&A) with tool access.
  */
 export class ExecutorAgent {
     private config: ExecutorConfig;

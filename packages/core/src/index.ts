@@ -2,7 +2,7 @@ export { loadConfig, saveConfig, getCapabilities } from "./config/loader.js";
 export type { PantheonCapabilities } from "./config/loader.js";
 export { ModelRegistry } from "./registry/model-registry.js";
 export { Gateway } from "./gateway/gateway.js";
-export type { ModelFallbackCallback } from "./gateway/gateway.js";
+export type { ModelFallbackCallback, GatewayOptions } from "./gateway/gateway.js";
 export { Classifier } from "./router/classifier.js";
 export { CostTracker } from "./cost/tracker.js";
 export { Sandbox } from "./sandbox/sandbox.js";
@@ -15,10 +15,14 @@ export { registerBuiltinTools, editFileTool, grepTool } from "./tools/builtin/in
 export { buildRepoMap } from "./tools/repo-map/index.js";
 
 export { AgentRuntime } from "./agent/agent-runtime.js";
-export type { AgentConfig, AgentTurnResult } from "./agent/agent-runtime.js";
-export { getDb, createTestDb, closeDb } from "./db/client.js";
+export type { AgentConfig, AgentTurnResult, AgentRunOptions } from "./agent/agent-runtime.js";
+export { getDb, createTestDb, closeTestDbs, closeDb } from "./db/client.js";
 export type { PantheonDatabase } from "./db/client.js";
 export { schema } from "./db/index.js";
+// Query operators re-exported so API consumers (e.g. @pantheon/server) can build
+// Drizzle queries against `schema` without depending on drizzle-orm themselves —
+// a second drizzle-orm instance would not type-unify with the one `schema` uses.
+export { eq, desc, and, sql } from "drizzle-orm";
 export { SessionManager } from "./session/session-manager.js";
 export { SessionSummarizer } from "./session/summarizer.js";
 export { Tracer } from "./tracing/tracer.js";

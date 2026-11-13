@@ -4,6 +4,66 @@ All notable changes to Pantheon are documented here.
 
 ---
 
+## [0.8.0] — 2026-09-03
+
+Pantheon gains **multi-model consensus**, **A/B experiment routing**, and a **provider failover chain**. The routing classifier now emits a confidence score and auto-escalates ambiguous prompts. A full audit of v0.7 gap-fix tools uncovered two silent bugs in the `grep` tool (parameters accepted but never forwarded to `rg`), a missing `taskRole` column in the DB schema, orphaned gateway variable causing type unsafety in the chat route, and quality scores that were computed but never written back to the DB — all fixed in this version.
+
+### Added
+- **`ConsensusEngine`** (`packages/core/src/consensus/`) — fans out a single prompt to N models concurrently via `Promise.allSettled`, synthesizes the best answer using a configurable synthesis model. Handles 0/1/N success cases: falls back to the solo response when only one model succeeds, errors cleanly when all fail. Persists each run to `consensus_runs` with synthesized content, per-model responses, and latency.
+- **`ConsensusEngine.updateQualityScore(runId, score)`** — new method to write the async LLM judge score back to the `consensus_runs` row after the response has been sent to the client.
+- **`ABRouter`** (`packages/core/src/ab/`) — deterministic SHA-256 hash-based arm assignment per `experimentId:sessionId`. Reads active experiments from `loadConfig()`. Returns `ABResolution | null` with arm, modelId, and experimentId.
+- **`ABStore`** — persists A/B run records to `ab_runs` table; computes per-arm averages (latency, quality score) for the `getComparison()` analytics endpoint.
+- **`QualityJudge`** — async LLM-based 1–10 scorer (uses `llama-smart`). Called fire-and-forget after responses; result is written back to both `consensus_runs` and `ab_runs` via their respective `updateQualityScore()` methods.
+- **Routing confidence threshold** — `Classifier` now parses an optional confidence float from the LLM response (e.g. `"standard 0.65"`). When confidence is below `confidenceThreshold` (default `0.6`) and tier is `standard`, the decision auto-escalates to `complex`. Confidence is emitted in the `routing` SSE event.
+- **Provider failover chain** — `completeWithFailover()` in `Gateway` walks `DEFAULT_FAILOVER_CHAIN = ["deepseek-v4-pro", "claude-fallback", "gpt-fallback"]`. On provider error, falls back to the next model and emits a `model_fallback` SSE event (`{ from, to, reason }`).
+- **`--consensus` flag on `pantheon chat`** — fan-out to all configured models and synthesize the best answer. Shows per-model streaming start/done events in the TUI.
+- **`pantheon consensus list` / `consensus show <id>`** — inspect historical consensus runs.
+- **`pantheon ab list`** — list configured A/B experiments from `config.yml`.
+- **`pantheon ab comparison <id>`** — show control vs. variant analytics: run counts, avg latency, avg quality score, and a simple winner summary.
+- **`/api/ab/experiments`** and **`/api/ab/experiments/:id/comparison`** REST endpoints.
+- **`consensus_runs` SQLite table** — id, session_id, prompt_hash, synthesized_content, model_responses (JSON), synthesis_latency_ms, quality_score.
+- **`ab_runs` SQLite table** — id, experiment_id, session_id, prompt_hash, arm, model_id, latency_ms, input_tokens, output_tokens, quality_score.
+- **`quality_score REAL` column added to `consensus_runs`** — populated asynchronously after judge completes.
+- **New unit tests: `edit-file.test.ts`** — 7 tests covering successful replacement, targetContent-not-found error, first-occurrence-only replacement, multi-line edits, missing file error, sandbox jail enforcement, and type validation.
+- **New unit tests: `grep.test.ts`** — tests covering real `rg` invocations: pattern found, no-matches result, `fileGlob` filtering, `contextLines`, `caseInsensitive`, and large output truncation.
+- **New `fork()` tests in `permission-manager.test.ts`** — 3 tests covering child inherits parent grants, child grants do not propagate to parent, and sibling fork isolation.
+- **New unit tests: `repo-map.test.ts`** — 5 tests covering non-empty output for TS files, exported symbol extraction, `node_modules` exclusion, empty directory handling, and `dist` exclusion.
+
+### Fixed
+- **`grep.ts` silent data loss** — `contextLines` and `fileGlob` parameters were accepted by the tool definition and advertised to the LLM, but `rgArgs.push()` was called with no arguments. Changed to `rgArgs.push("-C", String(contextLines))` and `rgArgs.push("--glob", fileGlob)`. Every call using these options previously produced silently wrong results.
+- **`schema.ts` / `client.ts` — missing `task_role` column** — `SubTask.taskRole` has existed in `@pantheon/shared` since v0.6, but was never in the Drizzle schema or `INIT_SQL`. Added to both the `CREATE TABLE` statement and the `ALTER TABLE` migration (best-effort, swallowed for existing DBs).
+- **`client.ts` — `consensus_runs` missing `quality_score` column** — added to `CREATE TABLE` and `ALTER TABLE` migration so the `updateQualityScore` method has a column to write to.
+- **`chat.ts` — `(gateway as any)` cast removed** — the agentic path previously created `const gateway = new Gateway(registry)` and `const gatewayWithFallback = new Gateway(registry, callback)` and then papered over them with a runtime `(gateway as any) = gatewayWithFallback` cast. Replaced with a single `gatewayWithFallback` instantiated at the top of the handler, used consistently for all paths (noTools, consensus, A/B, orchestration, single-agent). The orchestrator previously received the plain `gateway` (without the fallback callback); it now correctly receives `gatewayWithFallback`.
+- **`chat.ts` — consensus quality score was fire-and-forget into void** — `judge.score()` was called but the result was never written anywhere. Now calls `engine.updateQualityScore(result.runId, score)` in the `.then()` callback.
+
+### Changed
+- **`package.json` version** bumped from `0.6.0` → `0.8.0` (was stale).
+- **`README.md`** — version badge updated to v0.8.0; `--consensus`, `--orchestrate` flags added to command reference; `pantheon consensus` and `pantheon ab` commands documented; v0.8 row added to version history table; `consensus_runs` and `ab_runs` tables added to DB schema documentation.
+
+- **Audit fixes (post-release pass)** — a second review of the v0.8 tree before merge fixed the items below.
+  - `chat.ts` referenced the removed `gateway` variable in the orchestration path's background summarizer, so `@pantheon/server` did not compile; the new v0.8 test files also had type errors that broke `pnpm turbo build` (and therefore CI).
+  - **Sub-task status was never persisted.** `PlannerAgent` stored `sub_tasks` rows with id `${planId}_${localId}` while Coder/Debugger/Executor updated rows by the LLM's local id (`task-1`), so every sub-task stayed `pending` forever. Planner now rewrites task ids (and dependency references) to the globally unique form before persisting, and also writes `task_role`, which was added to the schema but never populated.
+  - **Routing classified up to three times per request** (A/B resolution, orchestrate=auto check, then again inside `AgentRuntime`), each an LLM call that could disagree. The chat route now classifies once and passes the decision to `AgentRuntime.run()` via the new `AgentRunOptions.decision`.
+  - **Groq-only fallback was cosmetic.** When `DEEPSEEK_API_KEY` was missing, the route emitted a `warning` and a `general`-tier routing event but the agent re-classified and still called `deepseek-v4-pro`. The overridden decision is now the one actually executed.
+  - **`experimentId` request field was ignored** — `ABRouter.resolveArm()` always picked the first active experiment. It now accepts an optional `experimentId` and returns `null` if the requested experiment is not active. Stale "(no sticky sessions in v0.8)" comment corrected: assignment is sticky per session by hash.
+  - **A/B runs recorded `latencyMs: 0` and zero tokens.** `AgentTurnResult` now carries `usage` summed across all LLM calls in the turn, and the route records real turn latency and usage.
+  - **`Gateway.stream()` had no failover** — `complete()` walked the failover chain but streaming did not. Streams that fail before producing output now fall back to the next chain model and emit `model_fallback`; mid-stream failures still propagate.
+  - **Malformed tool-call JSON crashed the turn** — `JSON.parse` on model-emitted arguments was unguarded. Arguments that fail to parse now become `{}` (logged, recorded on the span) so the tool returns a clear error the model can act on.
+  - **`pantheon agents list/show/plan` were broken** — the CLI read `id`, `createdAt`, `completedAt`, `updatedAt` from rows whose real fields are `agentId`, `startTime`, `endTime`; `list` threw on `a.id.slice`. Fixed and `plan` now shows `taskRole`.
+  - **ReviewerAgent flagged every orchestration as failed verification** when the project root has no `tsconfig.json` (`tsc --noEmit` errors with "No inputs were found"). tsc is now skipped (and reported as skipped) in that case.
+  - `/api/health` reported version `0.5.0`; CLI hard-coded `0.8.0` twice. Both now read `PANTHEON_VERSION` from `@pantheon/shared`. All workspace packages bumped from `0.6.0` to `0.8.0`.
+  - `/api/consensus` and `/api/agents` loaded entire tables into memory and filtered/sorted in JS; now filtered, ordered and limited in SQL.
+  - `docker-compose.yml` never passed `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` to the LiteLLM container, so the documented fallback models could not work under Docker.
+  - **Cost tracking always recorded `$0`.** `ModelConfig` gains optional `pricing: { inputPer1M, outputPer1M }`; when set, the gateway computes `costUsd` for every call (tokens are tracked regardless).
+  - Mid-turn escalation in `AgentRuntime` made a wasted classifier call and reached into `Gateway` internals via `as any`; replaced with `Gateway.getRoutingConfig()`.
+  - Removed unused imports/variables flagged by ESLint; `no-unused-vars` now ignores `_`-prefixed names.
+- **Test suite stability** — the suite intermittently aborted with `RemoveEnvironmentCleanupHook ... Assertion failed: (env) != nullptr` (better-sqlite3's native destructor running during GC after a Vitest worker context was torn down, on Node 24). Fixed by upgrading `better-sqlite3` to `12.11.1`, switching Vitest to the `forks` pool, closing every test SQLite handle after each file (`vitest.setup.ts` + `closeTestDbs()`), and making the gateway retry backoff configurable (`GatewayOptions.retryBaseDelayMs`) so failover tests no longer sleep for 12s.
+
+### Tests
+- Test count: **278 tests passing** across **30 test files** (up from 147/19 in v0.7). New coverage: stream failover, malformed tool-call arguments, cost computation, `AgentRunOptions.decision`, usage aggregation, explicit A/B `experimentId`, planner id rewriting + `task_role` persistence.
+
+---
+
 ## [0.7.0] — 2026-08-17
 
 Pantheon becomes **extensible and hardened**. Any MCP-compatible tool server can now be wired in as a plugin — GitHub, Jira, web search, or anything built to the Model Context Protocol spec — without touching core source code. The shell sandbox is overhauled from a permissive blocklist to a strict allowlist, and further hardened with argument-level path validation. A new `pantheon doctor` command diagnoses installation health. The `--budget` flag gives fine-grained control over orchestration cost. DeepSeek is now optional — Pantheon runs with only a Groq key and gracefully degrades complex prompts with a warning. The test suite grows to 147 fully deterministic tests with no real LLM API calls required.

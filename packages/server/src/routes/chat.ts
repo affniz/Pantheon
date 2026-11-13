@@ -21,8 +21,8 @@ import {
     ABStore,
     QualityJudge,
 } from "@pantheon/core";
-import type { PermissionDecision } from "@pantheon/core";
-import type { ChatMessage, OrchestrationEvent } from "@pantheon/shared";
+import type { ABResolution, PermissionDecision } from "@pantheon/core";
+import type { ChatMessage, OrchestrationEvent, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
 
@@ -58,6 +58,10 @@ const pendingPermissions = new Map<string, { resolve: (decision: PermissionDecis
  *   plan_created → { plan: TaskPlan }
  *   review_result → { approved, feedback, finalResponse }
  *   orchestration_done → { planId, finalResponse }
+ *
+ * Routing: the prompt is classified exactly once per request. That single
+ * RoutingDecision is used for A/B arm assignment, the orchestrate="auto" choice,
+ * and the agent run itself (passed via AgentRunOptions.decision).
  *
  * SSE event stream (v0.8 additions):
  *   consensus_model_start → { modelId: string }
@@ -105,7 +109,6 @@ chatRouter.post("/", async (c) => {
 
         try {
             const registry = new ModelRegistry();
-            const gateway = new Gateway(registry);
             const sm = new SessionManager();
 
             // Resolve or create session
@@ -122,11 +125,19 @@ chatRouter.post("/", async (c) => {
             sm.addMessage(effectiveSessionId, userMsg);
             messages = [...messages, userMsg];
 
+            // Wire gateway with model_fallback SSE event from the start — used everywhere
+            const gatewayWithFallback = new Gateway(
+                registry,
+                (from, to, reason) => {
+                    sendEvent("model_fallback", { from, to, reason }).catch(() => {});
+                }
+            );
+
             // Build episodic memory context
             const fastModelId = registry.getDefault()?.id ?? registry.list()[0]?.id;
             let episodicMemory = "";
             if (fastModelId && effectiveSessionId) {
-                const summarizer = new SessionSummarizer(gateway, fastModelId);
+                const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
                 episodicMemory = summarizer.getEpisodicMemoryContext(effectiveSessionId, {
                     recentMessageCount: 10,
                     summaryLimit: 4,
@@ -135,7 +146,7 @@ chatRouter.post("/", async (c) => {
 
             if (noTools) {
                 // Pure chat mode — stream directly
-                const { generator, decision } = await gateway.stream(messages, model);
+                const { generator, decision } = await gatewayWithFallback.stream(messages, model);
                 await sendEvent("routing", decision);
 
                 let accumulated = "";
@@ -151,14 +162,6 @@ chatRouter.post("/", async (c) => {
             } else {
                 // ── v0.8: Consensus path ──────────────────────────────────────
                 const cfg = loadConfig();
-
-                // Wire gateway with model_fallback SSE event
-                const gatewayWithFallback = new Gateway(
-                    registry,
-                    (from, to, reason) => {
-                        sendEvent("model_fallback", { from, to, reason }).catch(() => {});
-                    }
-                );
 
                 if (consensus) {
                     const consensusConfig = cfg.consensus ?? {
@@ -193,33 +196,35 @@ chatRouter.post("/", async (c) => {
                     };
                     sm.addMessage(effectiveSessionId, assistantMsg);
 
-                    // Async quality scoring (fire-and-forget)
-                    const judgeModelId = "llama-smart";
-                    const judge = new QualityJudge(gatewayWithFallback, judgeModelId);
-                    judge.score(prompt.trim(), result.synthesizedContent).catch(() => {});
+                    // Async quality scoring — write score back to consensus_runs row
+                    const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
+                    judge.score(prompt.trim(), result.synthesizedContent).then((score) => {
+                        if (score !== null) {
+                            engine.updateQualityScore(result.runId, score);
+                        }
+                    }).catch(() => {});
 
                     await sendEvent("done", { sessionId: effectiveSessionId, iterations: 0, consensus: true });
                     return;
                 }
 
+                // ── Routing — classify exactly once per request ───────────────
+                // The same decision drives A/B arm assignment, the orchestration
+                // choice, and the agent run itself, so the classifier (an LLM call)
+                // is not invoked two or three times with potentially different answers.
+                const routingDecision: RoutingDecision = await gatewayWithFallback.resolveRouting(messages, model);
+
                 // ── A/B experiment resolution ─────────────────────────────────
-                let effectiveModel = model;
-                let abResolution: import("@pantheon/core").ABResolution | null = null;
+                let abResolution: ABResolution | null = null;
                 if (cfg.ab && cfg.ab.experiments.length > 0) {
                     const abRouter = new ABRouter(cfg.ab);
-                    abResolution = abRouter.resolveArm(
-                        await gatewayWithFallback.resolveRouting(messages, model),
-                        effectiveSessionId
-                    );
+                    abResolution = abRouter.resolveArm(routingDecision, effectiveSessionId, experimentId);
                     if (abResolution) {
-                        effectiveModel = abResolution.modelId;
+                        routingDecision.selectedModelId = abResolution.modelId;
+                        routingDecision.reason =
+                            `A/B experiment "${abResolution.experimentId}" (${abResolution.arm} arm)`;
                     }
                 }
-
-                // Use gateway with fallback from here on
-                // (replaces the plain `gateway` used below)
-                // We reassign for type compatibility
-                (gateway as any) = gatewayWithFallback;
 
                 // Determine if we should use multi-agent orchestration
                 let useOrchestration = false;
@@ -228,30 +233,28 @@ chatRouter.post("/", async (c) => {
                     useOrchestration = true;
                 } else if (orchestrate === false) {
                     useOrchestration = false;
-                } else {
-                    // "auto" — classify the prompt and orchestrate if complex
-                    const routingDecision = await gatewayWithFallback.resolveRouting(messages, effectiveModel);
-                    if (routingDecision.tier === "complex" && !effectiveModel) {
-                        const caps = getCapabilities();
-                        if (caps.orchestrationEnabled) {
-                            useOrchestration = true;
-                        } else {
-                            // DEEPSEEK_API_KEY not set — warn and fall back to llama-smart
-                            await sendEvent("warning", {
-                                message:
-                                    "DEEPSEEK_API_KEY not set — complex task routed to llama-smart instead. " +
-                                    "Add DEEPSEEK_API_KEY to .env to enable full orchestration.",
-                            });
-                            // Override the decision to use llama-smart (general tier)
-                            routingDecision.tier = "general";
-                            routingDecision.selectedModelId = registry.getRoutingConfig().tiers.general;
-                            routingDecision.reason = "fallback: DEEPSEEK_API_KEY not set";
-                            useOrchestration = false;
-                        }
+                } else if (routingDecision.tier === "complex" && !model && !abResolution) {
+                    // "auto" — orchestrate complex prompts (unless the model was pinned)
+                    const caps = getCapabilities();
+                    if (caps.orchestrationEnabled) {
+                        useOrchestration = true;
+                    } else {
+                        // DEEPSEEK_API_KEY not set — warn and fall back to llama-smart.
+                        // The overridden decision is passed to the agent below, so the
+                        // fallback model is actually used (not just reported).
+                        await sendEvent("warning", {
+                            message:
+                                "DEEPSEEK_API_KEY not set — complex task routed to llama-smart instead. " +
+                                "Add DEEPSEEK_API_KEY to .env to enable full orchestration.",
+                        });
+                        routingDecision.tier = "general";
+                        routingDecision.selectedModelId = registry.getRoutingConfig().tiers.general;
+                        routingDecision.reason = "fallback: DEEPSEEK_API_KEY not set";
                     }
-                    // Emit routing decision for the CLI
-                    await sendEvent("routing", routingDecision);
                 }
+
+                // Emit the routing decision for the CLI
+                await sendEvent("routing", routingDecision);
 
                 const sandbox = Sandbox.create(workingDir);
 
@@ -291,10 +294,10 @@ chatRouter.post("/", async (c) => {
                     ["read_file", "list_directory"]
                 );
 
-                const onToolCall = (call: import("@pantheon/shared").ToolCall, safety: "safe" | "destructive") => {
+                const onToolCall = (call: ToolCall, safety: "safe" | "destructive") => {
                     sendEvent("tool_call", { id: call.id, name: call.name, arguments: call.arguments, safety }).catch(() => {});
                 };
-                const onToolResult = (result: import("@pantheon/shared").ToolResult) => {
+                const onToolResult = (result: ToolResult) => {
                     sendEvent("tool_result", { toolCallId: result.toolCallId, content: result.content, isError: result.isError }).catch(() => {});
                 };
 
@@ -303,7 +306,7 @@ chatRouter.post("/", async (c) => {
                     const routingConfig = registry.getRoutingConfig();
 
                     const orchestrator = new Orchestrator({
-                        gateway,
+                        gateway: gatewayWithFallback,
                         toolRegistry: new ToolRegistry(), // orchestrator creates its own per executor
                         sandbox,
                         permissionManager,
@@ -339,7 +342,7 @@ chatRouter.post("/", async (c) => {
                         const allMsgs = sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
-                            const summarizer = new SessionSummarizer(gateway, fastModelId);
+                            const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
                             summarizer.saveForSession(effectiveSessionId, allMsgs).catch(() => {});
                         }
                     }
@@ -356,8 +359,7 @@ chatRouter.post("/", async (c) => {
                     registerBuiltinTools(toolRegistry);
 
                     // Wire plugins
-                    const pluginCfg = loadConfig().plugins;
-                    const pluginDir = pluginCfg?.directory ?? DEFAULT_PLUGINS_DIR;
+                    const pluginDir = cfg.plugins?.directory ?? DEFAULT_PLUGINS_DIR;
                     const pluginReg = new PluginRegistry(toolRegistry, pluginDir);
                     try {
                         await pluginReg.loadFromDirectory(sandbox);
@@ -365,7 +367,7 @@ chatRouter.post("/", async (c) => {
                         process.stderr.write(`[chat] plugin load error: ${e instanceof Error ? e.message : String(e)}\n`);
                     }
 
-                    const agentRuntime = new AgentRuntime(gateway, toolRegistry, {
+                    const agentRuntime = new AgentRuntime(gatewayWithFallback, toolRegistry, {
                         maxIterations: 20,
                         sandbox,
                         permissionManager,
@@ -376,10 +378,12 @@ chatRouter.post("/", async (c) => {
                         onToolResult,
                     });
 
-                    const turnResult = await agentRuntime.run(messages, effectiveModel);
+                    const turnStart = Date.now();
+                    const turnResult = await agentRuntime.run(messages, model, { decision: routingDecision });
+                    const turnLatencyMs = Date.now() - turnStart;
 
-                    // Emit the routing decision (if we didn't emit it above during auto-detection)
-                    if (orchestrate !== "auto") {
+                    // Routing was already emitted above; only re-emit if the agent escalated mid-turn
+                    if (turnResult.escalated) {
                         await sendEvent("routing", turnResult.decision);
                     }
                     await sendEvent("text", { content: turnResult.response });
@@ -393,7 +397,7 @@ chatRouter.post("/", async (c) => {
                         const allMsgs = sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
-                            const summarizer = new SessionSummarizer(gateway, fastModelId);
+                            const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
                             summarizer.saveForSession(effectiveSessionId, allMsgs).catch(() => {});
                         }
                     }
@@ -407,9 +411,9 @@ chatRouter.post("/", async (c) => {
                             promptHash: ABStore.hashPrompt(prompt.trim()),
                             arm: abResolution.arm,
                             modelId: abResolution.modelId,
-                            latencyMs: 0, // per-call timing not tracked at this level in v0.8
-                            inputTokens: 0,
-                            outputTokens: 0,
+                            latencyMs: turnLatencyMs,
+                            inputTokens: turnResult.usage.inputTokens,
+                            outputTokens: turnResult.usage.outputTokens,
                         });
                         const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
                         judge.score(prompt.trim(), turnResult.response).then((score) => {

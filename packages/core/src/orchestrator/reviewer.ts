@@ -113,21 +113,28 @@ export class ReviewerAgent {
                 const verificationNotes: string[] = [];
                 let verificationPassed = true;
 
-                // 1. TypeScript compilation check
-                const tscResult = await runCheck(
-                    "npx",
-                    ["tsc", "--noEmit"],
-                    this.config.sandbox.projectRoot,
-                    60_000,
-                );
-                if (!tscResult.success) {
-                    verificationPassed = false;
-                    verificationNotes.push(
-                        "TypeScript compilation FAILED:\n" + tscResult.output.slice(0, 3000),
+                // 1. TypeScript compilation check — only meaningful when the project root
+                //    actually has a tsconfig.json. Without one, `tsc --noEmit` errors out
+                //    ("No inputs were found") and every orchestration would be flagged as
+                //    failed verification even when nothing is wrong.
+                if (fs.existsSync(path.join(this.config.sandbox.projectRoot, "tsconfig.json"))) {
+                    const tscResult = await runCheck(
+                        "npx",
+                        ["tsc", "--noEmit"],
+                        this.config.sandbox.projectRoot,
+                        60_000,
                     );
-                    process.stderr.write("[reviewer] tsc --noEmit failed\n");
+                    if (!tscResult.success) {
+                        verificationPassed = false;
+                        verificationNotes.push(
+                            "TypeScript compilation FAILED:\n" + tscResult.output.slice(0, 3000),
+                        );
+                        process.stderr.write("[reviewer] tsc --noEmit failed\n");
+                    } else {
+                        verificationNotes.push("TypeScript compilation: PASSED");
+                    }
                 } else {
-                    verificationNotes.push("TypeScript compilation: PASSED");
+                    verificationNotes.push("TypeScript compilation: skipped (no tsconfig.json in project root)");
                 }
 
                 // 2. Test suite

@@ -6,6 +6,7 @@ try { (process as any).loadEnvFile(); } catch { /* no .env file — that's fine 
 
 import { Command } from "commander";
 import chalk from "chalk";
+import { PANTHEON_VERSION } from "@pantheon/shared";
 import { chatCommand } from "./commands/chat.js";
 import { listModels, addModel, removeModel, setDefaultModel } from "./commands/models.js";
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
@@ -39,7 +40,7 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.8.0"));
+    console.log(chalk.hex("#6B7280")(`                              v${PANTHEON_VERSION}`));
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
@@ -93,7 +94,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.8.0")
+    .version(PANTHEON_VERSION)
     .action(() => {
         showWelcome();
     });

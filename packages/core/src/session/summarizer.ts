@@ -1,4 +1,4 @@
-import { eq, desc, ne } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import type { ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import { getDb, type PantheonDatabase } from "../db/client.js";

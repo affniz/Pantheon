@@ -94,6 +94,18 @@ export interface AgentTurnResult {
     iterations: number;
     /** Whether the model was escalated mid-turn due to repeated errors */
     escalated: boolean;
+    /** Token usage summed across every LLM call made during this turn */
+    usage: { inputTokens: number; outputTokens: number };
+}
+
+export interface AgentRunOptions {
+    /**
+     * A routing decision that was already resolved by the caller (e.g. the chat
+     * route classifies once to decide on orchestration). When provided, the
+     * runtime uses it instead of calling the classifier again, which avoids a
+     * second LLM round-trip and keeps the model consistent with what was reported.
+     */
+    decision?: RoutingDecision;
 }
 
 /**
@@ -127,11 +139,24 @@ export class AgentRuntime {
      */
     async run(
         messages: ChatMessage[],
-        modelId?: string
+        modelId?: string,
+        options: AgentRunOptions = {}
     ): Promise<AgentTurnResult> {
         const runFn = async (): Promise<AgentTurnResult> => {
-            // Resolve routing once for the entire turn
-            const decision = await this.gateway.resolveRouting(messages, modelId);
+            // Resolve routing once for the entire turn (or reuse the caller's decision)
+            const decision = options.decision ?? await this.gateway.resolveRouting(messages, modelId);
+
+            const usage = { inputTokens: 0, outputTokens: 0 };
+            const complete = async (
+                msgs: ChatMessage[],
+                model: string,
+                tools?: ReturnType<ToolRegistry["toOpenAITools"]>,
+            ) => {
+                const result = await this.gateway.complete(msgs, model, tools);
+                usage.inputTokens += result.usage?.inputTokens ?? 0;
+                usage.outputTokens += result.usage?.outputTokens ?? 0;
+                return result;
+            };
 
             const systemPromptBase = this.config.systemPrompt
                 ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
@@ -191,7 +216,7 @@ export class AgentRuntime {
                             .slice(0, 8_000); // cap input to the summary call
 
                         try {
-                            const summaryResp = await this.gateway.complete(
+                            const summaryResp = await complete(
                                 [
                                     {
                                         role: "system",
@@ -238,10 +263,8 @@ export class AgentRuntime {
                 // Mid-turn escalation: if repeated errors, re-route to the complex tier
                 if (!escalated && errorIterations >= ESCALATION_THRESHOLD) {
                     try {
-                        const escalatedDecision = await this.gateway.resolveRouting(messages, undefined);
                         // Only escalate if the complex tier gives us a different (better) model
-                        const routingConfig = (this.gateway as any).registry?.getRoutingConfig?.();
-                        const complexModelId = routingConfig?.tiers?.complex;
+                        const complexModelId = this.gateway.getRoutingConfig().tiers.complex;
                         if (complexModelId && complexModelId !== currentDecision.selectedModelId) {
                             currentDecision = {
                                 tier: "complex",
@@ -260,9 +283,9 @@ export class AgentRuntime {
                 }
 
                 // Send to LLM with tool definitions
-                let message: import("@pantheon/shared").ChatMessage;
+                let message: ChatMessage;
                 try {
-                    const result = await this.gateway.complete(
+                    const result = await complete(
                         workingMessages,
                         currentDecision.selectedModelId,
                         tools.length > 0 ? tools : undefined
@@ -281,7 +304,7 @@ export class AgentRuntime {
                             "Please summarize what you accomplished so far and provide a final response without calling any more tools.",
                         toolCallId: syntheticId,
                     });
-                    const fallback = await this.gateway.complete(
+                    const fallback = await complete(
                         workingMessages,
                         currentDecision.selectedModelId
                         // No tools — force plain text
@@ -293,6 +316,7 @@ export class AgentRuntime {
                         decision: currentDecision,
                         iterations,
                         escalated,
+                        usage,
                     };
                 }
 
@@ -305,6 +329,7 @@ export class AgentRuntime {
                         decision: currentDecision,
                         iterations,
                         escalated,
+                        usage,
                     };
                 }
 
@@ -436,7 +461,7 @@ export class AgentRuntime {
                     "Please provide your final response based on the information gathered so far.",
             });
 
-            const { message: finalMessage } = await this.gateway.complete(
+            const { message: finalMessage } = await complete(
                 workingMessages,
                 currentDecision.selectedModelId
                 // No tools — force a text response
@@ -449,6 +474,7 @@ export class AgentRuntime {
                 decision: currentDecision,
                 iterations,
                 escalated,
+                usage,
             };
         }; // end runFn
 
@@ -470,6 +496,8 @@ export class AgentRuntime {
                     span.attributes.selectedModelId = result.decision.selectedModelId;
                     span.attributes.routingTier = result.decision.tier;
                     span.attributes.escalated = result.escalated;
+                    span.attributes.inputTokens = result.usage.inputTokens;
+                    span.attributes.outputTokens = result.usage.outputTokens;
                     return result;
                 }
             );

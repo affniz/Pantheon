@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getDb, schema } from "@pantheon/core";
+import { getDb, schema, desc, eq } from "@pantheon/core";
 
 export const consensusRouter = new Hono();
 
@@ -7,7 +7,7 @@ export const consensusRouter = new Hono();
  * GET /api/consensus -- list recent consensus runs (summary), newest first
  */
 consensusRouter.get("/", (c) => {
-    const limit = Math.min(Number(c.req.query("limit") ?? "20"), 100);
+    const limit = Math.min(Math.max(1, Number(c.req.query("limit") ?? "20") || 20), 100);
     const db = getDb();
     const runs = db
         .select({
@@ -15,12 +15,13 @@ consensusRouter.get("/", (c) => {
             sessionId: schema.consensusRuns.sessionId,
             promptHash: schema.consensusRuns.promptHash,
             synthesisLatencyMs: schema.consensusRuns.synthesisLatencyMs,
+            qualityScore: schema.consensusRuns.qualityScore,
             createdAt: schema.consensusRuns.createdAt,
         })
         .from(schema.consensusRuns)
-        .all()
-        .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1))
-        .slice(0, limit);
+        .orderBy(desc(schema.consensusRuns.createdAt))
+        .limit(limit)
+        .all();
 
     return c.json({ runs });
 });
@@ -34,8 +35,8 @@ consensusRouter.get("/:id", (c) => {
     const run = db
         .select()
         .from(schema.consensusRuns)
-        .all()
-        .find((r) => r.id === id);
+        .where(eq(schema.consensusRuns.id, id))
+        .get();
 
     if (!run) {
         return c.json({ error: "Consensus run not found" }, 404);

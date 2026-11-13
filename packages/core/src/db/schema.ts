@@ -98,6 +98,7 @@ export const subTasks = sqliteTable("sub_tasks", {
     title: text("title").notNull(),
     description: text("description").notNull(),
     dependencies: text("dependencies"),                   // JSON array of task IDs
+    taskRole: text("task_role"),                          // "code" | "debug" | "general"
     status: text("status").notNull(),                     // pending | running | completed | failed | cancelled
     result: text("result"),
     error: text("error"),
@@ -125,6 +126,7 @@ export const consensusRuns = sqliteTable("consensus_runs", {
     /** JSON array of ConsensusResponse objects */
     modelResponses: text("model_responses").notNull(),
     synthesisLatencyMs: integer("synthesis_latency_ms").notNull(),
+    qualityScore: real("quality_score"),                      // 1–10, nullable until judged async
     createdAt: text("created_at").notNull(),
 });
 

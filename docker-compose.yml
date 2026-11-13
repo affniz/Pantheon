@@ -10,6 +10,9 @@ services:
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      # Optional fallback providers (claude-fallback / gpt-fallback in litellm-config.yaml)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     restart: unless-stopped
 
   pantheon-server:
@@ -27,6 +30,9 @@ services:
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      # Capability detection (getCapabilities) reads these; keys are only used by LiteLLM
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - LITELLM_BASE_URL=http://litellm:4000
       - SENTRY_DSN=${SENTRY_DSN:-}
       - NODE_ENV=${NODE_ENV:-production}

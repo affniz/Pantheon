@@ -245,9 +245,11 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                     }
 
                     case "agent_spawned": {
-                        const agent = evt.data.agent as { taskId?: string };
+                        const agent = evt.data.agent as { taskId?: string; role?: string };
                         if (agent?.taskId) {
-                            accumulatedText += `\n  ▶ [executor] started task ${agent.taskId}`;
+                            // Sub-task IDs are `${planId}_${localId}` — show the local part only
+                            const shortTask = agent.taskId.slice(agent.taskId.lastIndexOf("_") + 1);
+                            accumulatedText += `\n  ▶ [${agent.role ?? "executor"}] started ${shortTask}`;
                             setStreamedText(accumulatedText);
                         }
                         break;
@@ -255,14 +257,16 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
 
                     case "agent_completed": {
                         const d = evt.data;
-                        accumulatedText += `\n  ✓ [executor:${d.agentId.slice(0, 6)}] completed`;
+                        accumulatedText += `\n  ✓ [agent:${String(d.agentId).slice(0, 6)}] completed`;
                         setStreamedText(accumulatedText);
                         break;
                     }
 
                     case "agent_failed": {
                         const d = evt.data;
-                        accumulatedText += `\n  ✗ [executor:${d.agentId.slice(0, 6)}] failed: ${d.error}`;
+                        const label = String(d.agentId);
+                        const shortLabel = label.includes("_") ? label.slice(label.lastIndexOf("_") + 1) : label.slice(0, 6);
+                        accumulatedText += `\n  ✗ [agent:${shortLabel}] failed: ${d.error}`;
                         setStreamedText(accumulatedText);
                         break;
                     }

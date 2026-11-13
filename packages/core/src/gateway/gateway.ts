@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { ChatMessage, RoutingDecision, ToolCall } from "@pantheon/shared";
+import type { ChatMessage, RoutingConfig, RoutingDecision, ToolCall } from "@pantheon/shared";
 import type { ModelRegistry } from "../registry/model-registry.js";
 import type { OpenAITool } from "../tools/tool-registry.js";
 import { Classifier } from "../router/classifier.js";
@@ -12,16 +12,29 @@ const DEFAULT_FAILOVER_CHAIN = ["deepseek-v4-pro", "claude-fallback", "gpt-fallb
 /** Callback invoked when the gateway falls back to a different model. */
 export type ModelFallbackCallback = (from: string, to: string, reason: string) => void;
 
+export interface GatewayOptions {
+    /**
+     * Base delay between retry attempts of a single model call. Attempt N waits
+     * `retryBaseDelayMs * N`. Default: 500ms. Tests pass 0 to avoid real sleeps.
+     */
+    retryBaseDelayMs?: number;
+}
+
+/** Number of attempts made against a single model before giving up on it. */
+const MAX_ATTEMPTS = 3;
+
 export class Gateway {
     private client: OpenAI;
     private registry: ModelRegistry;
     private classifier: Classifier;
     private tracker: CostTracker;
     private onModelFallback?: ModelFallbackCallback;
+    private retryBaseDelayMs: number;
 
-    constructor(registry: ModelRegistry, onModelFallback?: ModelFallbackCallback) {
+    constructor(registry: ModelRegistry, onModelFallback?: ModelFallbackCallback, options: GatewayOptions = {}) {
         this.registry = registry;
         if (onModelFallback !== undefined) this.onModelFallback = onModelFallback;
+        this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
         const { baseUrl, masterKey } = registry.getGatewayConfig();
 
         this.client = new OpenAI({ baseURL: baseUrl, apiKey: masterKey });
@@ -39,6 +52,45 @@ export class Gateway {
     private upstreamModelName(modelId: string): string {
         const model = this.registry.get(modelId);
         return model?.modelName ?? modelId;
+    }
+
+    /** Routing configuration (tiers, thresholds) from the underlying registry. */
+    getRoutingConfig(): RoutingConfig {
+        return this.registry.getRoutingConfig();
+    }
+
+    /** The application-level failover chain (configured or default). */
+    private failoverChain(): string[] {
+        return this.registry.getGatewayConfig().failoverChain ?? [...DEFAULT_FAILOVER_CHAIN];
+    }
+
+    /**
+     * Compute the USD cost of a call from the model's configured pricing.
+     * Returns 0 when no pricing is configured so usage is still recorded.
+     */
+    private computeCost(modelId: string, inputTokens: number, outputTokens: number): number {
+        const pricing = this.registry.get(modelId)?.pricing;
+        if (!pricing) return 0;
+        return (inputTokens * pricing.inputPer1M + outputTokens * pricing.outputPer1M) / 1_000_000;
+    }
+
+    /**
+     * Parse tool-call arguments emitted by the model. Models occasionally emit
+     * malformed JSON; instead of failing the whole completion we surface the
+     * problem to the agent loop as an empty argument object plus a parse error,
+     * which the tool will reject with a clear message the model can act on.
+     */
+    private parseToolArguments(raw: string): { args: Record<string, unknown>; parseError?: string } {
+        if (!raw || raw.trim() === "") return { args: {} };
+        try {
+            const parsed: unknown = JSON.parse(raw);
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+                return { args: parsed as Record<string, unknown> };
+            }
+            return { args: {}, parseError: `tool arguments must be a JSON object, got ${Array.isArray(parsed) ? "array" : typeof parsed}` };
+        } catch (err) {
+            return { args: {}, parseError: err instanceof Error ? err.message : String(err) };
+        }
     }
 
     /**
@@ -100,8 +152,49 @@ export class Gateway {
         modelId?: string
     ): Promise<{ generator: AsyncGenerator<string>; decision: RoutingDecision }> {
         const decision = await this.resolveRouting(messages, modelId);
-        const generator = this._streamCompletion(messages, decision);
+        const generator = this._streamWithFailover(messages, decision);
         return { generator, decision };
+    }
+
+    /**
+     * Streaming counterpart of `complete()`'s failover: when the selected model is
+     * the head of the failover chain, a stream that fails before producing any
+     * output falls back to the next model in the chain (emitting `onModelFallback`).
+     * Once content has been yielded we cannot transparently switch models, so the
+     * error is propagated instead.
+     */
+    private async *_streamWithFailover(
+        messages: ChatMessage[],
+        decision: RoutingDecision
+    ): AsyncGenerator<string> {
+        const chain = this.failoverChain();
+        const candidates =
+            chain.indexOf(decision.selectedModelId) === 0 && chain.length > 1
+                ? chain
+                : [decision.selectedModelId];
+
+        let lastError: unknown;
+        for (let i = 0; i < candidates.length; i++) {
+            const modelId = candidates[i]!;
+            let yielded = false;
+            try {
+                for await (const chunk of this._streamCompletion(messages, modelId)) {
+                    yielded = true;
+                    yield chunk;
+                }
+                return;
+            } catch (err) {
+                if (yielded) throw err;
+                lastError = err;
+                const reason = err instanceof Error ? err.message : String(err);
+                const nextModel = candidates[i + 1];
+                if (!nextModel) break;
+                process.stderr.write(`[gateway] stream failover: model "${modelId}" failed: ${reason}\n`);
+                process.stderr.write(`[gateway] stream failover: trying "${nextModel}"\n`);
+                this.onModelFallback?.(modelId, nextModel, reason);
+            }
+        }
+        throw lastError;
     }
 
     /**
@@ -119,8 +212,7 @@ export class Gateway {
         usage: { inputTokens: number; outputTokens: number };
     }> {
         // Determine if this model is part of the failover chain
-        const gatewayConfig = this.registry.getGatewayConfig();
-        const failoverChain = gatewayConfig.failoverChain ?? [...DEFAULT_FAILOVER_CHAIN];
+        const failoverChain = this.failoverChain();
         const chainIdx = failoverChain.indexOf(modelId);
 
         // Only apply failover if the requested model is the head of the chain
@@ -232,9 +324,10 @@ export class Gateway {
                 // malformed tool-call output that causes a 400; retrying usually succeeds.
                 const client = this.clientFor(modelId);
                 const upstreamModel = this.upstreamModelName(modelId);
-                for (let attempt = 1; attempt <= 3; attempt++) {
+                for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
                     try {
                         response = await client.chat.completions.create(
+                            // eslint-disable-next-line @typescript-eslint/no-explicit-any
                             { ...requestParams, model: upstreamModel } as any
                         );
                         break; // success
@@ -242,9 +335,9 @@ export class Gateway {
                         lastError = err;
                         const msg = err instanceof Error ? err.message : String(err);
                         process.stderr.write(`[gateway] attempt ${attempt} failed: ${msg}\n`);
-                        if (attempt < 3) {
-                            // Small backoff before retry
-                            await new Promise((r) => setTimeout(r, 500 * attempt));
+                        if (attempt < MAX_ATTEMPTS && this.retryBaseDelayMs > 0) {
+                            // Small linear backoff before retry
+                            await new Promise((r) => setTimeout(r, this.retryBaseDelayMs * attempt));
                         }
                     }
                 }
@@ -276,12 +369,19 @@ export class Gateway {
                 // Parse tool calls from the response
                 let toolCalls: ToolCall[] | undefined;
                 if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
-                    toolCalls = choice.message.tool_calls.map((tc) => ({
-                        id: tc.id,
-                        name: tc.function.name,
-                        arguments: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-                    }));
+                    const parseErrors: string[] = [];
+                    toolCalls = choice.message.tool_calls.map((tc) => {
+                        const { args, parseError } = this.parseToolArguments(tc.function.arguments);
+                        if (parseError) {
+                            parseErrors.push(`${tc.function.name}: ${parseError}`);
+                            process.stderr.write(
+                                `[gateway] malformed tool arguments for "${tc.function.name}": ${parseError}\n`
+                            );
+                        }
+                        return { id: tc.id, name: tc.function.name, arguments: args };
+                    });
                     span.attributes.returnedToolCalls = toolCalls.map((tc) => tc.name);
+                    if (parseErrors.length > 0) span.attributes.toolArgumentParseErrors = parseErrors;
                 }
 
                 const message: ChatMessage = {
@@ -296,7 +396,7 @@ export class Gateway {
                     modelId,
                     inputTokens,
                     outputTokens,
-                    costUsd: 0,
+                    costUsd: this.computeCost(modelId, inputTokens, outputTokens),
                     promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
                 });
 
@@ -308,9 +408,8 @@ export class Gateway {
 
     private async *_streamCompletion(
         messages: ChatMessage[],
-        decision: RoutingDecision
+        modelId: string
     ): AsyncGenerator<string> {
-        const modelId = decision.selectedModelId;
         const client = this.clientFor(modelId);
         const upstreamModel = this.upstreamModelName(modelId);
 
@@ -339,10 +438,10 @@ export class Gateway {
 
         this.tracker.record({
             timestamp: new Date().toISOString(),
-            modelId: decision.selectedModelId,
+            modelId,
             inputTokens,
             outputTokens,
-            costUsd: 0,
+            costUsd: this.computeCost(modelId, inputTokens, outputTokens),
             promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
         });
     }

@@ -4,6 +4,17 @@ export interface ModelConfig {
     displayName?: string;
     /** Real upstream model name, used when provider needs direct routing (e.g. google). Defaults to id. */
     modelName?: string;
+    /**
+     * Optional pricing used to compute `costUsd` on usage records.
+     * When omitted, cost is recorded as 0 (tokens are still tracked).
+     */
+    pricing?: ModelPricing;
+}
+
+/** Per-token pricing in USD per 1M tokens. */
+export interface ModelPricing {
+    inputPer1M: number;
+    outputPer1M: number;
 }
 
 export interface GatewayConfig {

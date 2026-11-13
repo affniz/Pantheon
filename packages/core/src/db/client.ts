@@ -96,6 +96,7 @@ const INIT_SQL = `
         title           TEXT NOT NULL,
         description     TEXT NOT NULL,
         dependencies    TEXT,
+        task_role       TEXT,
         status          TEXT NOT NULL,
         result          TEXT,
         error           TEXT,
@@ -127,6 +128,7 @@ const INIT_SQL = `
         synthesized_content   TEXT NOT NULL,
         model_responses       TEXT NOT NULL,
         synthesis_latency_ms  INTEGER NOT NULL,
+        quality_score         REAL,
         created_at            TEXT NOT NULL
     );
 
@@ -176,6 +178,19 @@ export function getDb(): PantheonDatabase {
     _sqlite.pragma("foreign_keys = ON");
     _sqlite.exec(INIT_SQL);
 
+    // Best-effort column migrations for databases created before this column was added.
+    // SQLite does not support IF NOT EXISTS on ALTER TABLE, so we swallow the error.
+    try {
+        _sqlite.exec("ALTER TABLE sub_tasks ADD COLUMN task_role TEXT;");
+    } catch {
+        // Column already exists — safe to ignore
+    }
+    try {
+        _sqlite.exec("ALTER TABLE consensus_runs ADD COLUMN quality_score REAL;");
+    } catch {
+        // Column already exists — safe to ignore
+    }
+
     _db = drizzle(_sqlite, { schema });
 
     // Background pruning: delete trace spans older than 7 days.
@@ -199,13 +214,37 @@ export function getDb(): PantheonDatabase {
 }
 
 /**
+ * SQLite handles created through createTestDb(). They are closed by closeTestDbs()
+ * (called from the Vitest setup file after each test file) so that no native
+ * `Database` object is left to be garbage-collected after the test worker's
+ * environment is torn down — that late finalizer aborts the Node process
+ * ("RemoveEnvironmentCleanupHook ... (env) != nullptr").
+ */
+const _testSqliteHandles = new Set<Database.Database>();
+
+/**
  * Create a Drizzle database instance for testing with a custom SQLite instance.
  * Does NOT use the singleton — each call returns a fresh instance.
  */
 export function createTestDb(sqlite: Database.Database): PantheonDatabase {
     sqlite.pragma("foreign_keys = ON");
     sqlite.exec(INIT_SQL);
+    _testSqliteHandles.add(sqlite);
     return drizzle(sqlite, { schema });
+}
+
+/**
+ * Close every SQLite handle created via createTestDb(). Safe to call repeatedly.
+ */
+export function closeTestDbs(): void {
+    for (const sqlite of _testSqliteHandles) {
+        try {
+            if (sqlite.open) sqlite.close();
+        } catch {
+            // Already closed or unusable — nothing to do
+        }
+    }
+    _testSqliteHandles.clear();
 }
 
 /**

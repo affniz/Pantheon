@@ -131,3 +131,32 @@ describe("ABRouter", () => {
         expect(result!.experimentId).toBe("my-experiment");
     });
 });
+
+
+describe("ABRouter — explicit experimentId", () => {
+    const decision: RoutingDecision = { tier: "standard", selectedModelId: "deepseek-v4-flash", reason: "t" };
+    const config: ABConfig = {
+        experiments: [
+            { id: "exp-a", name: "A", splitPercent: 50, controlModelId: "c-a", variantModelId: "v-a", active: true },
+            { id: "exp-b", name: "B", splitPercent: 50, controlModelId: "c-b", variantModelId: "v-b", active: true },
+            { id: "exp-off", name: "Off", splitPercent: 50, controlModelId: "c-o", variantModelId: "v-o", active: false },
+        ],
+    };
+
+    it("defaults to the first active experiment when none is requested", () => {
+        const res = new ABRouter(config).resolveArm(decision, "s1");
+        expect(res?.experimentId).toBe("exp-a");
+    });
+
+    it("routes through the requested active experiment", () => {
+        const res = new ABRouter(config).resolveArm(decision, "s1", "exp-b");
+        expect(res?.experimentId).toBe("exp-b");
+        expect(["c-b", "v-b"]).toContain(res?.modelId);
+    });
+
+    it("returns null when the requested experiment is inactive or unknown", () => {
+        const router = new ABRouter(config);
+        expect(router.resolveArm(decision, "s1", "exp-off")).toBeNull();
+        expect(router.resolveArm(decision, "s1", "does-not-exist")).toBeNull();
+    });
+});

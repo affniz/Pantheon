@@ -20,11 +20,30 @@ function timeAgo(isoString: string): string {
     return new Date(isoString).toLocaleDateString();
 }
 
-function formatDuration(start: string, end?: string): string {
-    if (!end) return "-";
-    const ms = new Date(end).getTime() - new Date(start).getTime();
+function formatDuration(startMs?: number | null, endMs?: number | null): string {
+    if (typeof startMs !== "number" || typeof endMs !== "number") return "-";
+    const ms = endMs - startMs;
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Shape of an agent node as returned by GET /api/agents.
+ * Mirrors the `agent_nodes` table columns (camelCased by Drizzle).
+ */
+interface AgentRow {
+    agentId: string;
+    role: string;
+    modelId: string;
+    parentAgentId?: string | null;
+    sessionId: string;
+    taskId?: string | null;
+    status: string;
+    result?: string | null;
+    error?: string | null;
+    startTime: number;
+    endTime?: number | null;
+    createdAt: string;
 }
 
 function formatStatus(status: string): string {
@@ -42,9 +61,9 @@ export async function agentsList(opts: { limit?: number }) {
     const client = new PantheonApiClient();
     const limit = opts.limit ?? 20;
 
-    let agents;
+    let agents: AgentRow[];
     try {
-        agents = await client.listAgents({ limit });
+        agents = (await client.listAgents({ limit })) as AgentRow[];
     } catch (err) {
         console.error(chalk.red(`  Failed to fetch agents: ${err instanceof Error ? err.message : String(err)}`));
         process.exit(1);
@@ -64,13 +83,14 @@ export async function agentsList(opts: { limit?: number }) {
     console.log(`  ${dim("─".repeat(85))}`);
 
     for (const a of agents) {
-        const id = accent(a.id.slice(0, 8));
+        const id = accent(a.agentId.slice(0, 8));
         const role = (a.role || "agent").slice(0, 14).padEnd(15);
-        const status = formatStatus(a.status || "unknown").padEnd(12 + (formatStatus(a.status || "unknown").length - (a.status || "unknown").length));
+        const rawStatus = a.status || "unknown";
+        const status = formatStatus(rawStatus) + " ".repeat(Math.max(0, 12 - rawStatus.length));
         const model = (a.modelId || "-").slice(0, 19).padEnd(20);
         const started = (a.createdAt ? timeAgo(a.createdAt) : "-").padEnd(12);
-        const duration = formatDuration(a.createdAt, a.completedAt || a.updatedAt);
-        
+        const duration = formatDuration(a.startTime, a.endTime);
+
         console.log(`  ${id}  ${role} ${status} ${model} ${dim(started)} ${duration}`);
     }
 
@@ -82,9 +102,9 @@ export async function agentsShow(id: string) {
     await ensureServerRunning();
     const client = new PantheonApiClient();
 
-    let agent;
+    let agent: AgentRow;
     try {
-        agent = await client.getAgent(id);
+        agent = (await client.getAgent(id)) as AgentRow;
     } catch (err) {
         console.error(chalk.red(`  Agent "${id}" not found or error fetching details.`));
         process.exit(1);
@@ -93,14 +113,16 @@ export async function agentsShow(id: string) {
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Agent Details")}`);
     console.log(`  ${dim("─".repeat(60))}`);
-    console.log(`  ${dim("ID:")}        ${accent(agent.id)}`);
+    console.log(`  ${dim("ID:")}        ${accent(agent.agentId)}`);
     console.log(`  ${dim("Role:")}      ${agent.role || "agent"}`);
     console.log(`  ${dim("Status:")}    ${formatStatus(agent.status || "unknown")}`);
     console.log(`  ${dim("Session:")}   ${agent.sessionId || "-"}`);
     console.log(`  ${dim("Model:")}     ${agent.modelId || "-"}`);
-    console.log(`  ${dim("Created:")}   ${agent.createdAt ? new Date(agent.createdAt).toLocaleString() : "-"}`);
-    console.log(`  ${dim("Updated:")}   ${agent.updatedAt ? new Date(agent.updatedAt).toLocaleString() : "-"}`);
-    console.log(`  ${dim("Duration:")}  ${formatDuration(agent.createdAt, agent.completedAt || agent.updatedAt)}`);
+    if (agent.parentAgentId) console.log(`  ${dim("Parent:")}    ${agent.parentAgentId}`);
+    if (agent.taskId) console.log(`  ${dim("Task:")}      ${agent.taskId}`);
+    console.log(`  ${dim("Started:")}   ${agent.startTime ? new Date(agent.startTime).toLocaleString() : "-"}`);
+    console.log(`  ${dim("Ended:")}     ${agent.endTime ? new Date(agent.endTime).toLocaleString() : "-"}`);
+    console.log(`  ${dim("Duration:")}  ${formatDuration(agent.startTime, agent.endTime)}`);
 
     if (agent.error) {
         console.log(`\n  ${chalk.red.bold("Error:")}`);
@@ -127,51 +149,52 @@ export async function agentsPlan(sessionId: string) {
     await ensureServerRunning();
     const client = new PantheonApiClient();
 
-    let agents;
+    let agents: AgentRow[];
     try {
-        agents = await client.listAgents({ sessionId });
+        agents = (await client.listAgents({ sessionId, limit: 500 })) as AgentRow[];
     } catch (err) {
         console.error(chalk.red(`  Failed to fetch agents for session "${sessionId}".`));
         process.exit(1);
     }
 
     const orchestrators = agents.filter(a => a.role === "orchestrator" || a.role === "planner");
-    
+
     if (orchestrators.length === 0) {
         console.error(chalk.red(`  No orchestrator agent found for session "${sessionId}".`));
         process.exit(1);
     }
 
     // Default to the most recent orchestrator
-    const orchestrator = orchestrators.sort((a, b) => 
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    )[0];
+    const orchestrator = orchestrators.sort((a, b) => b.startTime - a.startTime)[0]!;
 
     let plan;
     try {
-        plan = await client.getAgentPlan(orchestrator.id);
-    } catch (err) {
-        console.error(chalk.red(`  Failed to fetch plan for agent "${orchestrator.id}".`));
+        plan = await client.getAgentPlan(orchestrator.agentId);
+    } catch {
+        console.error(chalk.red(`  Failed to fetch plan for agent "${orchestrator.agentId}".`));
         process.exit(1);
     }
 
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold(`Task Plan for Session ${accent(sessionId.slice(0, 8))}`)}`);
-    console.log(`  ${dim(`Orchestrator Agent: ${orchestrator.id}`)}`);
+    console.log(`  ${dim(`Orchestrator Agent: ${orchestrator.agentId}`)}`);
     console.log(`  ${dim("─".repeat(80))}`);
 
     if (!plan || !plan.tasks || plan.tasks.length === 0) {
         console.log(dim("  No tasks found in plan."));
     } else {
+        // Sub-task IDs are stored as `${planId}_${localId}`; show the local part.
+        const shortId = (id: string) => id.includes("_") ? id.slice(id.lastIndexOf("_") + 1) : id;
         for (const task of plan.tasks) {
             const status = formatStatus(task.status || "pending");
-            const taskId = accent(task.id);
-            const desc = task.description || "Unknown task";
-            
-            console.log(`  [${status}] ${taskId}: ${desc}`);
-            
+            const taskId = accent(shortId(task.id));
+            const role = task.taskRole ? muted(`[${task.taskRole}] `) : "";
+            const desc = task.title || task.description || "Unknown task";
+
+            console.log(`  [${status}] ${taskId}: ${role}${desc}`);
+
             if (task.dependencies && task.dependencies.length > 0) {
-                console.log(`    ${dim("Depends on:")} ${task.dependencies.join(", ")}`);
+                console.log(`    ${dim("Depends on:")} ${task.dependencies.map(shortId).join(", ")}`);
             }
             if (task.result) {
                 const resPreview = typeof task.result === "string" 

@@ -10,10 +10,12 @@ export interface ABResolution {
 /**
  * ABRouter applies A/B traffic splitting to routing decisions.
  *
- * When an active experiment matches the current routing tier, it probabilistically
- * routes requests to the control or variant model based on splitPercent.
+ * When an active experiment applies, it routes requests to the control or variant
+ * model based on splitPercent.
  *
- * Decision is stateless per-call (no sticky sessions in v0.8).
+ * Arm assignment is sticky per session: it is derived from a SHA-256 hash of
+ * `experimentId:sessionId`, so the same session always lands on the same arm
+ * without any stored state.
  */
 export class ABRouter {
     private config: ABConfig;
@@ -26,15 +28,25 @@ export class ABRouter {
      * Given a routing decision, check if an active experiment applies.
      * Returns the arm and model to use, or null if no experiment is active.
      *
-     * @param decision - The routing decision from the classifier.
+     * @param decision - The routing decision from the classifier (reserved for tier-scoped experiments).
      * @param sessionId - Used to seed deterministic assignment per session.
+     * @param experimentId - Optional explicit experiment to route through. When given and it
+     *   names an active experiment, that experiment is used; otherwise the first active one is.
      */
-    resolveArm(decision: RoutingDecision, sessionId: string): ABResolution | null {
+    resolveArm(_decision: RoutingDecision, sessionId: string, experimentId?: string): ABResolution | null {
         const activeExperiments = this.config.experiments.filter((e) => e.active);
         if (activeExperiments.length === 0) return null;
 
-        // Use the first active experiment (v0.8 supports one active experiment at a time)
-        const experiment = activeExperiments[0]!;
+        const requested = experimentId
+            ? activeExperiments.find((e) => e.id === experimentId)
+            : undefined;
+        if (experimentId && !requested) {
+            // Caller asked for a specific experiment that is not active — do not silently
+            // route through a different one.
+            return null;
+        }
+
+        const experiment = requested ?? activeExperiments[0]!;
 
         // Deterministic hash: same session always gets the same arm
         const hash = createHash("sha256")

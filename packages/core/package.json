@@ -1,6 +1,6 @@
 {
     "name": "@pantheon/core",
-    "version": "0.6.0",
+    "version": "0.8.0",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -19,7 +19,7 @@
     "dependencies": {
         "@pantheon/shared": "workspace:*",
         "@types/better-sqlite3": "^9.6.0",
-        "better-sqlite3": "11.9.1",
+        "better-sqlite3": "12.11.1",
         "drizzle-orm": "^0.45.2",
         "js-yaml": "^4.1.0",
         "openai": "^4.52.0",
