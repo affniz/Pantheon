@@ -98,6 +98,7 @@ export const subTasks = sqliteTable("sub_tasks", {
     title: text("title").notNull(),
     description: text("description").notNull(),
     dependencies: text("dependencies"),                   // JSON array of task IDs
+    taskRole: text("task_role"),                          // "code" | "debug" | "general"
     status: text("status").notNull(),                     // pending | running | completed | failed | cancelled
     result: text("result"),
     error: text("error"),
@@ -114,3 +115,34 @@ export const installedPlugins = sqliteTable("installed_plugins", {
     config: text("config"),                                  // JSON plugin settings
     directory: text("directory").notNull(),                  // absolute path to plugin dir
 });
+
+// ─── Consensus Runs (v0.8) ────────────────────────────────────────────────────
+
+export const consensusRuns = sqliteTable("consensus_runs", {
+    id: text("id").primaryKey(),                             // UUID
+    sessionId: text("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+    promptHash: text("prompt_hash").notNull(),               // first 16 hex chars of SHA-256
+    synthesizedContent: text("synthesized_content").notNull(),
+    /** JSON array of ConsensusResponse objects */
+    modelResponses: text("model_responses").notNull(),
+    synthesisLatencyMs: integer("synthesis_latency_ms").notNull(),
+    qualityScore: real("quality_score"),                      // 1–10, nullable until judged async
+    createdAt: text("created_at").notNull(),
+});
+
+// ─── A/B Run Records (v0.8) ──────────────────────────────────────────────────
+
+export const abRuns = sqliteTable("ab_runs", {
+    id: text("id").primaryKey(),                             // UUID
+    experimentId: text("experiment_id").notNull(),
+    sessionId: text("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+    promptHash: text("prompt_hash").notNull(),
+    arm: text("arm").notNull(),                              // "control" | "variant"
+    modelId: text("model_id").notNull(),
+    latencyMs: integer("latency_ms").notNull(),
+    inputTokens: integer("input_tokens").notNull(),
+    outputTokens: integer("output_tokens").notNull(),
+    qualityScore: real("quality_score"),                     // 1–10, nullable until judged
+    createdAt: text("created_at").notNull(),
+});
+

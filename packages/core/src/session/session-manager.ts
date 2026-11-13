@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { eq, desc, and, ne, sql } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 import type { ChatMessage, Session } from "@pantheon/shared";
 import { getDb, type PantheonDatabase } from "../db/client.js";
 import { sessions, messages } from "../db/schema.js";
@@ -53,7 +53,7 @@ export class SessionManager {
         const offset = options?.offset ?? 0;
         const includeArchived = options?.includeArchived ?? false;
 
-        let query = this.db
+        const rows = this.db
             .select({
                 id: sessions.id,
                 title: sessions.title,
@@ -65,16 +65,12 @@ export class SessionManager {
             })
             .from(sessions)
             .leftJoin(messages, eq(sessions.id, messages.sessionId))
+            .where(includeArchived ? undefined : eq(sessions.isArchived, false))
             .groupBy(sessions.id)
             .orderBy(desc(sessions.createdAt))
             .limit(limit)
-            .offset(offset);
-
-        if (!includeArchived) {
-            query = query.where(eq(sessions.isArchived, false)) as any;
-        }
-
-        const rows = query.all();
+            .offset(offset)
+            .all();
         return rows.map((row) => ({
             id: row.id,
             title: row.title,

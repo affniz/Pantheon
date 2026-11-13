@@ -51,10 +51,10 @@ export class MCPClient {
         let transport: Transport;
 
         if (config.transport === "stdio") {
-            const { transport: _, ...rest } = config;
+            const { transport: _kind, ...rest } = config;
             transport = new StdioTransport(rest);
         } else {
-            const { transport: _, ...rest } = config;
+            const { transport: _kind, ...rest } = config;
             transport = new SSETransport(rest);
         }
 

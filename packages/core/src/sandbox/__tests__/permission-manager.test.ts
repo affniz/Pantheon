@@ -71,4 +71,53 @@ describe("PermissionManager", () => {
             expect(mockPrompt).toHaveBeenCalledTimes(2);
         });
     });
+
+    describe("fork()", () => {
+        it("child inherits parent alwaysAllowed grants", async () => {
+            // Grant always_allow for "read" in the parent
+            mockPrompt.mockResolvedValue("always_allow");
+            await manager.check("read", {}, "safe");
+            expect(manager.isAlwaysAllowed("read")).toBe(true);
+
+            // Fork the manager — child should know "read" is already allowed
+            const child = manager.fork();
+            expect(child.isAlwaysAllowed("read")).toBe(true);
+            // Should not prompt because "read" is pre-seeded
+            const result = await child.check("read", {}, "safe");
+            expect(result).toBe(true);
+            expect(mockPrompt).toHaveBeenCalledTimes(1); // Only the original parent grant
+        });
+
+        it("new grants in child do NOT propagate to parent", async () => {
+            const child = manager.fork();
+
+            // Grant always_allow in the child only
+            mockPrompt.mockResolvedValue("always_allow");
+            await child.check("write", {}, "safe");
+            expect(child.isAlwaysAllowed("write")).toBe(true);
+
+            // Parent should NOT have picked up the child's grant
+            expect(manager.isAlwaysAllowed("write")).toBe(false);
+        });
+
+        it("child starts with only the parent grants, not extras from sibling forks", async () => {
+            // Grant read to parent
+            mockPrompt.mockResolvedValue("always_allow");
+            await manager.check("read", {}, "safe");
+
+            const child1 = manager.fork();
+            const child2 = manager.fork();
+
+            // child1 grants "shell"
+            mockPrompt.mockResolvedValue("always_allow");
+            await child1.check("shell", {}, "safe");
+
+            // child2 should NOT see child1's "shell" grant
+            expect(child2.isAlwaysAllowed("shell")).toBe(false);
+
+            // But both children still have "read" from the parent
+            expect(child1.isAlwaysAllowed("read")).toBe(true);
+            expect(child2.isAlwaysAllowed("read")).toBe(true);
+        });
+    });
 });

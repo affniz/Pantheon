@@ -78,11 +78,11 @@ export const grepTool: Tool = {
         }
 
         if (contextLines > 0) {
-            rgArgs.push();
+            rgArgs.push("-C", String(contextLines));
         }
 
         if (fileGlob) {
-            rgArgs.push();
+            rgArgs.push("--glob", fileGlob);
         }
 
         rgArgs.push("--", pattern, resolvedSearchPath);

@@ -362,3 +362,47 @@ describe("AgentRuntime", () => {
         );
     });
 });
+
+
+describe("AgentRuntime — run options", () => {
+    let sandbox: Sandbox;
+    let permissionManager: PermissionManager;
+    let config: AgentConfig;
+
+    beforeEach(() => {
+        sandbox = createMockSandbox();
+        permissionManager = createMockPermissionManager(true);
+        config = { maxIterations: 10, sandbox, permissionManager };
+    });
+
+    it("uses a caller-provided routing decision instead of re-classifying", async () => {
+        const gateway = createMockGateway([{ role: "assistant", content: "done" }]);
+        const runtime = new AgentRuntime(gateway, new ToolRegistry(), config);
+        const preset: RoutingDecision = { tier: "general", selectedModelId: "llama-smart", reason: "preset" };
+
+        const result = await runtime.run([{ role: "user", content: "hi" }], undefined, { decision: preset });
+
+        expect(gateway.resolveRouting).not.toHaveBeenCalled();
+        expect(result.decision).toEqual(preset);
+        // The preset model is the one actually used for the completion
+        const completeCall = (gateway.complete as ReturnType<typeof vi.fn>).mock.calls[0]!;
+        expect(completeCall[1]).toBe("llama-smart");
+    });
+
+    it("sums token usage across every LLM call in the turn", async () => {
+        const toolCall: ToolCall = { id: "tc1", name: "testTool", arguments: { input: "x" } };
+        const gateway = createMockGateway([
+            { role: "assistant", content: "", toolCalls: [toolCall] },
+            { role: "assistant", content: "final" },
+        ]);
+        const registry = new ToolRegistry();
+        registry.register(createTestTool());
+        const runtime = new AgentRuntime(gateway, registry, config);
+
+        const result = await runtime.run([{ role: "user", content: "go" }]);
+
+        // Two completions × (10 in / 20 out) from createMockGateway
+        expect(result.usage).toEqual({ inputTokens: 20, outputTokens: 40 });
+        expect(result.iterations).toBe(2);
+    });
+});

@@ -13,7 +13,7 @@ import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
 import { Tracer } from "../tracing/tracer.js";
 import { getDb } from "../db/client.js";
-import { agentNodes, subTasks } from "../db/schema.js";
+import { agentNodes } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { PlannerAgent } from "./planner.js";
@@ -84,7 +84,7 @@ export class Orchestrator {
     }
 
     async run(prompt: string, messages: ChatMessage[]): Promise<OrchestratorResult> {
-        return Tracer.startTrace(this.config.sessionId, async (_traceId) => {
+        return Tracer.startTrace(this.config.sessionId, async () => {
             return Tracer.startSpan("orchestrator.run", "orchestrator", async (span) => {
                 const db = getDb();
                 const orchestratorAgentId = randomUUID();
@@ -130,7 +130,6 @@ export class Orchestrator {
                     span.attributes.waveCount = waves.length;
 
                     // ── 3. Execute — run each wave in parallel (role-based dispatch) ──
-                    const allAgentNodes: AgentNode[] = [];
                     const taskResults = new Map<string, SubTask>();
 
                     for (const wave of waves) {

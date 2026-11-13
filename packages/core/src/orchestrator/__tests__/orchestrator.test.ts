@@ -84,10 +84,18 @@ describe("PlannerAgent", () => {
         const plan = await planner.plan("Write a research report on AI");
 
         expect(plan.tasks).toHaveLength(2);
-        expect(plan.tasks[0]?.id).toBe("task-1");
-        expect(plan.tasks[1]?.dependencies).toContain("task-1");
         expect(plan.sessionId).toBe("test-session");
         expect(plan.planId).toBeTruthy();
+        // IDs are rewritten to be globally unique and dependencies are remapped to match
+        expect(plan.tasks[0]?.id).toBe(`${plan.planId}_task-1`);
+        expect(plan.tasks[1]?.id).toBe(`${plan.planId}_task-2`);
+        expect(plan.tasks[1]?.dependencies).toEqual([`${plan.planId}_task-1`]);
+        // The in-memory id must equal the DB primary key so agents can update the row
+        const row = _testSqlite!
+            .prepare("SELECT id, task_role FROM sub_tasks WHERE id = ?")
+            .get(plan.tasks[0]!.id) as { id: string; task_role: string } | undefined;
+        expect(row?.id).toBe(plan.tasks[0]?.id);
+        expect(row?.task_role).toBe("general");
     });
 
     it("falls back to a single task when LLM returns invalid JSON", async () => {
@@ -103,7 +111,7 @@ describe("PlannerAgent", () => {
         const plan = await planner.plan("Do something complex");
 
         expect(plan.tasks).toHaveLength(1);
-        expect(plan.tasks[0]?.id).toBe("task-1");
+        expect(plan.tasks[0]?.id).toBe(`${plan.planId}_task-1`);
         expect(plan.tasks[0]?.title).toBe("Complete the request");
     });
 

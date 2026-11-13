@@ -24,9 +24,13 @@ interface Props {
     resume?: string | boolean | undefined;
     noSave?: boolean | undefined;
     budget?: "low" | "medium" | "high";
+    /** v0.8: Enable multi-model consensus fan-out */
+    consensus?: boolean;
+    /** v0.8: A/B experiment ID to route through */
+    experimentId?: string;
 }
 
-function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, budget = "medium" }: Props) {
+function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, budget = "medium", consensus = false, experimentId }: Props) {
     const client = useMemo(() => new PantheonApiClient(getServerUrl()), []);
 
     // Session state
@@ -143,6 +147,9 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                 ...(budget === "low" ? { orchestrate: false } : {}),
                 ...(budget === "high" ? { maxSubTasks: 6 } : {}),
                 ...(budget === "medium" ? { maxSubTasks: 3 } : {}),
+                // v0.8 features
+                ...(consensus ? { consensus: true } : {}),
+                ...(experimentId ? { experimentId } : {}),
             });
 
             for await (const evt of stream) {
@@ -238,9 +245,11 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                     }
 
                     case "agent_spawned": {
-                        const agent = evt.data.agent as { taskId?: string };
+                        const agent = evt.data.agent as { taskId?: string; role?: string };
                         if (agent?.taskId) {
-                            accumulatedText += `\n  ▶ [executor] started task ${agent.taskId}`;
+                            // Sub-task IDs are `${planId}_${localId}` — show the local part only
+                            const shortTask = agent.taskId.slice(agent.taskId.lastIndexOf("_") + 1);
+                            accumulatedText += `\n  ▶ [${agent.role ?? "executor"}] started ${shortTask}`;
                             setStreamedText(accumulatedText);
                         }
                         break;
@@ -248,14 +257,16 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
 
                     case "agent_completed": {
                         const d = evt.data;
-                        accumulatedText += `\n  ✓ [executor:${d.agentId.slice(0, 6)}] completed`;
+                        accumulatedText += `\n  ✓ [agent:${String(d.agentId).slice(0, 6)}] completed`;
                         setStreamedText(accumulatedText);
                         break;
                     }
 
                     case "agent_failed": {
                         const d = evt.data;
-                        accumulatedText += `\n  ✗ [executor:${d.agentId.slice(0, 6)}] failed: ${d.error}`;
+                        const label = String(d.agentId);
+                        const shortLabel = label.includes("_") ? label.slice(label.lastIndexOf("_") + 1) : label.slice(0, 6);
+                        accumulatedText += `\n  ✗ [agent:${shortLabel}] failed: ${d.error}`;
                         setStreamedText(accumulatedText);
                         break;
                     }
@@ -271,6 +282,40 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                     case "orchestration_done":
                         // Final response arrives via the "text" event — nothing extra needed here
                         break;
+
+                    // v0.8 events
+                    case "model_fallback": {
+                        const d = evt.data;
+                        accumulatedText += `\n⚠  Fell back from ${d.from} → ${d.to} (${d.reason})\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "consensus_model_start": {
+                        const d = evt.data;
+                        accumulatedText += `\n  ◆ Querying ${d.modelId}…`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "consensus_model_done": {
+                        const d = evt.data;
+                        if (d.error) {
+                            accumulatedText += `\n  ✗ ${d.modelId} failed: ${d.error}`;
+                        } else {
+                            accumulatedText += `\n  ✓ ${d.modelId} responded (${d.latencyMs}ms)`;
+                        }
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "consensus_done": {
+                        const d = evt.data;
+                        const successCount = (d.responses as any[]).filter((r: any) => !r.error).length;
+                        accumulatedText += `\n\n◆ Consensus: ${successCount}/${d.responses.length} models responded. Synthesis took ${d.synthesisLatencyMs}ms.\n\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
                 }
             }
 
@@ -384,7 +429,15 @@ const LOGO_LINES: readonly [string, string][] = [
     [" ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝", "#C68A1A"],
 ];
 
-export async function chatCommand(modelId?: string, noTools?: boolean, resume?: string | boolean, noSave?: boolean, budget?: "low" | "medium" | "high") {
+export async function chatCommand(
+    modelId?: string,
+    noTools?: boolean,
+    resume?: string | boolean,
+    noSave?: boolean,
+    budget?: "low" | "medium" | "high",
+    consensus?: boolean,
+    experimentId?: string,
+) {
     // Auto-start the server if not running
     try {
         await ensureServerRunning();
@@ -398,7 +451,7 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
     for (const [line, color] of LOGO_LINES) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.7.0"));
+    console.log(chalk.hex("#6B7280")("                              v0.8.0"));
     console.log("");
 
     if (resume) {
@@ -415,6 +468,14 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
         console.log(chalk.hex("#6B7280")("  Budget: high — up to 6 parallel sub-tasks\n"));
     }
 
+    if (consensus) {
+        console.log(chalk.hex("#56B6C2")("  Consensus mode — fanning out to multiple models\n"));
+    }
+
+    if (experimentId) {
+        console.log(chalk.hex("#6B7280")(`  A/B experiment: ${experimentId}\n`));
+    }
+
     render(
         <ChatApp
             {...(modelId ? { modelId } : {})}
@@ -422,6 +483,8 @@ export async function chatCommand(modelId?: string, noTools?: boolean, resume?: 
             resume={resume}
             noSave={noSave}
             budget={budget ?? "medium"}
+            {...(consensus ? { consensus: true } : {})}
+            {...(experimentId ? { experimentId } : {})}
         />
     );
 }

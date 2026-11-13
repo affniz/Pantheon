@@ -6,6 +6,7 @@ try { (process as any).loadEnvFile(); } catch { /* no .env file — that's fine 
 
 import { Command } from "commander";
 import chalk from "chalk";
+import { PANTHEON_VERSION } from "@pantheon/shared";
 import { chatCommand } from "./commands/chat.js";
 import { listModels, addModel, removeModel, setDefaultModel } from "./commands/models.js";
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
@@ -13,6 +14,8 @@ import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./c
 import { traceList, traceShow, traceClear } from "./commands/trace.js";
 import { agentsList, agentsShow, agentsPlan } from "./commands/agents.js";
 import { pluginsList, pluginsInstall, pluginsRemove, pluginsInfo } from "./commands/plugins.js";
+import { consensusList, consensusShow } from "./commands/consensus.js";
+import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
 
@@ -37,7 +40,7 @@ function showWelcome() {
     for (const [line, color] of LOGO) {
         console.log(chalk.hex(color)(line));
     }
-    console.log(chalk.hex("#6B7280")("                              v0.7.0"));
+    console.log(chalk.hex("#6B7280")(`                              v${PANTHEON_VERSION}`));
     console.log("");
     console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Multi-model AI agent orchestration system")}`);
     console.log(`  ${border("─".repeat(50))}`);
@@ -45,6 +48,7 @@ function showWelcome() {
     console.log(`  ${accent("chat")}                ${dim("Start an agentic chat session (with tools)")}`);
     console.log(`  ${accent("chat --resume")}       ${dim("Resume the last session")}`);
     console.log(`  ${accent("chat --no-tools")}     ${dim("Chat without tool access")}`);
+    console.log(`  ${accent("chat --consensus")}    ${dim("Fan-out to multiple models, synthesize the best answer")}`);
     console.log("");
     console.log(`  ${accent("sessions list")}       ${dim("List recent chat sessions")}`);
     console.log(`  ${accent("sessions show")} ${muted("<id>")}   ${dim("Show session details")}`);
@@ -54,6 +58,12 @@ function showWelcome() {
     console.log(`  ${accent("agents list")}           ${dim("List recent orchestration runs")}`);
     console.log(`  ${accent("agents show")} ${muted("<id>")}    ${dim("Show agent details")}`);
     console.log(`  ${accent("agents plan")} ${muted("<id>")}    ${dim("Show task plan for a session")}`);
+    console.log("");
+    console.log(`  ${accent("consensus list")}      ${dim("List recent consensus runs")}`);
+    console.log(`  ${accent("consensus show")} ${muted("<id>")} ${dim("Show per-model responses and synthesis")}`);
+    console.log("");
+    console.log(`  ${accent("ab list")}             ${dim("List A/B experiments")}`);
+    console.log(`  ${accent("ab comparison")} ${muted("<id>")} ${dim("View A/B comparison analytics")}`);
     console.log("");
     console.log(`  ${accent("plugins list")}       ${dim("List installed plugins")}`);
     console.log(`  ${accent("plugins install")} ${muted("<src>")} ${dim("Install a plugin")}`);
@@ -84,7 +94,7 @@ const program = new Command();
 program
     .name("pantheon")
     .description("Multi-model AI agent pantheon")
-    .version("0.7.0")
+    .version(PANTHEON_VERSION)
     .action(() => {
         showWelcome();
     });
@@ -101,12 +111,16 @@ program
         "Cost/latency budget: low (no orchestration), medium (default, up to 3 sub-tasks), high (up to 6 sub-tasks)",
         "medium"
     )
+    .option("--consensus", "Fan-out to multiple models and synthesize the best answer (v0.8)")
+    .option("--experiment <id>", "Route through an A/B experiment (v0.8)")
     .action((opts) => chatCommand(
         opts.model,
         opts.tools === false ? true : undefined,
         opts.resume,
         opts.save === false ? true : undefined,
         opts.budget as "low" | "medium" | "high",
+        opts.consensus ?? false,
+        opts.experiment,
     ));
 
 // ── Models ────────────────────────────────────────────────────────────────────
@@ -256,6 +270,37 @@ traceCmd
     .command("clear")
     .description("Clear all trace data")
     .action(traceClear);
+
+// ── Consensus (v0.8) ──────────────────────────────────────────────────────────
+
+const consensusCmd = program.command("consensus").description("View multi-model consensus runs (v0.8)");
+
+consensusCmd
+    .command("list", { isDefault: true })
+    .description("List recent consensus runs")
+    .option("-n, --limit <n>", "Number of runs to show", "20")
+    .action((opts) => consensusList({ limit: Number(opts.limit) }));
+
+consensusCmd
+    .command("show")
+    .description("Show per-model responses and synthesized answer for a consensus run")
+    .argument("<id>", "Consensus run ID")
+    .action(consensusShow);
+
+// ── A/B (v0.8) ───────────────────────────────────────────────────────────────
+
+const abCmd = program.command("ab").description("A/B model testing and analytics (v0.8)");
+
+abCmd
+    .command("list", { isDefault: true })
+    .description("List configured A/B experiments")
+    .action(abList);
+
+abCmd
+    .command("comparison")
+    .description("View A/B comparison analytics for an experiment")
+    .argument("<id>", "Experiment ID")
+    .action(abComparison);
 
 // ── Server ────────────────────────────────────────────────────────────────────
 

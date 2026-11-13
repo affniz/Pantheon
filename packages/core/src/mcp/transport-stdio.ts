@@ -89,7 +89,7 @@ export class StdioTransport {
                     // This is a server notification
                     this.notificationHandler?.(message as JSONRPCNotification);
                 }
-            } catch (error) {
+            } catch {
                 process.stderr.write(
                     `[mcp:${command}] Failed to parse message: ${line.slice(0, 200)}\n`
                 );

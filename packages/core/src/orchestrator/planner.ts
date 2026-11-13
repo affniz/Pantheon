@@ -42,7 +42,12 @@ export interface PlannerConfig {
 
 /**
  * Planner agent — decomposes a user prompt into an ordered set of sub-tasks.
- * Uses the smart model (70B) for reasoning about task decomposition.
+ * Uses the complex-tier model (deepseek-v4-pro) for reasoning about task decomposition.
+ *
+ * Sub-task IDs returned by the LLM (e.g. "task-1") are only unique within one plan,
+ * so they are rewritten to `${planId}_${id}` (dependencies included) before being
+ * persisted. The specialist agents update `sub_tasks` rows by `task.id`, so the
+ * in-memory ID and the DB primary key must be the same value.
  */
 export class PlannerAgent {
     private config: PlannerConfig;
@@ -109,6 +114,8 @@ export class PlannerAgent {
                     }];
                 }
 
+                const VALID_ROLES = new Set(["code", "debug", "general"]);
+
                 // Validate each task has the required fields
                 const validTasks: SubTask[] = parsedTasks
                     .filter(
@@ -122,9 +129,9 @@ export class PlannerAgent {
                         id: t.id,
                         title: t.title,
                         description: t.description,
-                        dependencies: t.dependencies,
+                        dependencies: t.dependencies.filter((d): d is string => typeof d === "string"),
                         status: "pending" as const,
-                        taskRole: t.taskRole ?? "general",
+                        taskRole: t.taskRole && VALID_ROLES.has(t.taskRole) ? t.taskRole : "general",
                     }));
 
                 // If validation stripped everything, fall back to a single task
@@ -135,15 +142,28 @@ export class PlannerAgent {
                         description: prompt,
                         dependencies: [],
                         status: "pending",
+                        taskRole: "general",
                     });
                 }
 
                 // Enforce the maxSubTasks cap
                 const cap = Math.min(6, Math.max(1, this.config.maxSubTasks ?? 3));
-                const cappedTasks = validTasks.slice(0, cap);
+                const planId = randomUUID();
+
+                // Rewrite LLM-local IDs to globally unique IDs (and remap dependencies).
+                // Dependencies on unknown or truncated tasks are dropped so a task is never
+                // blocked forever on something that will not run.
+                const keptLocalIds = new Set(validTasks.slice(0, cap).map((t) => t.id));
+                const toGlobal = (localId: string) => `${planId}_${localId}`;
+                const cappedTasks: SubTask[] = validTasks.slice(0, cap).map((t) => ({
+                    ...t,
+                    id: toGlobal(t.id),
+                    dependencies: t.dependencies
+                        .filter((d) => d !== t.id && keptLocalIds.has(d))
+                        .map(toGlobal),
+                }));
 
                 // Build the task plan
-                const planId = randomUUID();
                 const plan: TaskPlan = {
                     planId,
                     sessionId: this.config.sessionId,
@@ -163,11 +183,12 @@ export class PlannerAgent {
                 // Persist each sub-task
                 for (const task of cappedTasks) {
                     db.insert(subTasks).values({
-                        id: `${planId}_${task.id}`, // globally unique
+                        id: task.id, // already globally unique (`${planId}_${localId}`)
                         planId,
                         title: task.title,
                         description: task.description,
                         dependencies: JSON.stringify(task.dependencies),
+                        taskRole: task.taskRole ?? "general",
                         status: "pending",
                         createdAt: now,
                     }).run();

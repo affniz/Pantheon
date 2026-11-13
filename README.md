@@ -2,7 +2,7 @@
 
 > A self-hosted, multi-model AI orchestration system with intelligent routing, persistent memory, multi-agent task decomposition, and an extensible plugin ecosystem.
 
-**Current version: v0.7.0** · [Changelog](./CHANGELOG.md)
+**Current version: v0.8.0** · [Changelog](./CHANGELOG.md)
 
 ---
 
@@ -191,6 +191,9 @@ pantheon chat --model <id>        # pin a specific model (bypass routing)
 pantheon chat --budget low        # Groq-only — no orchestration
 pantheon chat --budget medium     # default — up to 3 sub-tasks
 pantheon chat --budget high       # up to 6 sub-tasks
+pantheon chat --consensus         # fan-out to all models and synthesize the best answer
+pantheon chat --orchestrate       # force multi-agent orchestration for this prompt
+pantheon chat --orchestrate false # force single-agent (skip orchestration auto-detect)
 
 # Sessions
 pantheon sessions list            # list recent sessions (default: 10)
@@ -210,6 +213,14 @@ pantheon plugins info <name>      # show plugin details and available tools
 pantheon agents list              # list recent orchestration runs
 pantheon agents show <agentId>    # show agent node details
 pantheon agents plan <sessionId>  # show the decomposed task plan for a session
+
+# Consensus (v0.8)
+pantheon consensus list           # list recent consensus runs
+pantheon consensus show <id>      # show per-model responses and synthesized result
+
+# A/B experiments (v0.8)
+pantheon ab list                  # list configured A/B experiments
+pantheon ab comparison <id>       # show control vs. variant analytics (latency + quality score)
 
 # Cost
 pantheon cost                     # show total usage summary
@@ -395,6 +406,8 @@ Pantheon uses **SQLite** (via Drizzle ORM) for local-first persistence. The data
 | `task_plans` | Task decomposition plan per orchestrated session |
 | `sub_tasks` | Individual sub-tasks within a plan, with dependency graph, taskRole, and execution results |
 | `installed_plugins` | Tracks installed plugins — name, version, source, enabled flag, install timestamp |
+| `consensus_runs` | Per-request consensus fan-out results with synthesized content, per-model responses, and async quality score |
+| `ab_runs` | Per-request A/B experiment records — arm, model, latency, token counts, and async quality score |
 
 > **v0.9** will introduce a PostgreSQL migration path — Drizzle makes this a driver swap, not a rewrite.
 
@@ -408,7 +421,16 @@ Pantheon uses **role-based model assignment** — models are matched to roles, n
 | `deepseek-v4-flash` | DeepSeek Chat V4 (0324) | `simple` / `standard` | Simple & moderate coding tasks |
 | `deepseek-v4-pro` | DeepSeek Reasoner V4 (0324) | `complex` | Complex coding + all orchestration agents |
 
-All models are accessed through the LiteLLM gateway (Docker on `:4000`). Optional fallback models (`claude-fallback`, `gpt-fallback`) activate automatically on primary provider errors if `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are set.
+All models are accessed through the LiteLLM gateway (Docker on `:4000`). Optional fallback models (`claude-fallback`, `gpt-fallback`) activate automatically on primary provider errors if `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are set — for both `complete()` and streaming calls.
+
+To have `pantheon cost` report dollar amounts (not just tokens), add per-model pricing to `config.yml`; without it, cost is recorded as `$0` and tokens are still tracked:
+
+```yaml
+models:
+  - id: deepseek-v4-flash
+    provider: deepseek
+    pricing: { inputPer1M: 0.27, outputPer1M: 1.10 }   # USD per 1M tokens
+```
 
 ---
 
@@ -418,7 +440,7 @@ All models are accessed through the LiteLLM gateway (Docker on `:4000`). Optiona
 pnpm turbo build      # build all packages
 pnpm turbo dev        # watch mode
 pnpm turbo lint       # run ESLint
-pnpm vitest run       # run tests (147 tests, from monorepo root)
+pnpm vitest run       # run tests (from monorepo root)
 pnpm turbo clean      # remove build artifacts
 ```
 
@@ -430,6 +452,7 @@ Full details in [CHANGELOG.md](./CHANGELOG.md).
 
 | Version | Summary |
 |:--------|:--------|
+| **v0.8** | Consensus engine (fan-out to N models, LLM synthesis); A/B experiment router with deterministic session assignment, quality judge, and analytics; provider failover chain; routing confidence threshold with auto-escalation; `--consensus` flag; `pantheon consensus` + `pantheon ab` commands |
 | **v0.7** | Plugin system (inline + MCP); sandbox overhauled to allowlist + arg path validation; `pantheon doctor`; `--budget` flag; Groq-only graceful degradation; `edit_file` + `grep` tools; repo map (AST codebase index); shell API key filtering; ReviewerAgent tsc+test verification; PermissionManager fork; context window pruning; 147 deterministic tests |
 | **v0.6** | Multi-agent orchestration — Planner/Coder/Debugger/Reviewer pipeline; DeepSeek V4; context-aware routing; `general` tier; `pantheon agents` commands |
 | **v0.5** | Hono API server; CLI becomes thin HTTP client; OpenTelemetry-style tracing; `pantheon trace`; rate limiting; Sentry |

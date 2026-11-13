@@ -8,7 +8,7 @@ import {
     Sandbox,
     ToolRegistry,
 } from "@pantheon/core";
-import type { PluginInfo } from "@pantheon/core";
+
 
 export const pluginsRouter = new Hono();
 
