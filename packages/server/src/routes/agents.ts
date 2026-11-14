@@ -1,81 +1,39 @@
 import { Hono } from "hono";
-import { getDb, schema, desc, eq } from "@pantheon/core";
+import { OrchestrationStore } from "@pantheon/core";
 
 export const agentsRouter = new Hono();
 
-const { agentNodes, taskPlans, subTasks } = schema;
+const store = new OrchestrationStore();
 
 /** GET /api/agents — List agent nodes, optionally filtered by sessionId */
-agentsRouter.get("/", (c) => {
+agentsRouter.get("/", async (c) => {
     const sessionId = c.req.query("sessionId");
     const limit = Math.min(Math.max(1, Number(c.req.query("limit") ?? "20") || 20), 500);
-    const db = getDb();
-
-    const agents = db
-        .select()
-        .from(agentNodes)
-        .where(sessionId ? eq(agentNodes.sessionId, sessionId) : undefined)
-        .orderBy(desc(agentNodes.startTime))
-        .limit(limit)
-        .all();
-
+    const agents = await store.listAgents({ sessionId, limit });
     return c.json({ agents });
 });
 
 /** GET /api/agents/:agentId — Get a single agent node by ID */
-agentsRouter.get("/:agentId", (c) => {
-    const agentId = c.req.param("agentId");
-    const db = getDb();
-
-    const agent = db.select().from(agentNodes).where(eq(agentNodes.agentId, agentId)).get();
-
+agentsRouter.get("/:agentId", async (c) => {
+    const agent = await store.getAgent(c.req.param("agentId"));
     if (!agent) {
         return c.json({ error: "Agent not found" }, 404);
     }
-
     return c.json({ agent });
 });
 
 /** GET /api/agents/:agentId/plan — Get the task plan associated with an agent's session */
-agentsRouter.get("/:agentId/plan", (c) => {
-    const agentId = c.req.param("agentId");
-    const db = getDb();
-
-    const agent = db.select().from(agentNodes).where(eq(agentNodes.agentId, agentId)).get();
-
+agentsRouter.get("/:agentId/plan", async (c) => {
+    const agent = await store.getAgent(c.req.param("agentId"));
     if (!agent) {
         return c.json({ error: "Agent not found" }, 404);
     }
 
-    // A session may have been orchestrated more than once — return the plan created
-    // most recently before (or at) the time this agent started.
-    const plan = db
-        .select()
-        .from(taskPlans)
-        .where(eq(taskPlans.sessionId, agent.sessionId))
-        .orderBy(desc(taskPlans.createdAt))
-        .all()
-        .find((p) => new Date(p.createdAt).getTime() <= agent.startTime + 1000)
-        ?? db
-            .select()
-            .from(taskPlans)
-            .where(eq(taskPlans.sessionId, agent.sessionId))
-            .orderBy(desc(taskPlans.createdAt))
-            .get();
-
+    const plan = await store.getPlanForAgent(agent);
     if (!plan) {
         return c.json({ error: "No task plan found for this agent's session" }, 404);
     }
 
-    const tasks = db
-        .select()
-        .from(subTasks)
-        .where(eq(subTasks.planId, plan.planId))
-        .all()
-        .map((t) => ({
-            ...t,
-            dependencies: t.dependencies ? (JSON.parse(t.dependencies) as string[]) : [],
-        }));
-
+    const tasks = await store.getSubTasks(plan.planId);
     return c.json({ plan: { ...plan, tasks } });
 });

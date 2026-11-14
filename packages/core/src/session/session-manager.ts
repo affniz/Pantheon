@@ -1,41 +1,39 @@
 import crypto from "node:crypto";
-import { eq, desc, sql } from "drizzle-orm";
+import { eq, desc, count } from "drizzle-orm";
 import type { ChatMessage, Session } from "@pantheon/shared";
-import { getDb, type PantheonDatabase } from "../db/client.js";
-import { sessions, messages } from "../db/schema.js";
+import { DbStore } from "../db/store.js";
 
-export class SessionManager {
-    private db: PantheonDatabase;
-
-    constructor(db?: PantheonDatabase) {
-        this.db = db ?? getDb();
-    }
-
-    create(title?: string): string {
+export class SessionManager extends DbStore {
+    async create(title?: string): Promise<string> {
+        const { sessions } = this.t;
         const id = crypto.randomUUID();
         const now = new Date().toISOString();
-        this.db
-            .insert(sessions)
-            .values({
-                id,
-                title: title ?? "New Session",
-                createdAt: now,
-                updatedAt: now,
-                isArchived: false,
-            })
-            .run();
+        await this.db.insert(sessions).values({
+            id,
+            title: title ?? "New Session",
+            createdAt: now,
+            updatedAt: now,
+            isArchived: false,
+        });
         return id;
     }
 
-    get(id: string): Session | undefined {
-        const session = this.db.select().from(sessions).where(eq(sessions.id, id)).get();
+    /** True when a session with this id exists (cheaper than `get`, no message count). */
+    async exists(id: string): Promise<boolean> {
+        const { sessions } = this.t;
+        const rows = await this.db.select({ id: sessions.id }).from(sessions).where(eq(sessions.id, id)).limit(1);
+        return rows.length > 0;
+    }
+
+    async get(id: string): Promise<Session | undefined> {
+        const { sessions, messages } = this.t;
+        const [session] = await this.db.select().from(sessions).where(eq(sessions.id, id)).limit(1);
         if (!session) return undefined;
 
-        const countResult = this.db
-            .select({ count: sql<number>`CAST(COUNT(*) AS INTEGER)` })
+        const [countResult] = await this.db
+            .select({ count: count() })
             .from(messages)
-            .where(eq(messages.sessionId, id))
-            .get();
+            .where(eq(messages.sessionId, id));
 
         return {
             id: session.id,
@@ -44,16 +42,17 @@ export class SessionManager {
             updatedAt: session.updatedAt,
             modelId: session.modelId ?? undefined,
             isArchived: session.isArchived,
-            messageCount: countResult?.count ?? 0,
+            messageCount: Number(countResult?.count ?? 0),
         };
     }
 
-    list(options?: { limit?: number; offset?: number; includeArchived?: boolean }): Session[] {
+    async list(options?: { limit?: number; offset?: number; includeArchived?: boolean }): Promise<Session[]> {
+        const { sessions, messages } = this.t;
         const limit = options?.limit ?? 50;
         const offset = options?.offset ?? 0;
         const includeArchived = options?.includeArchived ?? false;
 
-        const rows = this.db
+        const rows = await this.db
             .select({
                 id: sessions.id,
                 title: sessions.title,
@@ -61,16 +60,17 @@ export class SessionManager {
                 updatedAt: sessions.updatedAt,
                 modelId: sessions.modelId,
                 isArchived: sessions.isArchived,
-                messageCount: sql<number>`CAST(COUNT(${messages.id}) AS INTEGER)`,
+                messageCount: count(messages.id),
             })
             .from(sessions)
             .leftJoin(messages, eq(sessions.id, messages.sessionId))
             .where(includeArchived ? undefined : eq(sessions.isArchived, false))
             .groupBy(sessions.id)
-            .orderBy(desc(sessions.createdAt))
+            // id is a tiebreaker so paging is deterministic when timestamps collide
+            .orderBy(desc(sessions.createdAt), desc(sessions.id))
             .limit(limit)
-            .offset(offset)
-            .all();
+            .offset(offset);
+
         return rows.map((row) => ({
             id: row.id,
             title: row.title,
@@ -78,42 +78,41 @@ export class SessionManager {
             updatedAt: row.updatedAt,
             modelId: row.modelId ?? undefined,
             isArchived: row.isArchived,
-            messageCount: row.messageCount,
+            messageCount: Number(row.messageCount),
         }));
     }
 
-    addMessage(sessionId: string, message: ChatMessage): void {
+    async addMessage(sessionId: string, message: ChatMessage): Promise<void> {
+        const { sessions, messages } = this.t;
+
         // Auto-generate title if it's the first user message and session has default title
         if (message.role === "user") {
-            const session = this.db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+            const [session] = await this.db.select().from(sessions).where(eq(sessions.id, sessionId)).limit(1);
             if (session && session.title === "New Session") {
                 const newTitle = message.content.substring(0, 80).replace(/\n/g, " ") || "New Session";
-                this.updateTitle(sessionId, newTitle);
+                await this.updateTitle(sessionId, newTitle);
             }
         }
 
-        this.db
-            .insert(messages)
-            .values({
-                sessionId,
-                role: message.role,
-                content: message.content,
-                toolCalls: message.toolCalls ? JSON.stringify(message.toolCalls) : null,
-                toolCallId: message.toolCallId ?? null,
-                createdAt: (message.timestamp || new Date()).toISOString(),
-            })
-            .run();
+        await this.db.insert(messages).values({
+            sessionId,
+            role: message.role,
+            content: message.content,
+            toolCalls: message.toolCalls ? JSON.stringify(message.toolCalls) : null,
+            toolCallId: message.toolCallId ?? null,
+            createdAt: (message.timestamp || new Date()).toISOString(),
+        });
 
-        this.touch(sessionId);
+        await this.touch(sessionId);
     }
 
-    getMessages(sessionId: string): ChatMessage[] {
-        const rows = this.db
+    async getMessages(sessionId: string): Promise<ChatMessage[]> {
+        const { messages } = this.t;
+        const rows = await this.db
             .select()
             .from(messages)
             .where(eq(messages.sessionId, sessionId))
-            .orderBy(messages.id)
-            .all();
+            .orderBy(messages.id);
 
         return rows.map((row) => {
             const msg: ChatMessage = {
@@ -122,7 +121,11 @@ export class SessionManager {
                 timestamp: new Date(row.createdAt),
             };
             if (row.toolCalls) {
-                msg.toolCalls = JSON.parse(row.toolCalls);
+                try {
+                    msg.toolCalls = JSON.parse(row.toolCalls);
+                } catch {
+                    // A corrupt tool_calls blob must not make the whole session unreadable
+                }
             }
             if (row.toolCallId) {
                 msg.toolCallId = row.toolCallId;
@@ -131,42 +134,43 @@ export class SessionManager {
         });
     }
 
-    updateTitle(sessionId: string, title: string): void {
-        this.db
+    async updateTitle(sessionId: string, title: string): Promise<void> {
+        const { sessions } = this.t;
+        await this.db
             .update(sessions)
             .set({ title, updatedAt: new Date().toISOString() })
-            .where(eq(sessions.id, sessionId))
-            .run();
+            .where(eq(sessions.id, sessionId));
     }
 
-    touch(sessionId: string): void {
-        this.db
+    async touch(sessionId: string): Promise<void> {
+        const { sessions } = this.t;
+        await this.db
             .update(sessions)
             .set({ updatedAt: new Date().toISOString() })
-            .where(eq(sessions.id, sessionId))
-            .run();
+            .where(eq(sessions.id, sessionId));
     }
 
-    archive(sessionId: string): void {
-        this.db
+    async archive(sessionId: string): Promise<void> {
+        const { sessions } = this.t;
+        await this.db
             .update(sessions)
             .set({ isArchived: true, updatedAt: new Date().toISOString() })
-            .where(eq(sessions.id, sessionId))
-            .run();
+            .where(eq(sessions.id, sessionId));
     }
 
-    delete(sessionId: string): void {
-        this.db.delete(sessions).where(eq(sessions.id, sessionId)).run();
+    async delete(sessionId: string): Promise<void> {
+        const { sessions } = this.t;
+        await this.db.delete(sessions).where(eq(sessions.id, sessionId));
     }
 
-    getLatest(): Session | undefined {
-        const row = this.db
-            .select()
+    async getLatest(): Promise<Session | undefined> {
+        const { sessions } = this.t;
+        const [row] = await this.db
+            .select({ id: sessions.id })
             .from(sessions)
             .where(eq(sessions.isArchived, false))
             .orderBy(desc(sessions.updatedAt))
-            .limit(1)
-            .get();
+            .limit(1);
 
         if (!row) return undefined;
         return this.get(row.id);

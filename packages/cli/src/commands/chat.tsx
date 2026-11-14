@@ -54,7 +54,7 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
 
     // Fetch models and initialize session on mount
     useEffect(() => {
-        (async () => {
+        void (async () => {
             try {
                 // Load model list from API
                 const { models, defaultModel } = await client.listModels();

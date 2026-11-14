@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { grepTool } from "../builtin/grep.js";
 import { Sandbox } from "../../sandbox/sandbox.js";
 import * as fs from "node:fs";
@@ -43,6 +43,44 @@ describe("grep tool", () => {
         const result = await grepTool.execute({ pattern: "hello", path: "sample.ts" }, sandbox);
         expect(result).toContain("hello");
         expect(result).toContain("sample.ts");
+    });
+
+    it("reports results as project-relative path:line:text", async () => {
+        if (!rgAvailable) return;
+        fs.mkdirSync(path.join(tmpDir, "src"));
+        fs.writeFileSync(path.join(tmpDir, "src", "a.ts"), "const needle = 1;\n", "utf-8");
+        const result = await grepTool.execute({ pattern: "needle" }, sandbox);
+        expect(result).toMatch(/^(\.[\\/])?src[\\/]a\.ts:1:const needle = 1;$/);
+    });
+
+    it("refuses to search outside the project root (absolute path)", async () => {
+        const result = await grepTool.execute({ pattern: "root", path: "/etc" }, sandbox);
+        expect(result).toMatch(/outside the project root/);
+    });
+
+    it("refuses to search outside the project root (../ traversal)", async () => {
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), "grep-outside-"));
+        try {
+            fs.writeFileSync(path.join(outside, "secret.txt"), "TOP_SECRET_VALUE\n", "utf-8");
+            const rel = path.relative(tmpDir, path.join(outside, "secret.txt"));
+            const result = await grepTool.execute({ pattern: "TOP_SECRET", path: rel }, sandbox);
+            expect(result).toMatch(/outside the project root/);
+            expect(result).not.toContain("TOP_SECRET_VALUE");
+        } finally {
+            fs.rmSync(outside, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses to follow a symlink that points outside the project root", async () => {
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), "grep-outside-"));
+        try {
+            fs.writeFileSync(path.join(outside, "secret.txt"), "TOP_SECRET_VALUE\n", "utf-8");
+            fs.symlinkSync(outside, path.join(tmpDir, "link"));
+            const result = await grepTool.execute({ pattern: "TOP_SECRET", path: "link" }, sandbox);
+            expect(result).toMatch(/outside the project root/);
+        } finally {
+            fs.rmSync(outside, { recursive: true, force: true });
+        }
     });
 
     it("returns No matches found when pattern not present", async () => {

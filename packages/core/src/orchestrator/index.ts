@@ -10,3 +10,5 @@ export { DebuggerAgent } from "./debugger.js";
 export type { DebuggerConfig, DebuggerResult } from "./debugger.js";
 export { ReviewerAgent } from "./reviewer.js";
 export type { ReviewerConfig, ReviewResult } from "./reviewer.js";
+export { OrchestrationStore } from "./store.js";
+export type { AgentNodeRow, TaskPlanRow, SubTaskRow } from "./store.js";

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { ABStore, loadConfig } from "@pantheon/core";
+import { intParam } from "./params.js";
 
 export const abRouter = new Hono();
 
@@ -20,7 +21,7 @@ abRouter.get("/experiments", async (c) => {
 abRouter.get("/experiments/:id/comparison", async (c) => {
     const experimentId = c.req.param("id");
     try {
-        const comparison = store.getComparison(experimentId);
+        const comparison = await store.getComparison(experimentId);
         return c.json({ comparison });
     } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
@@ -32,7 +33,6 @@ abRouter.get("/experiments/:id/comparison", async (c) => {
  */
 abRouter.get("/experiments/:id/runs", async (c) => {
     const experimentId = c.req.param("id");
-    const limit = Math.min(Number(c.req.query("limit") ?? "50"), 200);
-    const runs = store.getRuns(experimentId).slice(-limit);
+    const runs = await store.getRuns(experimentId, intParam(c.req.query("limit"), 50, 1, 200));
     return c.json({ runs });
 });

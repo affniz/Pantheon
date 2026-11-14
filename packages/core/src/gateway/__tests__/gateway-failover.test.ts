@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import Database from "better-sqlite3";
-import { createTestDb } from "../../db/client.js";
+import { createTestDb, rawExecutor } from "../../db/client.js";
 import { Gateway } from "../gateway.js";
 import type { ChatMessage } from "@pantheon/shared";
 
@@ -390,9 +390,9 @@ describe("Gateway — cost computation", () => {
 
         await gateway.complete(MESSAGES, "priced");
 
-        const row = _testDb!.$client.prepare("SELECT cost_usd, model_id FROM usage_records").get() as
-            | { cost_usd: number; model_id: string }
-            | undefined;
+        const [row] = await rawExecutor(_testDb!).all<{ cost_usd: number; model_id: string }>(
+            "SELECT cost_usd, model_id FROM usage_records",
+        );
         expect(row?.model_id).toBe("priced");
         expect(row?.cost_usd).toBeCloseTo(1 * 1 + 0.5 * 2, 6);
     });
@@ -406,7 +406,7 @@ describe("Gateway — cost computation", () => {
         }));
 
         await gateway.complete(MESSAGES, "free");
-        const row = _testDb!.$client.prepare("SELECT cost_usd FROM usage_records").get() as { cost_usd: number };
-        expect(row.cost_usd).toBe(0);
+        const [row] = await rawExecutor(_testDb!).all<{ cost_usd: number }>("SELECT cost_usd FROM usage_records");
+        expect(row?.cost_usd).toBe(0);
     });
 });

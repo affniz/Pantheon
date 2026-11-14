@@ -5,9 +5,7 @@ import type { SubTask, TaskPlan, ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import { Tracer } from "../tracing/tracer.js";
-import { getDb } from "../db/client.js";
-import { agentNodes } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { OrchestrationStore } from "./store.js";
 import { randomUUID } from "node:crypto";
 
 const REVIEWER_SYSTEM_PROMPT = `You are a reviewer agent. Your job is to review the results of sub-tasks that were executed to fulfill a user request, then synthesize a final, coherent response.
@@ -94,19 +92,15 @@ export class ReviewerAgent {
     async review(plan: TaskPlan, completedTasks: SubTask[]): Promise<ReviewResult> {
         return Tracer.startSpan("reviewer.synthesize", "reviewer", async (span) => {
             const agentId = randomUUID();
-            const db = getDb();
-            const now = new Date().toISOString();
+            const store = new OrchestrationStore();
 
-            db.insert(agentNodes).values({
+            await store.startAgent({
                 agentId,
                 role: "reviewer",
                 modelId: this.config.reviewerModelId,
                 parentAgentId: this.config.parentAgentId,
                 sessionId: this.config.sessionId,
-                status: "running",
-                startTime: Date.now(),
-                createdAt: now,
-            }).run();
+            });
 
             try {
                 // Verification pass
@@ -206,10 +200,7 @@ export class ReviewerAgent {
                     agentId,
                 };
 
-                db.update(agentNodes)
-                    .set({ status: "completed", result: reviewResult.finalResponse, endTime: Date.now() })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
+                await store.completeAgent(agentId, reviewResult.finalResponse);
 
                 span.attributes.approved = approved;
                 span.attributes.taskCount = completedTasks.length;
@@ -218,15 +209,7 @@ export class ReviewerAgent {
 
                 return reviewResult;
             } catch (error) {
-                db.update(agentNodes)
-                    .set({
-                        status: "failed",
-                        error: error instanceof Error ? error.message : String(error),
-                        endTime: Date.now(),
-                    })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
-
+                await store.failAgent(agentId, error);
                 throw error;
             }
         });

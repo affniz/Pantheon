@@ -18,6 +18,7 @@ import { consensusList, consensusShow } from "./commands/consensus.js";
 import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
+import { dbStatus, dbMigrate } from "./commands/db.js";
 
 // Brand colors matching theme.ts
 const brand = chalk.hex("#F5A623");
@@ -336,6 +337,24 @@ serverCmd
             console.log(dim("  Pantheon server is not running. Use `pantheon server start` or `pantheon chat`."));
         }
     });
+
+// ── Database (v0.9) ───────────────────────────────────────────────────────────
+
+const dbCmd = program.command("db").description("Inspect and migrate the storage backend (SQLite / PostgreSQL)");
+
+dbCmd
+    .command("status", { isDefault: true })
+    .description("Show the active database, its schema version and row counts")
+    .option("--url <location>", "Inspect this database instead (postgres://… or a SQLite file path)")
+    .action((opts) => dbStatus(opts));
+
+dbCmd
+    .command("migrate")
+    .description("Copy all data to another database (e.g. SQLite → PostgreSQL)")
+    .requiredOption("--to <location>", "Destination: postgres://user:pass@host/db or a SQLite file path")
+    .option("--from <location>", "Source (default: the database Pantheon is currently using)")
+    .option("-y, --yes", "Do not prompt when the destination already contains data")
+    .action((opts) => dbMigrate(opts));
 
 // ── Doctor ────────────────────────────────────────────────────────────────────
 

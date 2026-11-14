@@ -1,6 +1,18 @@
 import { defineConfig } from 'vitest/config';
+import { fileURLToPath } from 'node:url';
+
+const src = (pkg: string) => fileURLToPath(new URL(`./packages/${pkg}/src/index.ts`, import.meta.url));
 
 export default defineConfig({
+    // Resolve workspace packages to their TypeScript sources, so tests never run
+    // against a stale `dist/` build and the whole suite shares one module instance
+    // of @pantheon/core (one database singleton, one set of mocks).
+    resolve: {
+        alias: {
+            '@pantheon/core': src('core'),
+            '@pantheon/shared': src('shared'),
+        },
+    },
     test: {
         include: ['packages/*/src/**/__tests__/**/*.test.ts'],
         globals: true,

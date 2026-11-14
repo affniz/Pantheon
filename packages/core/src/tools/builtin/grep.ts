@@ -58,18 +58,28 @@ export const grepTool: Tool = {
             return "Error: 'pattern' argument must be a non-empty string.";
         }
 
-        // Resolve search path within sandbox
+        // Resolve the search path inside the sandbox jail. `grep` is auto-approved, so a
+        // path that escapes the project root must be refused outright — falling back to
+        // an unchecked path here would let the model read any file on the machine
+        // (e.g. `grep . /etc/passwd`) without a permission prompt.
         let resolvedSearchPath: string;
         try {
             resolvedSearchPath = sandbox.resolvePath(searchPath);
         } catch {
-            resolvedSearchPath = path.resolve(sandbox.projectRoot, searchPath);
+            return `Error: path "${searchPath}" is outside the project root. Access denied.`;
         }
+
+        // Search relative to the project root so results carry short, stable paths.
+        const relative = path.relative(sandbox.projectRoot, resolvedSearchPath);
+        const rgTarget = relative === "" ? "." : relative.startsWith("..") ? resolvedSearchPath : relative;
 
         // Build rg argument list — call rg directly via execFile (NOT via sandbox allowlist)
         const rgArgs: string[] = [
             "--line-number",
             "--no-heading",
+            // rg omits the file name when given a single file; always include it so
+            // every result line is `path:line:text` regardless of what was searched.
+            "--with-filename",
             "--color=never",
         ];
 
@@ -85,7 +95,7 @@ export const grepTool: Tool = {
             rgArgs.push("--glob", fileGlob);
         }
 
-        rgArgs.push("--", pattern, resolvedSearchPath);
+        rgArgs.push("--", pattern, rgTarget);
 
         return new Promise<string>((resolve) => {
             execFile(

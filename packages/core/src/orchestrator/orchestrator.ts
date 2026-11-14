@@ -12,9 +12,7 @@ import type { ToolRegistry } from "../tools/tool-registry.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
 import { Tracer } from "../tracing/tracer.js";
-import { getDb } from "../db/client.js";
-import { agentNodes } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { OrchestrationStore } from "./store.js";
 import { randomUUID } from "node:crypto";
 import { PlannerAgent } from "./planner.js";
 import { ExecutorAgent } from "./executor.js";
@@ -86,20 +84,16 @@ export class Orchestrator {
     async run(prompt: string, messages: ChatMessage[]): Promise<OrchestratorResult> {
         return Tracer.startTrace(this.config.sessionId, async () => {
             return Tracer.startSpan("orchestrator.run", "orchestrator", async (span) => {
-                const db = getDb();
+                const store = new OrchestrationStore();
                 const orchestratorAgentId = randomUUID();
-                const now = new Date().toISOString();
 
                 // Register the root orchestrator agent node
-                db.insert(agentNodes).values({
+                await store.startAgent({
                     agentId: orchestratorAgentId,
                     role: "orchestrator",
                     modelId: this.config.plannerModelId,
                     sessionId: this.config.sessionId,
-                    status: "running",
-                    startTime: Date.now(),
-                    createdAt: now,
-                }).run();
+                });
 
                 span.attributes.agentId = orchestratorAgentId;
 
@@ -169,15 +163,7 @@ export class Orchestrator {
                         finalResponse: reviewResult.finalResponse,
                     });
 
-                    // Mark orchestrator as completed
-                    db.update(agentNodes)
-                        .set({
-                            status: "completed",
-                            result: reviewResult.finalResponse,
-                            endTime: Date.now(),
-                        })
-                        .where(eq(agentNodes.agentId, orchestratorAgentId))
-                        .run();
+                    await store.completeAgent(orchestratorAgentId, reviewResult.finalResponse);
 
                     this.emit({
                         type: "orchestration_done",
@@ -185,26 +171,8 @@ export class Orchestrator {
                         finalResponse: reviewResult.finalResponse,
                     });
 
-                    // Collect agent nodes for the result
-                    const agentNodeRows = db
-                        .select()
-                        .from(agentNodes)
-                        .where(eq(agentNodes.sessionId, this.config.sessionId))
-                        .all();
-
-                    const agentTree: AgentNode[] = agentNodeRows.map((row) => ({
-                        agentId: row.agentId,
-                        role: row.role as AgentNode["role"],
-                        modelId: row.modelId,
-                        sessionId: row.sessionId,
-                        status: row.status as AgentNode["status"],
-                        startTime: row.startTime,
-                        ...(row.parentAgentId ? { parentAgentId: row.parentAgentId } : {}),
-                        ...(row.taskId ? { taskId: row.taskId } : {}),
-                        ...(row.result ? { result: row.result } : {}),
-                        ...(row.error ? { error: row.error } : {}),
-                        ...(row.endTime !== null && row.endTime !== undefined ? { endTime: row.endTime } : {}),
-                    }));
+                    // Agents that took part in *this* run (a session may be orchestrated many times)
+                    const agentTree: AgentNode[] = await store.getAgentTree(orchestratorAgentId);
 
                     return {
                         planId: plan.planId,
@@ -215,14 +183,7 @@ export class Orchestrator {
                         reviewFeedback: reviewResult.feedback,
                     };
                 } catch (error) {
-                    db.update(agentNodes)
-                        .set({
-                            status: "failed",
-                            error: error instanceof Error ? error.message : String(error),
-                            endTime: Date.now(),
-                        })
-                        .where(eq(agentNodes.agentId, orchestratorAgentId))
-                        .run();
+                    await store.failAgent(orchestratorAgentId, error);
                     throw error;
                 }
             });

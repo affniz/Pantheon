@@ -96,6 +96,24 @@ export interface PantheonConfig {
     consensus?: ConsensusConfig;
     /** A/B traffic-splitting configuration (v0.8) */
     ab?: ABConfig;
+    /** Storage backend (v0.9). Omit to use SQLite at ~/.pantheon/pantheon.db. */
+    database?: DatabaseConfig;
+}
+
+/**
+ * Where Pantheon stores sessions, traces, usage and orchestration state.
+ *
+ * Environment variables take precedence over this block: `DATABASE_URL` overrides
+ * `url`, and `PANTHEON_DB_PATH` overrides `sqlitePath`.
+ */
+export interface DatabaseConfig {
+    /**
+     * Connection URL. `postgres://user:pass@host:5432/db` selects PostgreSQL.
+     * Prefer the `DATABASE_URL` environment variable so credentials stay out of config files.
+     */
+    url?: string;
+    /** SQLite file location, used when no PostgreSQL URL is configured. */
+    sqlitePath?: string;
 }
 
 export interface ShellAllowlistEntry {

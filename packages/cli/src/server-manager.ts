@@ -8,6 +8,9 @@ import fs from "node:fs";
 const PANTHEON_DIR = path.join(os.homedir(), ".pantheon");
 const PID_FILE = path.join(PANTHEON_DIR, "server.pid");
 const PORT_FILE = path.join(PANTHEON_DIR, "server-port");
+const LOG_FILE = path.join(PANTHEON_DIR, "server.log");
+/** The log is truncated on start once it grows past this, so it cannot fill the disk. */
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const STARTUP_TIMEOUT_MS = 8000;
 const POLL_INTERVAL_MS = 200;
 const DEFAULT_PORT = 3000;
@@ -53,14 +56,34 @@ export async function isServerRunning(): Promise<boolean> {
     }
 }
 
-/** Wait for the server to become reachable, polling every POLL_INTERVAL_MS. */
-async function waitForServer(): Promise<boolean> {
+/**
+ * Wait for the server to become reachable, polling every POLL_INTERVAL_MS.
+ * Gives up early when `hasExited()` reports the process died during startup.
+ */
+async function waitForServer(hasExited: () => boolean): Promise<boolean> {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS;
     while (Date.now() < deadline) {
         if (await isServerRunning()) return true;
+        if (hasExited()) return false;
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
     return false;
+}
+
+/** Path of the background server's log file. */
+export function getServerLogPath(): string {
+    return LOG_FILE;
+}
+
+/** Last few lines the server wrote since `fromByte`, for startup-failure messages. */
+function tailLog(fromByte: number, maxLines = 8): string {
+    try {
+        // Slice the Buffer, not the string: the offset is in bytes and the log has multi-byte characters.
+        const text = fs.readFileSync(LOG_FILE).subarray(fromByte).toString("utf-8");
+        return text.trim().split("\n").slice(-maxLines).join("\n");
+    } catch {
+        return "";
+    }
 }
 
 /** Find the path to the built server entry point. */
@@ -108,13 +131,30 @@ export async function ensureServerRunning(): Promise<void> {
     fs.mkdirSync(PANTHEON_DIR, { recursive: true });
     fs.writeFileSync(PORT_FILE, String(port), "utf-8");
 
+    // Send the server's output to ~/.pantheon/server.log. It used to be discarded,
+    // which made a startup failure (bad DATABASE_URL, port clash, missing build)
+    // indistinguishable from a slow start.
+    let logStart = 0;
+    try {
+        if (fs.statSync(LOG_FILE).size > MAX_LOG_BYTES) fs.rmSync(LOG_FILE, { force: true });
+        else logStart = fs.statSync(LOG_FILE).size;
+    } catch {
+        // no log yet
+    }
+    const logFd = fs.openSync(LOG_FILE, "a");
+
     // Spawn as a detached process — survives CLI exit
     const serverProcess = spawn(process.execPath, [serverPath], {
         detached: true,
-        stdio: "ignore",
+        stdio: ["ignore", logFd, logFd],
         env: { ...process.env, PORT: String(port) },
     });
+    fs.closeSync(logFd); // the child holds its own copy
 
+    let exited = false;
+    serverProcess.once("exit", () => {
+        exited = true;
+    });
     serverProcess.unref();
 
     // Save PID for manual stop
@@ -128,11 +168,19 @@ export async function ensureServerRunning(): Promise<void> {
         process.stdout.write("  Starting Pantheon server...\n");
     }
 
-    const ready = await waitForServer();
+    const ready = await waitForServer(() => exited);
     if (!ready) {
+        if (exited) {
+            fs.rmSync(PID_FILE, { force: true });
+            fs.rmSync(PORT_FILE, { force: true });
+        }
+        const tail = tailLog(logStart);
         throw new Error(
-            `Pantheon API server failed to start within ${STARTUP_TIMEOUT_MS / 1000}s. ` +
-            `Check that port ${port} is not in use and that the server package is built.`
+            (exited
+                ? "Pantheon API server exited during startup."
+                : `Pantheon API server failed to start within ${STARTUP_TIMEOUT_MS / 1000}s.`) +
+            (tail ? `\n\n${tail}\n` : " ") +
+            `\nFull log: ${LOG_FILE}`
         );
     }
 }

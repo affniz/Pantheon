@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
 import type { ChatMessage, ConsensusConfig, ConsensusResult, ConsensusResponse } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
-import { getDb } from "../db/client.js";
-import { schema } from "../db/index.js";
+import { ConsensusStore } from "./consensus-store.js";
 
 const DEFAULT_SYNTHESIS_PROMPT = `You are a synthesis assistant. Below are responses from multiple AI models to the same user prompt.
 Your task is to synthesize the best possible answer by:
@@ -31,10 +29,12 @@ Model responses:
 export class ConsensusEngine {
     private gateway: Gateway;
     private config: ConsensusConfig;
+    private store: ConsensusStore;
 
-    constructor(gateway: Gateway, config: ConsensusConfig) {
+    constructor(gateway: Gateway, config: ConsensusConfig, store: ConsensusStore = new ConsensusStore()) {
         this.gateway = gateway;
         this.config = config;
+        this.store = store;
     }
 
     /**
@@ -89,16 +89,14 @@ export class ConsensusEngine {
         // Persist to DB
         const runId = randomUUID();
         try {
-            const db = getDb();
-            db.insert(schema.consensusRuns).values({
+            await this.store.save({
                 id: runId,
                 ...(sessionId ? { sessionId } : {}),
                 promptHash,
                 synthesizedContent,
-                modelResponses: JSON.stringify(responses),
+                responses,
                 synthesisLatencyMs,
-                createdAt: new Date().toISOString(),
-            }).run();
+            });
         } catch (e) {
             process.stderr.write(`[consensus] failed to persist run: ${e instanceof Error ? e.message : String(e)}\n`);
         }
@@ -155,13 +153,9 @@ export class ConsensusEngine {
      * @param runId - The UUID returned by `run()`.
      * @param qualityScore - Score from 1–10 produced by `QualityJudge`.
      */
-    updateQualityScore(runId: string, qualityScore: number): void {
+    async updateQualityScore(runId: string, qualityScore: number): Promise<void> {
         try {
-            const db = getDb();
-            db.update(schema.consensusRuns)
-                .set({ qualityScore })
-                .where(eq(schema.consensusRuns.id, runId))
-                .run();
+            await this.store.updateQualityScore(runId, qualityScore);
         } catch (e) {
             process.stderr.write(
                 `[consensus] failed to update quality score for run ${runId}: ${e instanceof Error ? e.message : String(e)}\n`

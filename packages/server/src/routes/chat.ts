@@ -114,15 +114,19 @@ chatRouter.post("/", async (c) => {
             // Resolve or create session
             let effectiveSessionId = sessionId;
             if (!effectiveSessionId) {
-                effectiveSessionId = sm.create();
+                effectiveSessionId = await sm.create();
+            } else if (!(await sm.exists(effectiveSessionId))) {
+                // Previously this surfaced as an opaque foreign-key error from the first insert.
+                await sendEvent("error", { message: `Session "${effectiveSessionId}" not found` });
+                return;
             }
 
             // Load existing messages for context
-            let messages: ChatMessage[] = sm.getMessages(effectiveSessionId);
+            let messages: ChatMessage[] = await sm.getMessages(effectiveSessionId);
 
             // Append the new user message
             const userMsg: ChatMessage = { role: "user", content: prompt.trim(), timestamp: new Date() };
-            sm.addMessage(effectiveSessionId, userMsg);
+            await sm.addMessage(effectiveSessionId, userMsg);
             messages = [...messages, userMsg];
 
             // Wire gateway with model_fallback SSE event from the start — used everywhere
@@ -138,7 +142,7 @@ chatRouter.post("/", async (c) => {
             let episodicMemory = "";
             if (fastModelId && effectiveSessionId) {
                 const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
-                episodicMemory = summarizer.getEpisodicMemoryContext(effectiveSessionId, {
+                episodicMemory = await summarizer.getEpisodicMemoryContext(effectiveSessionId, {
                     recentMessageCount: 10,
                     summaryLimit: 4,
                 });
@@ -156,7 +160,7 @@ chatRouter.post("/", async (c) => {
                 }
 
                 const assistantMsg: ChatMessage = { role: "assistant", content: accumulated, timestamp: new Date() };
-                sm.addMessage(effectiveSessionId, assistantMsg);
+                await sm.addMessage(effectiveSessionId, assistantMsg);
 
                 await sendEvent("done", { sessionId: effectiveSessionId, iterations: 1 });
             } else {
@@ -194,15 +198,13 @@ chatRouter.post("/", async (c) => {
                         content: result.synthesizedContent,
                         timestamp: new Date(),
                     };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    await sm.addMessage(effectiveSessionId, assistantMsg);
 
                     // Async quality scoring — write score back to consensus_runs row
                     const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
-                    judge.score(prompt.trim(), result.synthesizedContent).then((score) => {
-                        if (score !== null) {
-                            engine.updateQualityScore(result.runId, score);
-                        }
-                    }).catch(() => {});
+                    judge.score(prompt.trim(), result.synthesizedContent)
+                        .then((score) => (score === null ? undefined : engine.updateQualityScore(result.runId, score)))
+                        .catch(() => {});
 
                     await sendEvent("done", { sessionId: effectiveSessionId, iterations: 0, consensus: true });
                     return;
@@ -335,11 +337,11 @@ chatRouter.post("/", async (c) => {
                         content: result.finalResponse,
                         timestamp: new Date(),
                     };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    await sm.addMessage(effectiveSessionId, assistantMsg);
 
                     // Background summarization
                     if (fastModelId) {
-                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const allMsgs = await sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
                             const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
@@ -390,11 +392,11 @@ chatRouter.post("/", async (c) => {
 
                     // Persist assistant message
                     const assistantMsg: ChatMessage = { role: "assistant", content: turnResult.response, timestamp: new Date() };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    await sm.addMessage(effectiveSessionId, assistantMsg);
 
                     // Background summarization
                     if (fastModelId) {
-                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const allMsgs = await sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
                             const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
@@ -405,7 +407,7 @@ chatRouter.post("/", async (c) => {
                     // v0.8: Record A/B run and async quality scoring
                     if (abResolution) {
                         const abStore = new ABStore();
-                        const savedRun = abStore.save({
+                        const savedRun = await abStore.save({
                             experimentId: abResolution.experimentId,
                             sessionId: effectiveSessionId,
                             promptHash: ABStore.hashPrompt(prompt.trim()),
@@ -416,11 +418,9 @@ chatRouter.post("/", async (c) => {
                             outputTokens: turnResult.usage.outputTokens,
                         });
                         const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
-                        judge.score(prompt.trim(), turnResult.response).then((score) => {
-                            if (score !== null) {
-                                abStore.updateQualityScore(savedRun.id, score);
-                            }
-                        }).catch(() => {});
+                        judge.score(prompt.trim(), turnResult.response)
+                            .then((score) => (score === null ? undefined : abStore.updateQualityScore(savedRun.id, score)))
+                            .catch(() => {});
                     }
 
                     await sendEvent("done", {

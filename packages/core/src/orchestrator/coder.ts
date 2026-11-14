@@ -5,9 +5,7 @@ import { ToolRegistry } from "../tools/tool-registry.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
 import { Tracer } from "../tracing/tracer.js";
-import { getDb } from "../db/client.js";
-import { agentNodes, subTasks } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { OrchestrationStore } from "./store.js";
 import { randomUUID } from "node:crypto";
 import { registerBuiltinTools } from "../tools/builtin/index.js";
 
@@ -50,25 +48,17 @@ export class CoderAgent {
             span.attributes.agentType = "coder";
 
             const agentId = randomUUID();
-            const db = getDb();
-            const now = new Date().toISOString();
+            const store = new OrchestrationStore();
 
-            db.insert(agentNodes).values({
+            await store.startAgent({
                 agentId,
                 role: "coder",
                 modelId: this.config.coderModelId,
                 parentAgentId: this.config.parentAgentId,
                 sessionId: this.config.sessionId,
                 taskId: task.id,
-                status: "running",
-                startTime: Date.now(),
-                createdAt: now,
-            }).run();
-
-            db.update(subTasks)
-                .set({ status: "running", agentId })
-                .where(eq(subTasks.id, task.id))
-                .run();
+            });
+            await store.updateSubTask(task.id, { status: "running", agentId });
 
             const toolRegistry = new ToolRegistry();
             registerBuiltinTools(toolRegistry);
@@ -108,15 +98,8 @@ Guidelines:
             try {
                 const turnResult = await agentRuntime.run(contextMessages, this.config.coderModelId);
 
-                db.update(agentNodes)
-                    .set({ status: "completed", result: turnResult.response, endTime: Date.now() })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
-
-                db.update(subTasks)
-                    .set({ status: "completed", result: turnResult.response })
-                    .where(eq(subTasks.id, task.id))
-                    .run();
+                await store.completeAgent(agentId, turnResult.response);
+                await store.updateSubTask(task.id, { status: "completed", result: turnResult.response });
 
                 span.attributes.iterations = turnResult.iterations;
                 span.attributes.toolCallCount = turnResult.toolCalls.length;
@@ -131,18 +114,8 @@ Guidelines:
                     iterations: turnResult.iterations,
                 };
             } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-
-                db.update(agentNodes)
-                    .set({ status: "failed", error: errorMessage, endTime: Date.now() })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
-
-                db.update(subTasks)
-                    .set({ status: "failed", error: errorMessage })
-                    .where(eq(subTasks.id, task.id))
-                    .run();
-
+                await store.failAgent(agentId, error);
+                await store.failSubTask(task.id, error);
                 throw error;
             }
         });

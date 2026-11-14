@@ -391,14 +391,7 @@ export class Gateway {
                 };
 
                 // Record usage
-                this.tracker.record({
-                    timestamp: new Date().toISOString(),
-                    modelId,
-                    inputTokens,
-                    outputTokens,
-                    costUsd: this.computeCost(modelId, inputTokens, outputTokens),
-                    promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-                });
+                await this.recordUsage(modelId, inputTokens, outputTokens, messages);
 
                 return { message, usage: { inputTokens, outputTokens } };
             }
@@ -436,13 +429,32 @@ export class Gateway {
             }
         }
 
-        this.tracker.record({
-            timestamp: new Date().toISOString(),
-            modelId,
-            inputTokens,
-            outputTokens,
-            costUsd: this.computeCost(modelId, inputTokens, outputTokens),
-            promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-        });
+        await this.recordUsage(modelId, inputTokens, outputTokens, messages);
+    }
+
+    /**
+     * Persist token usage and cost for one LLM call. Best-effort: a database
+     * problem must never turn a successful model response into a failed request.
+     */
+    private async recordUsage(
+        modelId: string,
+        inputTokens: number,
+        outputTokens: number,
+        messages: ChatMessage[],
+    ): Promise<void> {
+        try {
+            await this.tracker.record({
+                timestamp: new Date().toISOString(),
+                modelId,
+                inputTokens,
+                outputTokens,
+                costUsd: this.computeCost(modelId, inputTokens, outputTokens),
+                promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
+            });
+        } catch (err) {
+            process.stderr.write(
+                `[gateway] failed to record usage for ${modelId}: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+        }
     }
 }

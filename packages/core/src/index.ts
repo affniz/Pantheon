@@ -16,9 +16,37 @@ export { buildRepoMap } from "./tools/repo-map/index.js";
 
 export { AgentRuntime } from "./agent/agent-runtime.js";
 export type { AgentConfig, AgentTurnResult, AgentRunOptions } from "./agent/agent-runtime.js";
-export { getDb, createTestDb, closeTestDbs, closeDb } from "./db/client.js";
-export type { PantheonDatabase } from "./db/client.js";
-export { schema } from "./db/index.js";
+export {
+    getDb,
+    initDb,
+    closeDb,
+    openDatabase,
+    closeDatabase,
+    tablesFor,
+    dialectOf,
+    resolveDatabaseTarget,
+    parseDatabaseTarget,
+    describeTarget,
+    redactUrl,
+    getDatabaseStatus,
+    copyDatabase,
+    createTestDb,
+    createTestPgDb,
+    closeTestDbs,
+    sqliteSchema,
+    pgSchema,
+    LATEST_SCHEMA_VERSION,
+} from "./db/index.js";
+export type {
+    PantheonDatabase,
+    Tables,
+    Dialect,
+    DatabaseTarget,
+    DatabaseStatus,
+    TransferReport,
+    TransferOptions,
+} from "./db/index.js";
+export { DbStore } from "./db/store.js";
 // Query operators re-exported so API consumers (e.g. @pantheon/server) can build
 // Drizzle queries against `schema` without depending on drizzle-orm themselves —
 // a second drizzle-orm instance would not type-unify with the one `schema` uses.
@@ -28,6 +56,8 @@ export { SessionSummarizer } from "./session/summarizer.js";
 export { Tracer } from "./tracing/tracer.js";
 export { TraceCollector } from "./tracing/collector.js";
 export { TraceStore } from "./tracing/store.js";
+export { OrchestrationStore } from "./orchestrator/store.js";
+export type { AgentNodeRow, TaskPlanRow, SubTaskRow } from "./orchestrator/store.js";
 export { Orchestrator } from "./orchestrator/orchestrator.js";
 export type { OrchestratorConfig, OrchestratorResult } from "./orchestrator/orchestrator.js";
 export { PlannerAgent } from "./orchestrator/planner.js";
@@ -46,6 +76,7 @@ export { MCPClient, StdioTransport, SSETransport, mcpToolToDefinition, createMCP
 export type { MCPTransportConfig, StdioTransportConfig, SSETransportConfig, MCPToolDefinition, MCPToolCallResult, ServerCapabilities } from "./mcp/index.js";
 
 // ── v0.8: Consensus & A/B ────────────────────────────────────────────────────
-export { ConsensusEngine } from "./consensus/index.js";
+export { ConsensusEngine, ConsensusStore } from "./consensus/index.js";
+export type { ConsensusRunSummary, ConsensusRunDetail } from "./consensus/index.js";
 export { ABRouter, QualityJudge, ABStore } from "./ab/index.js";
 export type { ABResolution } from "./ab/index.js";
