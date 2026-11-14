@@ -111,6 +111,15 @@ describe("credential redaction", () => {
         expect(redactUrl("postgres://alice:p%40ss:word@h/db")).toBe("postgres://alice:***@h/db");
     });
 
+    it("redacts passwords that themselves contain @ or :", () => {
+        expect(redactUrl("postgres://alice:p@ss:w0rd@db.internal/pantheon")).toBe("postgres://alice:***@db.internal/pantheon");
+    });
+
+    it("does not mistake a port plus an @ later in the URL for credentials", () => {
+        const url = "postgres://db.internal:5432/pantheon?application_name=a@b";
+        expect(redactUrl(url)).toBe(url);
+    });
+
     it("leaves URLs without a password untouched", () => {
         expect(redactUrl("postgres://db.internal/pantheon")).toBe("postgres://db.internal/pantheon");
         expect(redactUrl("postgres://alice@db.internal/pantheon")).toBe("postgres://alice@db.internal/pantheon");

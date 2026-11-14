@@ -2,7 +2,7 @@
 
 > A self-hosted, multi-model AI orchestration system with intelligent routing, persistent memory, multi-agent task decomposition, and an extensible plugin ecosystem.
 
-**Current version: v0.8.0** · [Changelog](./CHANGELOG.md)
+**Current version: v0.9.0** · [Changelog](./CHANGELOG.md)
 
 ---
 
@@ -72,7 +72,7 @@ The agent uses a ReAct (observe → think → act) loop. Built-in tools:
 
 **`edit_file`** is the preferred tool for all file modifications. The agent provides `{ path, targetContent, replacementContent }` to replace an exact substring rather than rewriting the whole file — preventing hallucinated deletions on large files.
 
-**`grep`** is purpose-built for codebase search. It calls `rg` directly (bypasses the shell allowlist) and is auto-approved on first use — so searching across thousands of files never blocks on a permission prompt.
+**`grep`** is purpose-built for codebase search. It calls `rg` directly (bypasses the shell allowlist) and is auto-approved on first use — so searching across thousands of files never blocks on a permission prompt. Because it is auto-approved it is strictly confined to the project root: absolute paths, `../` traversal and symlinks that lead outside are refused. Results are reported as `path:line:text` relative to the project root.
 
 **Sandbox model (v0.7+):** the `shell` tool validates every command against a strict allowlist before execution. The default allowlist covers ~30 safe command families:
 
@@ -151,11 +151,44 @@ Bundled example plugins: **GitHub** (`@modelcontextprotocol/server-github`), **W
 
 ### Session Persistence & Memory
 
-Every `pantheon chat` creates a UUID-keyed session in SQLite. Sessions are:
+Every `pantheon chat` creates a UUID-keyed session in the database (SQLite by default, PostgreSQL optionally — see [Storage Backends](#storage-backends)). Sessions are:
 
 - **Resumable** — `pantheon chat --resume` picks up the last session; `--resume <id>` resumes a specific one.
 - **Summarized** — after 4+ exchanges, a 2–3 sentence LLM summary is generated and stored.
 - **Remembered** — episodic memory injects two layers of context into every new session: raw messages from the most recent past session (last 10), and LLM summaries from up to 4 older sessions.
+
+---
+
+### Storage Backends
+
+Pantheon is local-first: out of the box everything lives in a single SQLite file at `~/.pantheon/pantheon.db`, with nothing to install or run. Since v0.9 the same code runs unchanged on **PostgreSQL**, for when you want the server in a container, on another machine, or shared by several processes.
+
+| Backend | Select it with | Good for |
+|:--------|:---------------|:---------|
+| SQLite (default) | nothing — or `PANTHEON_DB_PATH=/path/to/file.db` | Single machine, zero setup |
+| PostgreSQL (tested on 16) | `DATABASE_URL=postgres://user:pass@host:5432/db` | Docker / remote deployments, multiple server processes |
+
+**Moving to PostgreSQL**
+
+```bash
+# 1. Start a database (or point at one you already run)
+docker compose --profile postgres up -d postgres
+
+# 2. Copy your existing sessions, traces, usage and orchestration history
+pantheon server stop
+pantheon db migrate --to postgres://pantheon:pantheon@localhost:5432/pantheon
+
+# 3. Switch over — add to .env, then start the server again
+#    DATABASE_URL=postgres://pantheon:pantheon@localhost:5432/pantheon
+pantheon server start
+pantheon db status          # → Backend: postgres
+```
+
+`pantheon db migrate` never modifies the source, preserves every id, and skips rows that already exist in the destination — so an interrupted copy is simply re-run. It works in any direction (`--from` / `--to` accept a `postgres://` URL or a SQLite file path), which also makes it a backup tool: `pantheon db migrate --to ./backup.db`.
+
+**Schema migrations** are versioned and applied automatically at startup on both backends (recorded in `schema_migrations`; concurrent server starts are serialised on PostgreSQL with an advisory lock). Databases created by v0.4–v0.8 are upgraded in place. A database written by a *newer* Pantheon is refused rather than risk corrupting it.
+
+Configuration precedence: `DATABASE_URL` → `database.url` in `config.yml` → `PANTHEON_DB_PATH` → `database.sqlitePath` in `config.yml` → `~/.pantheon/pantheon.db`. Prefer the environment variable for PostgreSQL so the password stays out of config files; Pantheon redacts passwords wherever it prints a connection URL.
 
 ---
 
@@ -171,7 +204,7 @@ Every LLM call, tool invocation, and routing decision is wrapped in an OpenTelem
 pantheon doctor
 ```
 
-Runs 7 checks: Node.js version, pnpm version, Docker daemon, LiteLLM gateway reachability (with latency), GROQ_API_KEY (live ping), DEEPSEEK_API_KEY (live ping, optional), fallback providers. Shows ✓ / ⚠ / ✗ with actionable hints. Exits non-zero on critical failures.
+Runs 8 checks: Node.js version, pnpm version, Docker daemon, database (connects, applies migrations, reports backend and schema version), LiteLLM gateway reachability (with latency), GROQ_API_KEY (live ping), DEEPSEEK_API_KEY (live ping, optional), fallback providers. Shows ✓ / ⚠ / ✗ with actionable hints. Exits non-zero on critical failures.
 
 ---
 
@@ -221,6 +254,12 @@ pantheon consensus show <id>      # show per-model responses and synthesized res
 # A/B experiments (v0.8)
 pantheon ab list                  # list configured A/B experiments
 pantheon ab comparison <id>       # show control vs. variant analytics (latency + quality score)
+
+# Database (v0.9)
+pantheon db status                # backend, location, schema version, row counts
+pantheon db status --url <loc>    # inspect another database (postgres://… or a SQLite path)
+pantheon db migrate --to <loc>    # copy all data to another database (SQLite ⇄ PostgreSQL)
+pantheon db migrate --from <loc> --to <loc> --yes   # explicit source; merge into a non-empty target
 
 # Cost
 pantheon cost                     # show total usage summary
@@ -285,7 +324,7 @@ When the agent calls tools, you'll see inline prompts:
 ```bash
 # 1. Clone the repo
 git clone https://github.com/affniz/Pantheon.git
-cd pantheon
+cd Pantheon
 
 # 2. Install dependencies
 pnpm install
@@ -311,7 +350,7 @@ docker compose up -d
 pantheon chat
 ```
 
-The Pantheon API server starts automatically in the background on the first `pantheon chat`. You can also start it manually with `pantheon server start`.
+The Pantheon API server starts automatically in the background on the first `pantheon chat`. You can also start it manually with `pantheon server start`. Its output goes to `~/.pantheon/server.log`; if it fails to start, the CLI prints the last lines of that log.
 
 ---
 
@@ -371,7 +410,9 @@ packages/
 │             #   AgentRole, SubTask (+ taskRole), TaskPlan, AgentNode, OrchestrationEvent
 ├── core/     # ModelRegistry, Gateway, Classifier (context-aware), CostTracker, Sandbox,
 │             #   PermissionManager (+ fork()), ToolRegistry, AgentRuntime (+ maxContextChars, repoMap),
-│             #   SessionManager, SessionSummarizer, Drizzle DB layer,
+│             #   SessionManager, SessionSummarizer,
+│             #   DB layer (Drizzle; SQLite + PostgreSQL, versioned migrations, copyDatabase),
+│             #   OrchestrationStore, ConsensusStore, ABStore,
 │             #   Tracer, TraceCollector, TraceStore,
 │             #   Orchestrator, PlannerAgent, CoderAgent, DebuggerAgent,
 │             #   ExecutorAgent, ReviewerAgent (+ verification),
@@ -381,11 +422,11 @@ packages/
 │             #   repo-map (buildRepoMap via ts-morph)
 ├── server/   # @pantheon/server — Hono API server (:3000)
 │             #   routes: /api/chat, /api/sessions, /api/models,
-│             #           /api/cost, /api/traces, /api/agents, /api/health,
-│             #           /api/plugins
+│             #           /api/cost, /api/traces, /api/agents, /api/health (+ /db),
+│             #           /api/plugins, /api/consensus, /api/ab
 │             #   middleware: rate-limiter, sentry, request-logger
 ├── cli/      # pantheon binary (Commander + Ink) — thin API client
-│             #   commands: chat, doctor, sessions, models, cost, trace, server, agents, plugins
+│             #   commands: chat, doctor, sessions, models, cost, trace, server, agents, plugins, db
 │             #   ui: theme, logo, input-box, message, status-bar,
 │             #       tool-call, tool-permission, trace-waterfall, plugin-badge
 └── (root)    # plugins/ — example plugins: github, web-search, jira
@@ -393,7 +434,7 @@ packages/
 
 ### Database
 
-Pantheon uses **SQLite** (via Drizzle ORM) for local-first persistence. The database lives at `~/.pantheon/pantheon.db` and is created automatically on first run.
+Pantheon persists through Drizzle ORM to **SQLite** (default, `~/.pantheon/pantheon.db`, created automatically) or **PostgreSQL** — see [Storage Backends](#storage-backends). The schema is identical on both:
 
 | Table | Purpose |
 |:------|:--------|
@@ -409,7 +450,9 @@ Pantheon uses **SQLite** (via Drizzle ORM) for local-first persistence. The data
 | `consensus_runs` | Per-request consensus fan-out results with synthesized content, per-model responses, and async quality score |
 | `ab_runs` | Per-request A/B experiment records — arm, model, latency, token counts, and async quality score |
 
-> **v0.9** will introduce a PostgreSQL migration path — Drizzle makes this a driver swap, not a rewrite.
+| `schema_migrations` | Applied schema versions — drives automatic, idempotent upgrades at startup |
+
+All database access goes through store classes in `@pantheon/core` (`SessionManager`, `CostTracker`, `TraceStore`, `OrchestrationStore`, `ConsensusStore`, `ABStore`). They are fully async and dialect-agnostic; the two Drizzle schemas (`schema.sqlite.ts`, `schema.pg.ts`) are kept identical by a parity test.
 
 ### Models
 
@@ -444,6 +487,16 @@ pnpm vitest run       # run tests (from monorepo root)
 pnpm turbo clean      # remove build artifacts
 ```
 
+Tests run against the TypeScript sources (no build needed) and never call a real LLM. Every storage test runs twice — on in-memory SQLite and on [PGlite](https://pglite.dev) (real PostgreSQL compiled to WASM, in-process) — so no database server is required. To additionally exercise the production `pg` driver against a real server (CI does this):
+
+```bash
+PANTHEON_TEST_POSTGRES_URL=postgres://user:pass@localhost:5432/postgres pnpm vitest run
+```
+
+Each test gets its own throw-away database on that server, dropped afterwards; the role needs `CREATEDB`.
+
+`@typescript-eslint/no-floating-promises` is enforced: every database call is async, and a forgotten `await` would silently drop a write.
+
 ---
 
 ## Version History
@@ -452,6 +505,7 @@ Full details in [CHANGELOG.md](./CHANGELOG.md).
 
 | Version | Summary |
 |:--------|:--------|
+| **v0.9** | PostgreSQL backend alongside SQLite (`DATABASE_URL`); versioned schema migrations; `pantheon db status` / `db migrate` (SQLite ⇄ PostgreSQL copy); fully async dialect-agnostic store layer; `grep` sandbox escape fixed; server log + clear startup errors; API route test-suite; 497 tests, storage tests on both backends |
 | **v0.8** | Consensus engine (fan-out to N models, LLM synthesis); A/B experiment router with deterministic session assignment, quality judge, and analytics; provider failover chain; routing confidence threshold with auto-escalation; `--consensus` flag; `pantheon consensus` + `pantheon ab` commands |
 | **v0.7** | Plugin system (inline + MCP); sandbox overhauled to allowlist + arg path validation; `pantheon doctor`; `--budget` flag; Groq-only graceful degradation; `edit_file` + `grep` tools; repo map (AST codebase index); shell API key filtering; ReviewerAgent tsc+test verification; PermissionManager fork; context window pruning; 147 deterministic tests |
 | **v0.6** | Multi-agent orchestration — Planner/Coder/Debugger/Reviewer pipeline; DeepSeek V4; context-aware routing; `general` tier; `pantheon agents` commands |

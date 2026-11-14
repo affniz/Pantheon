@@ -4,6 +4,61 @@ All notable changes to Pantheon are documented here.
 
 ---
 
+## [0.9.0] — 2026-11-14
+
+Pantheon gains a **PostgreSQL backend**. SQLite remains the zero-setup default; setting `DATABASE_URL` switches the same code to PostgreSQL, and `pantheon db migrate` moves existing data across. The promise made in v0.4 — "Postgres is a driver swap" — turned out not to hold: every database call was synchronous (`.run()` / `.all()` / `.get()`, a `better-sqlite3`-only API) and was scattered across agents and route handlers. This release rebuilds the storage layer so the claim is now true, and fixes a sandbox escape and several reliability problems found along the way.
+
+### Added
+- **PostgreSQL support** — set `DATABASE_URL=postgres://…` (or `database.url` in `config.yml`). Uses `pg` with a connection pool (`PANTHEON_DB_POOL_SIZE`, default 10). The schema is created automatically on first start.
+- **Versioned schema migrations** (`packages/core/src/db/migrations.ts`) — one migration list rendered for both dialects, recorded in a new `schema_migrations` table, applied idempotently at startup. Replaces the swallow-the-error `ALTER TABLE` calls. Databases created by v0.4–v0.8 upgrade in place; a database written by a *newer* build is refused. Concurrent server starts on PostgreSQL are serialised with an advisory lock.
+- **`pantheon db status`** — backend, location (password redacted), schema version and per-table row counts. `--url` inspects any other database.
+- **`pantheon db migrate --to <location> [--from <location>] [--yes]`** — copies every table between any two databases (SQLite → PostgreSQL, PostgreSQL → SQLite, SQLite → SQLite for backups). Preserves primary keys, advances PostgreSQL sequences afterwards, never modifies the source, and skips rows already present so an interrupted run can simply be repeated.
+- **`GET /api/health/db`** — the same status over HTTP.
+- **`pantheon doctor` database check** — connects, migrates and reports backend + schema version (8 checks, up from 7).
+- **`PANTHEON_DB_PATH`** / `database.sqlitePath` — relocate the SQLite file.
+- **Store layer** — `OrchestrationStore` (agent tree, plans, sub-tasks) and `ConsensusStore` join `SessionManager`, `CostTracker`, `TraceStore` and `ABStore`; all extend a common `DbStore`. No code outside these classes issues queries any more: the Coder/Debugger/Executor/Planner/Reviewer agents and the `/api/agents` and `/api/consensus` routes previously each carried their own copies.
+- **Docker** — optional `postgres` service (`docker compose --profile postgres up -d`); `DATABASE_URL` passed through to the server.
+- **Server log** — the background server's output now goes to `~/.pantheon/server.log` (truncated past 5 MB).
+- **`TraceCollector.flush()`** — resolves once every queued span is written (the collector drains until empty); used at shutdown and in tests. Duplicate span ids no longer fail a whole batch.
+- **`offset` on `GET /api/sessions`** for paging.
+- **API test-suite** — `packages/server` had no tests. 28 route tests now drive the real Hono app (sessions, cost, traces, agents, consensus, A/B, models, health, rate limiting, and the chat SSE flow with a fake gateway).
+- **Dual-backend tests** — every storage test runs on in-memory SQLite *and* on PGlite (real PostgreSQL compiled to WASM, in-process), so the PostgreSQL dialect is covered with no server. Setting `PANTHEON_TEST_POSTGRES_URL` adds a third pass through the production `pg` driver against a real server; CI does this with a `postgres:16` service container.
+
+### Changed
+- **Every store method is now `async`** (`SessionManager`, `SessionSummarizer`, `CostTracker`, `TraceStore`, `ABStore`, `ConsensusEngine.updateQualityScore`). This is a breaking change for anything importing `@pantheon/core` directly; the HTTP API and CLI are unaffected.
+- **`getDb()` / `initDb()`** — `initDb()` (async) connects and migrates and is awaited by the server before it listens; `getDb()` stays synchronous for SQLite and throws a clear error if PostgreSQL has not been initialised. `closeDb()` is now async. Stores resolve the handle lazily, so constructing one at module load no longer opens the database.
+- **`schema` export replaced** by `tablesFor(db)` plus `sqliteSchema` / `pgSchema`. `db/schema.ts` → `db/schema.sqlite.ts`, with a column-for-column `db/schema.pg.ts` (BIGINT for epoch-ms columns, BOOLEAN, DOUBLE PRECISION, SERIAL). A parity test fails if the two drift.
+- **`@typescript-eslint/no-floating-promises` is an error** (type-aware linting enabled). With an async database a forgotten `await` silently drops a write; this makes it a build failure.
+- **Tests run against TypeScript sources** via Vitest aliases for `@pantheon/core` / `@pantheon/shared`, so `pnpm vitest run` no longer depends on a prior build or a stale `dist/`.
+- `OrchestratorResult.agentTree` contains the agents of *that run*; it used to return every agent ever recorded for the session.
+- `GET /api/ab/experiments/:id/runs` and trace listing push `LIMIT`/aggregation into SQL (trace list was one count query per trace).
+- All workspace packages and `PANTHEON_VERSION` bumped to `0.9.0`.
+
+### Fixed
+- **Sandbox escape in the `grep` tool.** When the requested path failed the project-root check, the tool caught the error and searched the unchecked path anyway. Because `grep` is auto-approved, a model could read any file on the machine with no permission prompt (`grep . /etc/passwd`, `path: "../../.ssh"`, or via a symlink). Out-of-root paths are now refused.
+- **`grep` omitted the file name when searching a single file** (ripgrep's default), contradicting the tool description and failing its own test — the one red test in the v0.8 suite. Results are now always `path:line:text`, relative to the project root.
+- **Server start-up failures were invisible.** The background server was spawned with its output discarded, so any failure surfaced only as "failed to start within 8s". The CLI now detects an early exit immediately and prints the tail of the log.
+- **Database connections were never closed on shutdown** despite the comment saying so; the server now flushes pending trace spans and closes the database on SIGINT/SIGTERM.
+- **A failed usage-record write failed the whole LLM call** after the model had already answered. Usage recording is now best-effort.
+- **Orchestration error handlers could mask the real error** — a database failure while marking an agent as failed replaced the original exception. `failAgent` / `failSubTask` never throw.
+- **`POST /api/chat` with an unknown `sessionId`** surfaced as a raw foreign-key error; it now reports `Session "…" not found` and writes nothing.
+- **Episodic memory** could inject the *current* session's own summary as a "past session", and loaded the previous session's entire history just to keep its last ten messages.
+- **Concurrent background summarisation** of one session could fail on the `UNIQUE(session_id)` constraint.
+- **Query parameters were not validated** — `?limit=abc` reached the database as `NaN` and `?limit=1e9` was unbounded on `/api/sessions`, `/api/cost/recent` and `/api/traces`.
+- **Corrupt JSON in `tool_calls`, span `attributes`, sub-task `dependencies` or consensus `model_responses`** made the whole session/trace/plan unreadable; each now degrades to an empty value.
+- **Docker: the SQLite database lived in the container's writable layer** and was lost on every rebuild. It now sits on a named volume (`/data`).
+- **Docker: `ripgrep` was missing from the server image**, so the `grep` tool could never work in a container.
+- **SQLite `busy_timeout`** set to 5s so the CLI and server no longer race to `SQLITE_BUSY` on the same file.
+- README: `cd pantheon` after cloning `Pantheon` fails on case-sensitive filesystems.
+
+### Removed
+- `packages/core/src/db/__tests__/run-tests.ts` — a hand-rolled v0.4 test runner that Vitest never executed and that duplicated `session-manager.test.ts` / `tracker.test.ts`.
+
+### Tests
+- **497 tests** across **38 files** (up from 278/30), **587** when a real PostgreSQL server is supplied. New coverage: migrations (fresh, idempotent, legacy upgrade, future-version refusal, DDL-vs-schema column check), database target resolution and credential redaction, `copyDatabase` in three directions (round-trip equality, idempotency, resume, sequence handling, paging), `OrchestrationStore`, `ConsensusStore`, `TraceStore` + `TraceCollector` + `Tracer` end-to-end, `SessionSummarizer` and episodic memory, the `grep` jail, and the HTTP API.
+
+---
+
 ## [0.8.0] — 2026-09-03
 
 Pantheon gains **multi-model consensus**, **A/B experiment routing**, and a **provider failover chain**. The routing classifier now emits a confidence score and auto-escalates ambiguous prompts. A full audit of v0.7 gap-fix tools uncovered two silent bugs in the `grep` tool (parameters accepted but never forwarded to `rg`), a missing `taskRole` column in the DB schema, orphaned gateway variable causing type unsafety in the chat route, and quality scores that were computed but never written back to the DB — all fixed in this version.

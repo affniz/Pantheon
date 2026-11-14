@@ -128,7 +128,9 @@ export function resolveDatabaseTarget(): DatabaseTarget {
 
 /** Hide the password in a connection URL so it is safe to print. */
 export function redactUrl(url: string): string {
-    return url.replace(/(\/\/[^:/@]+):[^@]*@/, "$1:***@");
+    // user:password@ — the password runs to the last "@" before the host, and cannot
+    // contain an unencoded "/" (so a "@" later in the path or query is left alone).
+    return url.replace(/(\/\/[^:/@]+):[^/]*@/, "$1:***@");
 }
 
 /** Human-readable, credential-free description of a target. */
@@ -183,6 +185,9 @@ function openSqlite(target: Extract<DatabaseTarget, { dialect: "sqlite" }>): Pan
     if (target.path !== ":memory:") fs.mkdirSync(path.dirname(target.path), { recursive: true });
     const sqlite = new Database(target.path);
     if (target.path !== ":memory:") sqlite.pragma("journal_mode = WAL");
+    // The server and CLI (`pantheon db …`, `doctor`) may have the file open at once;
+    // wait for a competing writer instead of failing immediately with SQLITE_BUSY.
+    sqlite.pragma("busy_timeout = 5000");
     return wrapSqlite(sqlite, target);
 }
 
@@ -298,6 +303,9 @@ export function initDb(): Promise<PantheonDatabase> {
     _initPromise = (async () => {
         if (_db && _ready) return _db;
         const target = resolveDatabaseTarget();
+        // SQLite initialises synchronously; going through getDb() means a concurrent
+        // getDb() call can never open a second handle to the same file.
+        if (target.dialect === "sqlite") return getDb();
         const db = await openDatabase(target);
         _db = db;
         _ready = true;
