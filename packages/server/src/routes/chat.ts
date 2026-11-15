@@ -22,10 +22,11 @@ import {
     QualityJudge,
     eventBus,
 } from "@pantheon/core";
-import type { ABResolution, PermissionDecision } from "@pantheon/core";
+import type { ABResolution, PermissionDecision, SemanticMemory } from "@pantheon/core";
 import { scopeUserId } from "../middleware/auth.js";
 import { getAuthConfig } from "../auth/config.js";
 import { resolveWorkingDir } from "../workspace.js";
+import { semanticMemory, logMemoryError } from "../semantic.js";
 import type { ChatMessage, OrchestrationEvent, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
@@ -119,6 +120,7 @@ chatRouter.post("/", async (c) => {
     return streamSSE(c, async (stream) => {
         // Set once the session is known; until then there is nothing to attribute events to.
         let liveSessionId: string | undefined;
+        let semantic: SemanticMemory | undefined;
         const liveUserId = c.get("user")?.id;
 
         const sendEvent = async (event: string, data: unknown) => {
@@ -177,9 +179,29 @@ chatRouter.post("/", async (c) => {
                 });
             }
 
+            // Semantic memory: passages from past conversations that resemble this
+            // prompt, however old. Complements the summaries above; best-effort.
+            semantic = semanticMemory(gatewayWithFallback);
+            if (semantic) {
+                try {
+                    const relevant = await semantic.buildContext(prompt.trim(), {
+                        excludeSessionId: effectiveSessionId,
+                        userId: scopeUserId(c),
+                    });
+                    if (relevant) episodicMemory = [episodicMemory, relevant].filter(Boolean).join("\n\n");
+                } catch (e) {
+                    logMemoryError("retrieval", e);
+                }
+            }
+
             if (noTools) {
                 // Pure chat mode — stream directly
-                const { generator, decision } = await gatewayWithFallback.stream(messages, model);
+                // Memory context (episodic + semantic) goes in as a system message; this
+                // path used to ignore it entirely.
+                const withMemory: ChatMessage[] = episodicMemory
+                    ? [{ role: "system", content: episodicMemory }, ...messages]
+                    : messages;
+                const { generator, decision } = await gatewayWithFallback.stream(withMemory, model);
                 await sendEvent("routing", decision);
 
                 let accumulated = "";
@@ -468,6 +490,11 @@ chatRouter.post("/", async (c) => {
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             await sendEvent("error", { message });
+        } finally {
+            // Index this turn's messages for future retrieval, off the request path.
+            if (semantic && liveSessionId) {
+                semantic.indexSession(liveSessionId).catch((e) => logMemoryError("indexing", e));
+            }
         }
     });
 });

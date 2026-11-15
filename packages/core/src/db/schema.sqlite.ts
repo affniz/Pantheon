@@ -173,3 +173,18 @@ export const abRuns = sqliteTable("ab_runs", {
     createdAt: text("created_at").notNull(),
 });
 
+
+// ─── Semantic memory (v0.9) ───────────────────────────────────────────────────
+
+export const memoryChunks = sqliteTable("memory_chunks", {
+    id: text("id").primaryKey(),                             // `${messageId}:${chunkIndex}`
+    sessionId: text("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+    messageId: integer("message_id").notNull(),              // messages.id the chunk was cut from
+    chunkIndex: integer("chunk_index").notNull(),
+    role: text("role").notNull(),                            // "user" | "assistant"
+    content: text("content").notNull(),
+    embedding: text("embedding").notNull(),                  // JSON array of floats (portable across backends)
+    embeddingModel: text("embedding_model").notNull(),
+    dimensions: integer("dimensions").notNull(),
+    createdAt: integer("created_at").notNull(),   // epoch ms
+});

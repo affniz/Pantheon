@@ -372,6 +372,7 @@ export const TABLE_NAMES = [
     "api_tokens",
     "sessions",
     "messages",
+    "memory_chunks",
     "usage_records",
     "session_summaries",
     "spans",
@@ -429,8 +430,11 @@ export function createTestDb(sqlite: Database.Database = new Database(":memory:"
  */
 export async function createTestPgDb(): Promise<PantheonDatabase> {
     const { PGlite } = await import("@electric-sql/pglite");
+    const { vector } = await import("@electric-sql/pglite-pgvector");
     const { drizzle: drizzlePglite } = await import("drizzle-orm/pglite");
-    const client = new PGlite();
+    // pgvector is made *available* (as on a server with the package installed); it is
+    // only created in a database when something runs CREATE EXTENSION.
+    const client = new PGlite({ extensions: { vector } });
     const target: DatabaseTarget = { dialect: "postgres", url: "postgres://pglite/in-memory" };
     const db = drizzlePglite(client, { schema: pgSchema }) as unknown as PantheonDatabase;
     const raw: RawExecutor = {

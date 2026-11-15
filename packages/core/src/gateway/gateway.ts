@@ -62,6 +62,39 @@ export class Gateway {
         return model?.modelName ?? modelId;
     }
 
+    /**
+     * Embed texts with `modelId` through the gateway's OpenAI-compatible
+     * `/embeddings` endpoint. Returns one vector per input, in input order.
+     */
+    async embed(texts: string[], modelId: string): Promise<number[][]> {
+        if (texts.length === 0) return [];
+        return Tracer.startSpan("llm.embedding", "llm", async (span) => {
+            span.attributes.modelId = modelId;
+            span.attributes.inputCount = texts.length;
+            const response = await this.clientFor(modelId).embeddings.create({
+                model: this.upstreamModelName(modelId),
+                input: texts,
+            });
+            // The API may return items out of order; `index` is authoritative.
+            const vectors: number[][] = new Array(texts.length);
+            for (const item of response.data) {
+                vectors[item.index] = item.embedding;
+            }
+            if (vectors.some((v) => !Array.isArray(v))) {
+                throw new Error(`Embedding model "${modelId}" returned ${response.data.length} vectors for ${texts.length} inputs.`);
+            }
+            const inputTokens = response.usage?.prompt_tokens ?? 0;
+            span.attributes.inputTokens = inputTokens;
+            await this.recordUsage(modelId, inputTokens, 0, [{ role: "user", content: `[embedding × ${texts.length}]` }]);
+            return vectors;
+        });
+    }
+
+    /** An `Embedder` bound to one embedding model (for SemanticMemory). */
+    embedder(modelId: string): { modelId: string; embed(texts: string[]): Promise<number[][]> } {
+        return { modelId, embed: (texts) => this.embed(texts, modelId) };
+    }
+
     /** Routing configuration (tiers, thresholds) from the underlying registry. */
     getRoutingConfig(): RoutingConfig {
         return this.registry.getRoutingConfig();

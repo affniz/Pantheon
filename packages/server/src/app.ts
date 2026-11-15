@@ -14,6 +14,7 @@ import { pluginsRouter } from "./routes/plugins.js";
 import { consensusRouter } from "./routes/consensus.js";
 import { abRouter } from "./routes/ab.js";
 import { authRouter } from "./routes/auth.js";
+import { memoryRouter } from "./routes/memory.js";
 import { registerWebSocket } from "./routes/ws.js";
 import { authMiddleware } from "./middleware/auth.js";
 
@@ -42,6 +43,7 @@ app.route("/api/plugins", pluginsRouter);
 app.route("/api/consensus", consensusRouter);
 app.route("/api/ab", abRouter);
 app.route("/api/auth", authRouter);
+app.route("/api/memory", memoryRouter);
 
 /** Attach the WebSocket feed (/api/ws) to the HTTP server once it is listening. */
 export const injectWebSocket = registerWebSocket(app);

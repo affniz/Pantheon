@@ -10,6 +10,7 @@ import { ABStore } from "../../ab/ab-store.js";
 import { ConsensusStore } from "../../consensus/consensus-store.js";
 import { OrchestrationStore } from "../../orchestrator/store.js";
 import { AuthStore } from "../../auth/auth-store.js";
+import { MemoryStore } from "../../memory/memory-store.js";
 
 /** Put at least one row — with awkward values — into every table. */
 async function seed(db: PantheonDatabase): Promise<{ sessionId: string; archivedId: string }> {
@@ -29,6 +30,11 @@ async function seed(db: PantheonDatabase): Promise<{ sessionId: string; archived
         toolCalls: [{ id: "tc1", name: "read_file", arguments: { path: "a.ts" } }],
     });
     await sessions.addMessage(sessionId, { role: "tool", content: "file body", toolCallId: "tc1" });
+
+    await new MemoryStore(db).insert([
+        { sessionId, messageId: 1, chunkIndex: 0, role: "user", content: "remembered question", embedding: [0.1, -0.25, 0.975], embeddingModel: "embed-x" },
+        { sessionId, messageId: 1, chunkIndex: 1, role: "user", content: "second chunk", embedding: [1, 0, 0], embeddingModel: "embed-x" },
+    ]);
 
     const cost = new CostTracker(db);
     await cost.record({ timestamp: "2026-10-01T00:00:00.000Z", modelId: "m1", inputTokens: 1_500_000, outputTokens: 7, costUsd: 0.123456789, promptPreview: "p" });
@@ -87,6 +93,8 @@ async function snapshot(db: PantheonDatabase, sessionId: string) {
     const orch = new OrchestrationStore(db);
     const t = tablesFor(db);
     return {
+        memory: (await db.select().from(t.memoryChunks)).sort((a, b) => a.id.localeCompare(b.id)),
+        memoryHits: (await new MemoryStore(db).search([1, 0, 0], { embeddingModel: "embed-x", topK: 2 })).map((h) => [h.id, h.content, Number(h.score.toFixed(4))]),
         users: await new AuthStore(db).listUsers(),
         tokens: (await db.select().from(t.apiTokens)),
         sessions: await sessions.list({ includeArchived: true }),
@@ -110,6 +118,7 @@ const EXPECTED_COUNTS = {
     api_tokens: 1,
     sessions: 2,
     messages: 3,
+    memory_chunks: 2,
     usage_records: 2,
     session_summaries: 1,
     spans: 2,

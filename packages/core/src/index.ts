@@ -57,6 +57,8 @@ export { AuthStore, NotAuthorizedError, hashToken, safeEqual, normalizeEmail, TO
 export type { User, UserRole, AuthProvider, ApiTokenInfo } from "./auth/auth-store.js";
 export { EventBus, eventBus } from "./events/event-bus.js";
 export type { PantheonEvent, EventListener } from "./events/event-bus.js";
+export { SemanticMemory, MemoryStore, cosineSimilarity, chunkText } from "./memory/index.js";
+export type { Embedder, MemoryHit, MemoryStatus, SemanticMemoryOptions } from "./memory/index.js";
 export { SessionManager } from "./session/session-manager.js";
 export { SessionSummarizer } from "./session/summarizer.js";
 export { Tracer } from "./tracing/tracer.js";

@@ -11,6 +11,7 @@ const COPY_PLAN: Array<{ key: keyof Tables; sqlName: string; pk: string; serial:
     { key: "apiTokens", sqlName: "api_tokens", pk: "id", serial: false },
     { key: "sessions", sqlName: "sessions", pk: "id", serial: false },
     { key: "messages", sqlName: "messages", pk: "id", serial: true },
+    { key: "memoryChunks", sqlName: "memory_chunks", pk: "id", serial: false },
     { key: "usageRecords", sqlName: "usage_records", pk: "id", serial: true },
     { key: "sessionSummaries", sqlName: "session_summaries", pk: "id", serial: true },
     { key: "spans", sqlName: "spans", pk: "id", serial: false },

@@ -27,6 +27,17 @@ model_list:
       model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
 
+  # ── Embeddings (optional — semantic memory) ────────────────────────────────
+  # Groq and DeepSeek have no embedding models. With OPENAI_API_KEY set, enable
+  # semantic memory in ~/.pantheon/config.yml:
+  #   memory: { semantic: { enabled: true, embeddingModel: pantheon-embed } }
+  # Any LiteLLM-supported embedding model works; keep the name "pantheon-embed"
+  # or change embeddingModel to match.
+  - model_name: pantheon-embed
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+
 router_settings:
   # If deepseek-v4-pro fails (429 / 5xx), try claude then gpt before erroring
   fallbacks:

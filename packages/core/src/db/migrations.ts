@@ -283,6 +283,34 @@ export const MIGRATIONS: Migration[] = [
             yield { exec: "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);" };
         },
     },
+    {
+        version: 4,
+        name: "semantic memory: memory_chunks",
+        *up(dialect) {
+            // The embedding is stored as JSON text so the table is identical on both
+            // backends (and survives `pantheon db migrate`). On PostgreSQL with the
+            // pgvector extension, MemoryStore adds and maintains a native `vector`
+            // column next to it at runtime — see memory/memory-store.ts.
+            yield {
+                exec: `
+    CREATE TABLE IF NOT EXISTS memory_chunks (
+        id               TEXT PRIMARY KEY,
+        session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        message_id       INTEGER NOT NULL,
+        chunk_index      INTEGER NOT NULL,
+        role             TEXT NOT NULL,
+        content          TEXT NOT NULL,
+        embedding        TEXT NOT NULL,
+        embedding_model  TEXT NOT NULL,
+        dimensions       INTEGER NOT NULL,
+        created_at       ${types(dialect).epochMs} NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_chunks_session_id ON memory_chunks(session_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_chunks_model ON memory_chunks(embedding_model, created_at);
+    `,
+            };
+        },
+    },
 ];
 
 /** Highest schema version this build knows about. */

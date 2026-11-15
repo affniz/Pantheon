@@ -19,6 +19,7 @@ import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { dbStatus, dbMigrate } from "./commands/db.js";
+import { memoryStatus, memorySearch, memoryReindex, memoryClear } from "./commands/memory.js";
 import { authLogin, authLogout, authStatus, authTokenCreate, authTokenList, authTokenRevoke } from "./commands/auth.js";
 
 // Brand colors matching theme.ts
@@ -347,6 +348,32 @@ serverCmd
             console.log(dim("  Pantheon server is not running. Use `pantheon server start` or `pantheon chat`."));
         }
     });
+
+// ── Memory (v0.9) ─────────────────────────────────────────────────────────────
+
+const memoryCmd = program.command("memory").description("Semantic memory over past conversations");
+
+memoryCmd
+    .command("status", { isDefault: true })
+    .description("Show whether semantic memory is enabled and what is indexed")
+    .action(memoryStatus);
+
+memoryCmd
+    .command("search")
+    .description("Find passages from past conversations similar to a query")
+    .argument("<query...>", "What to look for")
+    .option("-n, --num <n>", "Number of results", "5")
+    .action((query: string[], opts) => memorySearch(query.join(" "), opts));
+
+memoryCmd
+    .command("reindex")
+    .description("Embed all messages that are not indexed yet")
+    .action(memoryReindex);
+
+memoryCmd
+    .command("clear")
+    .description("Delete the semantic index (conversations are kept)")
+    .action(memoryClear);
 
 // ── Auth (v0.9) ───────────────────────────────────────────────────────────────
 

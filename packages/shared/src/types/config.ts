@@ -106,6 +106,28 @@ export interface PantheonConfig {
     database?: DatabaseConfig;
     /** API authentication (v0.9). Omit for the local single-user default (no auth). */
     auth?: AuthConfig;
+    /** Long-term memory settings (v0.9). */
+    memory?: MemoryConfig;
+}
+
+export interface MemoryConfig {
+    /** Retrieval-augmented memory over past conversations. Off unless enabled. */
+    semantic?: SemanticMemoryConfig;
+}
+
+/**
+ * Semantic memory embeds past messages and retrieves the ones most similar to the
+ * current prompt. It needs an embedding model in litellm-config.yaml — Groq and
+ * DeepSeek do not offer one, so this is opt-in.
+ */
+export interface SemanticMemoryConfig {
+    enabled: boolean;
+    /** LiteLLM model name of the embedding model, e.g. "pantheon-embed". */
+    embeddingModel: string;
+    /** Memories injected per turn. Default 5. */
+    topK?: number;
+    /** Minimum cosine similarity (0–1) for a memory to be used. Default 0.35. */
+    minScore?: number;
 }
 
 /** OAuth application credentials for one sign-in provider. */
