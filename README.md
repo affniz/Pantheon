@@ -89,6 +89,8 @@ The agent uses a ReAct (observe → think → act) loop. Built-in tools:
 
 File-path arguments to `cat`, `head`, `tail`, `node`, `python3`, etc. are additionally validated to stay within the project root. `sed -i`, URL-as-arg, and `../` traversal patterns are blocked. **API keys and secrets are stripped from child process environments** — all env vars matching `/_API_KEY$/i`, `/_TOKEN$/i`, `/_SECRET$/i`, `/_PASSWORD$/i` are removed before `execFile`.
 
+A command line is split into its individual commands and **every one** must be on the allowlist — `ls -la | head`, `git status && git log` and `npm test 2>&1 | tail -50` work; `ls; curl … | sh` does not. Command substitution (`$(…)`, backticks), redirection to files, here-documents and background jobs are refused, and path arguments are checked after quote removal with `~` / `$VAR` expansion disallowed.
+
 Extend or restrict the allowlist per-project:
 
 ```yaml
@@ -102,6 +104,21 @@ sandbox:
 ```
 
 **Permission model:** safe tool calls (read-only, `grep`) are auto-allowed on first use. Destructive operations require explicit approval in the TUI.
+
+**Isolated execution (v0.9).** By default shell commands run as processes of the Pantheon server, with credentials stripped from their environment. That is appropriate for one person on their own machine. When other people can reach the server, run commands in throw-away containers instead:
+
+```yaml
+# ~/.pantheon/config.yml          (or: PANTHEON_EXEC=docker, PANTHEON_EXEC_IMAGE=…)
+sandbox:
+  execution:
+    mode: docker
+    image: node:22-slim      # must contain your project's toolchain
+    network: none            # "bridge" to allow outbound access (e.g. package installs)
+    memory: 2g
+    cpus: 2
+```
+
+Each `shell` command — and the reviewer's `tsc` / test run — then executes in its own container that sees only the project directory (mounted at the same path), has no network, none of the server's environment variables, no Linux capabilities, a read-only root filesystem, and memory/CPU/process limits; it is removed afterwards and killed on timeout. File tools (`read_file`, `write_file`, `edit_file`, `list_directory`, `grep`) do not execute project code and stay path-jailed on the host. If the Pantheon server itself runs in Docker, it needs access to a Docker daemon for this mode.
 
 ---
 
@@ -155,7 +172,103 @@ Every `pantheon chat` creates a UUID-keyed session in the database (SQLite by de
 
 - **Resumable** — `pantheon chat --resume` picks up the last session; `--resume <id>` resumes a specific one.
 - **Summarized** — after 4+ exchanges, a 2–3 sentence LLM summary is generated and stored.
-- **Remembered** — episodic memory injects two layers of context into every new session: raw messages from the most recent past session (last 10), and LLM summaries from up to 4 older sessions.
+- **Remembered** — episodic memory injects two layers of context into every new session: raw messages from the most recent past session (last 10), and LLM summaries from up to 4 older sessions. Optional [semantic memory](#semantic-memory) adds retrieval of the most relevant passages from *any* past session.
+
+---
+
+### Semantic Memory
+
+Summaries lose detail as a project ages. Semantic memory keeps the original messages: every user and assistant message is embedded after its turn, and at the start of each new turn the passages most similar to the prompt — from any past session — are injected under `## Relevant memory`. The session in progress is never fed back to itself, and with authentication on, a user only recalls their own sessions.
+
+It needs an embedding model, which Groq and DeepSeek do not offer, so it is off by default. With `OPENAI_API_KEY` set (the bundled `litellm-config.yaml` maps `pantheon-embed` to `text-embedding-3-small`; any LiteLLM embedding model works):
+
+```yaml
+# ~/.pantheon/config.yml          (or: PANTHEON_EMBEDDING_MODEL=pantheon-embed)
+memory:
+  semantic:
+    enabled: true
+    embeddingModel: pantheon-embed
+    topK: 5          # memories injected per turn
+    minScore: 0.35   # minimum cosine similarity
+```
+
+```bash
+pantheon memory reindex                       # embed conversations from before it was enabled
+pantheon memory search "how did we set up connection pooling"
+pantheon memory status                        # → Search: pgvector | in-process
+```
+
+On PostgreSQL with the [pgvector](https://github.com/pgvector/pgvector) extension installed, nearest-neighbour search runs inside the database (Pantheon creates the extension and a native `vector` column itself when it is allowed to). On SQLite, or PostgreSQL without pgvector, the same exact cosine search is computed by the server over the most recent 5,000 passages — fine for a personal history. Embeddings are stored portably, so `pantheon db migrate` carries the index across.
+
+---
+
+### Authentication
+
+Out of the box there is none, and none is needed: the server listens on `127.0.0.1` only and serves the one person logged in to the machine. **Before exposing it on a network, turn authentication on** — the API drives an agent that can run commands and read files.
+
+```bash
+# .env
+PANTHEON_AUTH=required
+HOST=0.0.0.0                      # listen beyond localhost (the server warns if you do this with auth off)
+PANTHEON_WORKSPACE=/srv/projects  # remote users can only work inside this directory
+PANTHEON_EXEC=docker              # recommended: run agent commands in containers (see Tool Use & Sandbox)
+```
+
+Every request must then carry a credential:
+
+| Credential | For | How to get it |
+|:-----------|:----|:--------------|
+| **API token** (`pth_…`) | CLI, scripts, CI | `pantheon auth login` (browser sign-in) or `pantheon auth token create` |
+| **Session cookie** (JWT, 7 days) | Browsers / the future dashboard | Sign in at `/api/auth/login/github` or `/google` |
+
+**Without an OAuth app** — on the server's machine, mint a token directly:
+
+```bash
+pantheon auth token create --name laptop     # prints the token once and saves it for this CLI
+export PANTHEON_API_TOKEN=pth_…              # or use it from another machine / CI
+```
+
+**With GitHub or Google sign-in** — register an OAuth app whose callback URL is `<public URL>/api/auth/callback/github` (or `/google`), then:
+
+```bash
+PANTHEON_PUBLIC_URL=https://pantheon.example.com
+PANTHEON_GITHUB_CLIENT_ID=…        PANTHEON_GITHUB_CLIENT_SECRET=…
+PANTHEON_GOOGLE_CLIENT_ID=…        PANTHEON_GOOGLE_CLIENT_SECRET=…
+PANTHEON_ALLOWED_EMAILS=teammate@example.com     # optional; see below
+PANTHEON_JWT_SECRET=<32+ random characters>      # required when running several server processes
+```
+
+```bash
+pantheon auth login --server https://pantheon.example.com   # opens the browser, saves a token to ~/.pantheon/credentials
+pantheon auth status
+pantheon auth token list
+pantheon auth logout                                        # revokes the token server-side
+```
+
+**Who gets in.** Sign-up is closed by default: the first person to sign in becomes the **owner**; anyone else is refused unless their (provider-verified) e-mail is in `PANTHEON_ALLOWED_EMAILS` / `auth.allowedEmails`. `*` opens it to anyone with an account at a configured provider.
+
+**What is isolated.** With auth required, each user sees and can continue only their own sessions, their semantic memory, and the live activity of their own sessions. Traces, cost totals, agent records and plugin management are still instance-wide in v0.9 — treat everyone you admit as trusted with those. Per-resource roles are planned for v1.0.
+
+Details: tokens are stored only as SHA-256 hashes and shown once; the CLI login uses a loopback redirect with a single-use code bound to a PKCE-style verifier, so the token never passes through the browser; OAuth state is signed and tied to the initiating browser; cookie-authenticated writes are checked against the server's origin.
+
+---
+
+### Live Activity Feed
+
+`GET /api/ws` is a WebSocket carrying the same events the chat stream emits — routing decisions, tool calls, agent spawn/complete/fail, plan and review results — for every session you are allowed to see, as they happen. It is what a dashboard would subscribe to; today you can watch it from a second terminal:
+
+```bash
+pantheon agents watch                 # all sessions
+pantheon agents watch -s <sessionId>  # one session
+pantheon agents watch --json          # raw events, one JSON object per line
+```
+
+```
+ws://localhost:3000/api/ws?sessionId=<id>&types=agent_spawned,agent_completed&access_token=pth_…
+→ { "type": "agent_spawned", "sessionId": "…", "timestamp": 1794721831529, "data": { … } }
+```
+
+Token deltas (`text`) are excluded unless listed in `types`. Clients may send `{"action":"subscribe","sessionId":…,"types":[…]}` to change filters and `{"action":"ping"}`. Authentication is the same as for HTTP; since browsers cannot set headers on a WebSocket, the token may be passed as `access_token` (accepted on the upgrade request only).
 
 ---
 
@@ -246,6 +359,7 @@ pantheon plugins info <name>      # show plugin details and available tools
 pantheon agents list              # list recent orchestration runs
 pantheon agents show <agentId>    # show agent node details
 pantheon agents plan <sessionId>  # show the decomposed task plan for a session
+pantheon agents watch             # follow live agent activity over the WebSocket feed (v0.9)
 
 # Consensus (v0.8)
 pantheon consensus list           # list recent consensus runs
@@ -255,6 +369,20 @@ pantheon consensus show <id>      # show per-model responses and synthesized res
 pantheon ab list                  # list configured A/B experiments
 pantheon ab comparison <id>       # show control vs. variant analytics (latency + quality score)
 
+# Auth (v0.9)
+pantheon auth status              # server auth mode and who you are signed in as
+pantheon auth login               # browser sign-in (GitHub/Google); saves an API token
+pantheon auth logout              # revoke and forget the saved token
+pantheon auth token create        # mint a token directly in the database (no OAuth needed)
+pantheon auth token list          # your tokens
+pantheon auth token revoke <id>   # revoke one
+
+# Semantic memory (v0.9)
+pantheon memory status            # enabled? search path, what is indexed
+pantheon memory search <query>    # passages from past conversations similar to the query
+pantheon memory reindex           # embed messages that are not indexed yet
+pantheon memory clear             # drop the index (conversations are kept)
+
 # Database (v0.9)
 pantheon db status                # backend, location, schema version, row counts
 pantheon db status --url <loc>    # inspect another database (postgres://… or a SQLite path)
@@ -263,6 +391,7 @@ pantheon db migrate --from <loc> --to <loc> --yes   # explicit source; merge int
 
 # Cost
 pantheon cost                     # show total usage summary
+pantheon cost --session <id>      # usage of one session (v0.9)
 pantheon cost recent              # show last 10 calls
 pantheon cost reset               # clear usage data
 
@@ -373,7 +502,8 @@ PantheonApiClient (HTTP)
 │  ├── sentryMiddleware                   │
 │  ├── requestLogger                      │
 │  ├── globalRateLimiter  (100/IP/min)    │
-│  └── llmRateLimiter     (15/IP/min)     │
+│  ├── llmRateLimiter     (15/IP/min)     │
+│  └── authMiddleware     (token / JWT)   │
 └──────────────────┬──────────────────────┘
                    │
      classify complexity (llama-smart)
@@ -412,7 +542,9 @@ packages/
 │             #   PermissionManager (+ fork()), ToolRegistry, AgentRuntime (+ maxContextChars, repoMap),
 │             #   SessionManager, SessionSummarizer,
 │             #   DB layer (Drizzle; SQLite + PostgreSQL, versioned migrations, copyDatabase),
-│             #   OrchestrationStore, ConsensusStore, ABStore,
+│             #   OrchestrationStore, ConsensusStore, ABStore, AuthStore,
+│             #   SemanticMemory, MemoryStore, EventBus,
+│             #   HostExecutor, DockerExecutor,
 │             #   Tracer, TraceCollector, TraceStore,
 │             #   Orchestrator, PlannerAgent, CoderAgent, DebuggerAgent,
 │             #   ExecutorAgent, ReviewerAgent (+ verification),
@@ -423,10 +555,11 @@ packages/
 ├── server/   # @pantheon/server — Hono API server (:3000)
 │             #   routes: /api/chat, /api/sessions, /api/models,
 │             #           /api/cost, /api/traces, /api/agents, /api/health (+ /db),
-│             #           /api/plugins, /api/consensus, /api/ab
-│             #   middleware: rate-limiter, sentry, request-logger
+│             #           /api/plugins, /api/consensus, /api/ab,
+│             #           /api/auth, /api/memory, /api/ws (WebSocket)
+│             #   middleware: rate-limiter, sentry, request-logger, auth
 ├── cli/      # pantheon binary (Commander + Ink) — thin API client
-│             #   commands: chat, doctor, sessions, models, cost, trace, server, agents, plugins, db
+│             #   commands: chat, doctor, sessions, models, cost, trace, server, agents, plugins, db, auth, memory
 │             #   ui: theme, logo, input-box, message, status-bar,
 │             #       tool-call, tool-permission, trace-waterfall, plugin-badge
 └── (root)    # plugins/ — example plugins: github, web-search, jira
@@ -438,7 +571,7 @@ Pantheon persists through Drizzle ORM to **SQLite** (default, `~/.pantheon/panth
 
 | Table | Purpose |
 |:------|:--------|
-| `sessions` | One row per chat session (title, timestamps, model, archived flag) |
+| `sessions` | One row per chat session (title, timestamps, model, archived flag, owning user) |
 | `messages` | All messages per session (role, content, tool calls, timestamps) |
 | `usage_records` | Per-call token usage and cost tracking |
 | `session_summaries` | LLM-generated summaries for episodic memory |
@@ -450,6 +583,9 @@ Pantheon persists through Drizzle ORM to **SQLite** (default, `~/.pantheon/panth
 | `consensus_runs` | Per-request consensus fan-out results with synthesized content, per-model responses, and async quality score |
 | `ab_runs` | Per-request A/B experiment records — arm, model, latency, token counts, and async quality score |
 
+| `users` | People who may use the instance — e-mail, sign-in provider, role (`owner` / `member`) |
+| `api_tokens` | API tokens (SHA-256 hash only), with last-used, expiry and revocation times |
+| `memory_chunks` | Semantic memory — embedded passages of past messages |
 | `schema_migrations` | Applied schema versions — drives automatic, idempotent upgrades at startup |
 
 All database access goes through store classes in `@pantheon/core` (`SessionManager`, `CostTracker`, `TraceStore`, `OrchestrationStore`, `ConsensusStore`, `ABStore`). They are fully async and dialect-agnostic; the two Drizzle schemas (`schema.sqlite.ts`, `schema.pg.ts`) are kept identical by a parity test.
@@ -505,7 +641,7 @@ Full details in [CHANGELOG.md](./CHANGELOG.md).
 
 | Version | Summary |
 |:--------|:--------|
-| **v0.9** | PostgreSQL backend alongside SQLite (`DATABASE_URL`); versioned schema migrations; `pantheon db status` / `db migrate` (SQLite ⇄ PostgreSQL copy); fully async dialect-agnostic store layer; `grep` sandbox escape fixed; server log + clear startup errors; API route test-suite; 497 tests, storage tests on both backends |
+| **v0.9** | PostgreSQL backend alongside SQLite + `pantheon db migrate`; authentication (API tokens, GitHub/Google OAuth, JWT sessions, `pantheon auth`); live WebSocket activity feed + `agents watch`; Docker-isolated command execution; semantic memory (RAG, pgvector); per-session cost, tier-scoped A/B, mid-turn repo-map refresh; two sandbox escapes closed; server and CLI test coverage. Web dashboard deferred. |
 | **v0.8** | Consensus engine (fan-out to N models, LLM synthesis); A/B experiment router with deterministic session assignment, quality judge, and analytics; provider failover chain; routing confidence threshold with auto-escalation; `--consensus` flag; `pantheon consensus` + `pantheon ab` commands |
 | **v0.7** | Plugin system (inline + MCP); sandbox overhauled to allowlist + arg path validation; `pantheon doctor`; `--budget` flag; Groq-only graceful degradation; `edit_file` + `grep` tools; repo map (AST codebase index); shell API key filtering; ReviewerAgent tsc+test verification; PermissionManager fork; context window pruning; 147 deterministic tests |
 | **v0.6** | Multi-agent orchestration — Planner/Coder/Debugger/Reviewer pipeline; DeepSeek V4; context-aware routing; `general` tier; `pantheon agents` commands |

@@ -44,6 +44,7 @@ services:
       - PANTHEON_DB_PATH=/data/pantheon.db
       - DATABASE_URL=${DATABASE_URL:-}
       # ── Authentication (see README → Authentication) ───────────────────────
+      - PANTHEON_EMBEDDING_MODEL=${PANTHEON_EMBEDDING_MODEL:-}
       - PANTHEON_AUTH=${PANTHEON_AUTH:-off}
       - PANTHEON_JWT_SECRET=${PANTHEON_JWT_SECRET:-}
       - PANTHEON_PUBLIC_URL=${PANTHEON_PUBLIC_URL:-}
