@@ -2,6 +2,7 @@ import { execSync, execFileSync } from "node:child_process";
 import chalk from "chalk";
 import {
     getCapabilities,
+    loadConfig,
     openDatabase,
     closeDatabase,
     getDatabaseStatus,
@@ -181,8 +182,10 @@ export async function doctorCommand(): Promise<void> {
     results.push(checkDocker());
     results.push(await checkDatabase());
     results.push(await checkGateway());
-    results.push(await checkApiKey("GROQ_API_KEY", "GROQ_API_KEY (routing)", "llama-smart", true));
-    results.push(await checkApiKey("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY (coding agents)", "deepseek-v4-flash", false));
+    // Ping the models the configuration actually routes to, not fixed names
+    const tiers = loadConfig().routing.tiers;
+    results.push(await checkApiKey("GROQ_API_KEY", "GROQ_API_KEY (routing)", tiers.general, true));
+    results.push(await checkApiKey("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY (coding agents)", tiers.simple, false));
 
     if (!caps.anthropicFallbackEnabled && !caps.openaiFallbackEnabled) {
         results.push({

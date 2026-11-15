@@ -2,7 +2,7 @@
 
 > A self-hosted, multi-model AI orchestration system with intelligent routing, persistent memory, multi-agent task decomposition, and an extensible plugin ecosystem.
 
-**Current version: v0.9.0** · [Changelog](./CHANGELOG.md)
+**Current version: v0.9.1** · [Changelog](./CHANGELOG.md)
 
 ---
 
@@ -29,6 +29,8 @@ Every prompt is classified by complexity before a model is chosen. A one-shot ca
 
 The classifier receives the last N turns of conversation history (default: 5) — so short follow-ups like *"debug this"* are classified correctly in context. Use `--model` to pin a model and bypass routing entirely.
 
+The model's answer is not taken on faith. Structural facts about the prompt set a **floor** it cannot go below: a prompt carrying code, a stack trace or file names is never routed as `general`, and one spanning several files or thousands of characters is at least `standard`. Pure small talk ("thanks!") is routed without a classifier call at all. If the classifier is unreachable or rate-limited, the request is routed on structure alone instead of failing. Classifier calls are included in `pantheon cost`.
+
 ---
 
 ### Multi-Agent Orchestration
@@ -39,12 +41,14 @@ Complex prompts automatically trigger a full pipeline without any manual flags:
 User prompt  →  PlannerAgent  →  parallel specialist agents  →  ReviewerAgent  →  final response
 ```
 
-1. **PlannerAgent** (deepseek-v4-pro) — decomposes the task into sub-tasks, each stamped with a `taskRole` (`code` / `debug` / `general`). Budget-controlled: `--budget low` disables orchestration; `--budget medium` caps at 3 sub-tasks (default); `--budget high` allows up to 6.
-2. **Wave scheduler** — runs dependency-free sub-tasks in parallel (`Promise.allSettled`); dependent tasks wait for their wave.
-3. **CoderAgent** (deepseek-v4-pro) — specialist for code generation, implementation, and file modification.
-4. **DebuggerAgent** (deepseek-v4-pro) — specialist for root-cause analysis, error diagnosis, and fix verification.
-5. **ExecutorAgent** (deepseek-v4-pro) — general tasks: research, documentation, Q&A.
-6. **ReviewerAgent** (deepseek-v4-pro) — synthesises all agent results into a single coherent response.
+1. **PlannerAgent** — decomposes the task into sub-tasks, each stamped with a `taskRole` (`code` / `debug` / `general`). It sees the repo map and memory of earlier sessions. Budget-controlled: `--budget low` disables orchestration; `--budget medium` caps at 3 sub-tasks (default); `--budget high` allows up to 6.
+2. **Baseline check** — while the planner works, the project's own checks (`tsc --noEmit` when there is a `tsconfig.json`, and the test command from `package.json`) are run once, so later failures can be told apart from ones that were already there.
+3. **Wave scheduler** — runs dependency-free sub-tasks in parallel; dependent tasks wait for their wave.
+4. **Specialist agents** — `coder`, `debugger` and `executor` are role presets (instructions and iteration budget) over one implementation. Each gets the session's full tool set — built-ins plus installed plugins and MCP servers — the repo map, and memory. Agents running at the same time are coordinated: writes to a file are applied one at a time, and an agent cannot overwrite a file another agent has just written (it is told to read it and use `edit_file` instead).
+5. **Verify and fix** — the checks run again. If this run broke them, a debugger agent is given the failure output and the list of files that changed, and asked to fix it; then the checks run again (up to 2 rounds). Failures that predate the run, or a run that changed no files, do not trigger a fix. Fix attempts appear as extra sub-tasks in `pantheon agents plan`.
+6. **ReviewerAgent** — synthesises the results and the verification outcome into one answer, streamed as it is written. It is told when a fix was needed or when checks were already failing.
+
+All of these run on the `complex` tier model.
 
 The plan preview is shown in the TUI with role badges before agents start executing:
 
@@ -102,6 +106,10 @@ sandbox:
       description: "Docker inspection commands"
   denyFromDefault: []
 ```
+
+Arguments are restricted where a command could otherwise run a program or write a file on the side: `find` has no `-exec`/`-delete`, `awk` no `system()`/pipes/redirection, `sed` no `-i` or `e`/`w` commands, `rg` no `--pre`, and `git` is limited to inspection (`git config` is read-only, no `stash`/branch/tag/remote changes).
+
+> **What this is and is not.** The allowlist controls which programs a model may start. It does not make `npm test`, `node script.js` or `make` safe — those run the project's own code with the server's privileges, by design. On your own machine that is the same trust you extend to the project anyway. For a server other people can reach, use isolated execution (below); the server prints a warning at start-up if it is exposed while running commands on the host.
 
 **Permission model:** safe tool calls (read-only, `grep`) are auto-allowed on first use. Destructive operations require explicit approval in the TUI.
 
@@ -170,7 +178,7 @@ Bundled example plugins: **GitHub** (`@modelcontextprotocol/server-github`), **W
 
 Every `pantheon chat` creates a UUID-keyed session in the database (SQLite by default, PostgreSQL optionally — see [Storage Backends](#storage-backends)). Sessions are:
 
-- **Resumable** — `pantheon chat --resume` picks up the last session; `--resume <id>` resumes a specific one.
+- **Resumable** — `pantheon chat --resume` picks up the last session; `--resume <id>` resumes a specific one. The stored transcript includes the agent's tool calls and their results (large outputs truncated), so a follow-up turn knows what the agent read and did, not just what it said.
 - **Summarized** — after 4+ exchanges, a 2–3 sentence LLM summary is generated and stored.
 - **Remembered** — episodic memory injects two layers of context into every new session: raw messages from the most recent past session (last 10), and LLM summaries from up to 4 older sessions. Optional [semantic memory](#semantic-memory) adds retrieval of the most relevant passages from *any* past session.
 
@@ -311,6 +319,38 @@ Every LLM call, tool invocation, and routing decision is wrapped in an OpenTelem
 
 ---
 
+### Evaluation
+
+Tests prove the plumbing works; they cannot tell you whether Pantheon does good work with your models. `pantheon eval` runs repeatable tasks against the real stack — each one a small project, a prompt, and checks on the result:
+
+```yaml
+# evals/02-fix-failing-test.yml
+name: fix-failing-test
+prompt: "`node test.js` fails. Find the bug in src/range.js and fix it. Do not modify test.js."
+files:
+  src/range.js: |
+    function range(start, end) { … }
+  test.js: |
+    …
+checks:
+  - command: node test.js                 # passes when it exits 0
+  - file_contains: { path: test.js, text: "assert.deepStrictEqual(range(1, 3), [1, 2, 3]);" }
+  - tool_called: edit_file
+```
+
+```bash
+pantheon eval                              # run ./evals (six starter tasks are bundled)
+pantheon eval --report before.json         # save a report
+pantheon eval --compare before.json        # …change a prompt or a model, then see what regressed or got fixed
+pantheon eval --only fix-failing --keep    # one task; keep its project directory for inspection
+```
+
+Each task runs in a throw-away copy of its project (so tool prompts are approved automatically) and reports pass/fail per check, duration, tool calls, the routing decision and token usage; the command exits non-zero if any task fails. Checks: `file_exists`, `file_absent`, `file_contains`, `file_not_contains`, `file_equals`, `command`, `response_contains`, `response_not_contains`, `tool_called`, `tool_not_called`, `max_tool_calls`. Task options: `orchestrate`, `model`, `noTools`, `timeoutSeconds`.
+
+The bundled tasks are a starting point — the valuable ones are the tasks you actually use Pantheon for. Run the set after changing a prompt, a model, or the orchestration.
+
+---
+
 ### Health Diagnostics
 
 ```bash
@@ -389,6 +429,11 @@ pantheon db status --url <loc>    # inspect another database (postgres://… or 
 pantheon db migrate --to <loc>    # copy all data to another database (SQLite ⇄ PostgreSQL)
 pantheon db migrate --from <loc> --to <loc> --yes   # explicit source; merge into a non-empty target
 
+# Evaluation
+pantheon eval [location]          # run eval tasks against the real model; exit 1 if any fail
+pantheon eval --report out.json   # write a JSON report
+pantheon eval --compare old.json  # show regressions and fixes against an earlier report
+
 # Cost
 pantheon cost                     # show total usage summary
 pantheon cost --session <id>      # usage of one session (v0.9)
@@ -419,6 +464,8 @@ Inside `pantheon chat`:
 | `tab` | Cycle through available models (auto-route → deepseek-v4-flash → deepseek-v4-pro → …) |
 | `enter` | Send message |
 | `ctrl+c` | Exit |
+
+The answer is streamed as it is written — in agent mode too, including the short commentary before each tool call — rather than appearing all at once when the turn ends.
 
 When the agent calls tools, you'll see inline prompts:
 
@@ -501,8 +548,9 @@ PantheonApiClient (HTTP)
 │                                         │
 │  ├── sentryMiddleware                   │
 │  ├── requestLogger                      │
-│  ├── globalRateLimiter  (100/IP/min)    │
-│  ├── llmRateLimiter     (15/IP/min)     │
+│  ├── globalRateLimiter  (100/client/min)│
+│  ├── llmRateLimiter     (15 remote / 60 local per min)
+│  │     keyed on the TCP peer; proxy headers only with PANTHEON_TRUST_PROXY=1
 │  └── authMiddleware     (token / JWT)   │
 └──────────────────┬──────────────────────┘
                    │
@@ -602,6 +650,17 @@ Pantheon uses **role-based model assignment** — models are matched to roles, n
 
 All models are accessed through the LiteLLM gateway (Docker on `:4000`). Optional fallback models (`claude-fallback`, `gpt-fallback`) activate automatically on primary provider errors if `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are set — for both `complete()` and streaming calls.
 
+Provider-specific request parameters belong in config, not code — for example a reasoning model that needs thinking switched on:
+
+```yaml
+models:
+  - id: deepseek-v4-pro
+    provider: deepseek
+    extraParams: { thinking: { type: enabled }, reasoning_effort: high }   # sent with every request to this model
+```
+
+No model name is hard-coded: the classifier, the context summariser and the quality judge use the `general` tier model, orchestration uses the `complex` tier, and the failover chain starts at the `complex` tier model.
+
 To have `pantheon cost` report dollar amounts (not just tokens), add per-model pricing to `config.yml`; without it, cost is recorded as `$0` and tokens are still tracked:
 
 ```yaml
@@ -623,7 +682,7 @@ pnpm vitest run       # run tests (from monorepo root)
 pnpm turbo clean      # remove build artifacts
 ```
 
-Tests run against the TypeScript sources (no build needed) and never call a real LLM. Every storage test runs twice — on in-memory SQLite and on [PGlite](https://pglite.dev) (real PostgreSQL compiled to WASM, in-process) — so no database server is required. To additionally exercise the production `pg` driver against a real server (CI does this):
+Tests run against the TypeScript sources (no build needed) and never call a real LLM. Besides unit tests there is an **end-to-end suite** (`packages/server/src/__tests__/e2e.test.ts`): the real server, real gateway and real tools against a scripted stand-in for the model endpoint, speaking the actual wire protocol (streaming, fragmented tool calls) — so the path from HTTP request to tool execution to stored transcript is exercised with nothing mocked in between. A **Docker integration test** runs the isolated executor against a real daemon when one is available (it is in CI) and is skipped otherwise. Every storage test runs twice — on in-memory SQLite and on [PGlite](https://pglite.dev) (real PostgreSQL compiled to WASM, in-process) — so no database server is required. To additionally exercise the production `pg` driver against a real server (CI does this):
 
 ```bash
 PANTHEON_TEST_POSTGRES_URL=postgres://user:pass@localhost:5432/postgres pnpm vitest run
@@ -641,6 +700,7 @@ Full details in [CHANGELOG.md](./CHANGELOG.md).
 
 | Version | Summary |
 |:--------|:--------|
+| **v0.9.1** | Orchestration verifies its work and fixes what it broke; parallel agents no longer overwrite each other; sub-agents get plugins, repo map and memory; streamed answers in agent mode; tool calls kept in session history; routing that degrades instead of failing; argument-level shell restrictions; rate limiter no longer spoofable; `pantheon eval`; end-to-end tests over the real wire protocol |
 | **v0.9** | PostgreSQL backend alongside SQLite + `pantheon db migrate`; authentication (API tokens, GitHub/Google OAuth, JWT sessions, `pantheon auth`); live WebSocket activity feed + `agents watch`; Docker-isolated command execution; semantic memory (RAG, pgvector); per-session cost, tier-scoped A/B, mid-turn repo-map refresh; two sandbox escapes closed; server and CLI test coverage. Web dashboard deferred. |
 | **v0.8** | Consensus engine (fan-out to N models, LLM synthesis); A/B experiment router with deterministic session assignment, quality judge, and analytics; provider failover chain; routing confidence threshold with auto-escalation; `--consensus` flag; `pantheon consensus` + `pantheon ab` commands |
 | **v0.7** | Plugin system (inline + MCP); sandbox overhauled to allowlist + arg path validation; `pantheon doctor`; `--budget` flag; Groq-only graceful degradation; `edit_file` + `grep` tools; repo map (AST codebase index); shell API key filtering; ReviewerAgent tsc+test verification; PermissionManager fork; context window pruning; 147 deterministic tests |

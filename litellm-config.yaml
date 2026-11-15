@@ -17,9 +17,11 @@ model_list:
   # ── Fallback models (used only when primary fails) ─────────────────────────
   # Keys are optional — set ANTHROPIC_API_KEY and/or OPENAI_API_KEY in .env
   # to enable automatic failover when DeepSeek is down or rate-limited.
+  # The current Sonnet. (This pointed at claude-3-5-sonnet-20241022, a model from
+  # 2024 that is no longer a sensible target.) Any Anthropic model ID works here.
   - model_name: claude-fallback
     litellm_params:
-      model: anthropic/claude-3-5-sonnet-20241022
+      model: anthropic/claude-sonnet-5-5
       api_key: os.environ/ANTHROPIC_API_KEY
 
   - model_name: gpt-fallback
