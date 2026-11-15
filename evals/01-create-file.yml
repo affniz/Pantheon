@@ -1,0 +1,8 @@
+name: create-file
+description: The simplest possible agentic task — one tool call.
+prompt: Create a file named NOTES.md containing a level-one heading "Notes" and nothing else.
+checks:
+  - file_exists: NOTES.md
+  - file_contains: { path: NOTES.md, text: "# Notes" }
+  - tool_called: write_file
+  - max_tool_calls: 4

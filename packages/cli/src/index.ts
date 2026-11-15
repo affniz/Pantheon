@@ -19,6 +19,7 @@ import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { dbStatus, dbMigrate } from "./commands/db.js";
+import { evalCommand } from "./commands/eval.js";
 import { memoryStatus, memorySearch, memoryReindex, memoryClear } from "./commands/memory.js";
 import { authLogin, authLogout, authStatus, authTokenCreate, authTokenList, authTokenRevoke } from "./commands/auth.js";
 
@@ -348,6 +349,18 @@ serverCmd
             console.log(dim("  Pantheon server is not running. Use `pantheon server start` or `pantheon chat`."));
         }
     });
+
+// ── Eval ──────────────────────────────────────────────────────────────────────
+
+program
+    .command("eval")
+    .description("Run repeatable end-to-end tasks against the real model and check the results")
+    .argument("[location]", "Directory of task files (*.yml) or a single task (default: ./evals)")
+    .option("--only <name...>", "Run only tasks whose name contains one of these")
+    .option("--report <file>", "Write a JSON report")
+    .option("--compare <file>", "Compare with an earlier report: show regressions and fixes")
+    .option("--keep", "Keep each task's project directory for inspection")
+    .action((location, opts) => evalCommand(location, opts));
 
 // ── Memory (v0.9) ─────────────────────────────────────────────────────────────
 
