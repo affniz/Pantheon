@@ -11,6 +11,8 @@ for (const k of ENV) delete process.env[k];
 process.env["HOME"] = tmpHome;
 process.env["PANTHEON_DB_PATH"] = path.join(tmpHome, "mem-test.db");
 process.env["NODE_ENV"] = "production";
+// Each request below names its own client address (x-forwarded-for) to stay clear of the rate limiter
+process.env["PANTHEON_TRUST_PROXY"] = "1";
 
 /** Messages the fake gateway was asked to answer, per call. */
 const streamed: ChatMessage[][] = [];

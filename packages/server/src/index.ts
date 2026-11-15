@@ -2,7 +2,7 @@
 try { (process as any).loadEnvFile(); } catch { /* no .env — ok */ }
 
 import { serve } from "@hono/node-server";
-import { initDb, closeDb, dialectOf, describeTarget, resolveDatabaseTarget, TraceCollector } from "@pantheon/core";
+import { initDb, closeDb, dialectOf, describeTarget, resolveDatabaseTarget, TraceCollector, Sandbox, loadConfig } from "@pantheon/core";
 import { app, injectWebSocket } from "./app.js";
 import { getAuthConfig } from "./auth/config.js";
 import { closeAllWebSockets } from "./routes/ws.js";
@@ -42,6 +42,25 @@ if (authConfig.mode === "required") {
         `[auth] WARNING: listening on ${HOST} with authentication OFF. Anyone who can reach this port can run\n` +
         `       commands and read files through the agent. Set PANTHEON_AUTH=required.\n`,
     );
+}
+
+// The host executor runs agent commands as this server's own user. That is the
+// intended setup for one person on their machine, and the wrong one for a server
+// other people can reach — say so at boot rather than leaving it to the README.
+try {
+    const exec = Sandbox.fromConfig(process.cwd(), loadConfig().sandbox).executor;
+    if (exec.kind === "docker") {
+        process.stdout.write(`[sandbox] ${exec.describe()}\n`);
+    } else if (authConfig.mode === "required" || !LOOPBACK.has(HOST)) {
+        process.stderr.write(
+            "[sandbox] WARNING: agent commands run directly on this host. The command allowlist limits what a\n" +
+            "          model may start, but allowed commands such as `npm test` or `node script.js` run project\n" +
+            "          code with this server's privileges. For a shared or exposed server set PANTHEON_EXEC=docker.\n",
+        );
+    }
+} catch (err) {
+    process.stderr.write(`[sandbox] invalid configuration: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
 }
 
 const server = serve(

@@ -9,7 +9,9 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pantheon-api-"));
 const saved = { HOME: process.env["HOME"], DB: process.env["PANTHEON_DB_PATH"], URL: process.env["DATABASE_URL"], ENV: process.env["NODE_ENV"] };
 process.env["HOME"] = tmpHome;
 process.env["PANTHEON_DB_PATH"] = path.join(tmpHome, "api-test.db");
-process.env["NODE_ENV"] = "production"; // silences the per-request logger
+process.env["NODE_ENV"] = "production";
+// Each request below names its own client address (x-forwarded-for) to stay clear of the rate limiter
+process.env["PANTHEON_TRUST_PROXY"] = "1"; // silences the per-request logger
 delete process.env["DATABASE_URL"];
 
 // ── Fake LLM gateway: the chat route must work end-to-end without a model ─────

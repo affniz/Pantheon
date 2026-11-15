@@ -17,6 +17,8 @@ for (const k of ENV) delete process.env[k];
 process.env["HOME"] = tmpHome;
 process.env["PANTHEON_DB_PATH"] = path.join(tmpHome, "auth-test.db");
 process.env["NODE_ENV"] = "production";
+// Each request below names its own client address (x-forwarded-for) to stay clear of the rate limiter
+process.env["PANTHEON_TRUST_PROXY"] = "1";
 process.env["PANTHEON_AUTH"] = "required";
 process.env["PANTHEON_PUBLIC_URL"] = "https://pantheon.test";
 process.env["PANTHEON_GITHUB_CLIENT_ID"] = "gh-client";

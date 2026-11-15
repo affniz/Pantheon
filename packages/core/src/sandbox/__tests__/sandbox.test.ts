@@ -366,3 +366,57 @@ describe("Sandbox.fromConfig()", () => {
         expect(() => Sandbox.fromConfig(tmpDir, { execution: { mode: "docker" } })).toThrowError(/Unknown execution network/);
     });
 });
+
+describe("default allowlist — argument-level escapes", () => {
+    const sandbox = Sandbox.create(os.tmpdir());
+    const allowed = (command: string) => expect(sandbox.validateCommand(command), command).toBe(command);
+    const refused = (command: string) => expect(() => sandbox.validateCommand(command), command).toThrowError(/blocked argument/);
+
+    it("find: may search, may not run programs, delete, or write files", () => {
+        allowed("find . -name '*.ts' -type f");
+        allowed("find src -newer package.json -print");
+        for (const c of ["find . -exec rm {} +", "find . -execdir sh -c id ';'", "find . -ok rm {} ';'", "find . -name '*.log' -delete", "find . -fprint /tmp/out", "find . -fls out"]) refused(c);
+    });
+
+    it("awk: text filtering only", () => {
+        allowed("awk '{print $1}' data.txt");
+        allowed("awk -F, 'NR==1 {print $2}' data.csv");
+        for (const c of [
+            `awk 'BEGIN{system("id")}'`,
+            `awk 'BEGIN{ system ("id") }'`,
+            `awk 'BEGIN{"id" | getline x; print x}'`,
+            `awk '{print | "sh"}'`,
+            `awk '{print > "/tmp/out"}' in.txt`,
+            `awk 'BEGIN{while((getline l < "/etc/passwd")>0) print l}'`,
+            "awk -f script.awk in.txt",
+        ]) refused(c);
+    });
+
+    it("sed: substitutions yes; executing, reading or writing files no", () => {
+        allowed("sed -n '1,20p' file.txt");
+        allowed("sed 's/foo/bar/g' file.txt");
+        allowed("sed -e 's/a/b/' -e 's/c/d/' file.txt");
+        for (const c of ["sed -i 's/a/b/' f", "sed -i.bak 's/a/b/' f", "sed --in-place 's/a/b/' f", "sed '1e id' f", "sed 's/a/b/e' f", "sed 's/a/b/w /tmp/out' f", "sed 'w /tmp/out' f", "sed -f script.sed f", "sed '1r /etc/passwd' f"]) refused(c);
+    });
+
+    it("git: inspection only", () => {
+        for (const c of [
+            "git status --short", "git log --oneline -5", "git diff HEAD~1", "git branch", "git branch -a", "git branch --list 'feat/*'",
+            "git tag", "git tag -l 'v*'", "git remote -v", "git remote show origin", "git stash list", "git stash show -p",
+            "git config --get user.name", "git config --list", "git config -l", "git grep -n TODO",
+        ]) allowed(c);
+        for (const c of [
+            "git config core.fsmonitor 'sh -c id'", "git config --global core.pager 'sh'", "git config alias.x '!sh'", "git config",
+            "git grep --open-files-in-pager=sh pattern", "git grep -Osh pattern", "git log --output=/tmp/x", "git diff --ext-diff",
+            "git stash", "git stash drop", "git stash clear", "git stash pop",
+            "git branch -D main", "git branch -m old new", "git branch --delete x",
+            "git tag -d v1", "git tag v2", "git remote add evil http://x", "git remote set-url origin http://x",
+        ]) refused(c);
+    });
+
+    it("rg and sort: no program execution, no output files", () => {
+        allowed("rg -n TODO src");
+        allowed("sort -u names.txt");
+        for (const c of ["rg --pre sh pattern", "rg --pre=cat x", "sort -o /tmp/out in.txt", "sort --output=out in.txt"]) refused(c);
+    });
+});

@@ -64,18 +64,40 @@ export const DEFAULT_SHELL_ALLOWLIST: ShellAllowlistEntry[] = [
     { command: "grep",   description: "Search text with patterns" },
     { command: "egrep",  description: "Extended grep" },
     { command: "fgrep",  description: "Fixed-string grep" },
-    { command: "rg",     description: "ripgrep — fast text search" },
-    { command: "find",   description: "Find files matching criteria", blockedArgs: [/-exec/] },
-    { command: "sort",   description: "Sort lines of text" },
+    {
+        command: "rg",
+        description: "ripgrep — fast text search",
+        blockedArgs: [/--pre\b/, /--hostname-bin\b/], // both run an arbitrary program
+    },
+    {
+        command: "find",
+        description: "Find files matching criteria",
+        // -exec/-ok run programs, -delete removes files, -fprint*/-fls write files
+        blockedArgs: [/-exec/, /-ok(dir)?\b/, /-delete\b/, /-fprint/, /-fls\b/],
+    },
+    { command: "sort",   description: "Sort lines of text", blockedArgs: [/(^|\s)(-o|--output)\b/] },
     { command: "uniq",   description: "Report or filter duplicate lines" },
     { command: "diff",   description: "Compare files line by line" },
-    { command: "awk",    description: "Pattern scanning and processing" },
+    {
+        command: "awk",
+        description: "Pattern scanning and processing (text filtering only)",
+        // awk is a programming language: system() and "cmd" | getline run programs,
+        // print > "file" writes files, getline < "file" reads any file. Its programs
+        // are quoted, so the shell-level checks cannot see inside them.
+        blockedArgs: [/system\s*\(/, /getline/, /\|/, />/, /(^|\s)(-f|--file|-i|--include|-l|--load)\b/],
+    },
     {
         command: "sed",
         description: "Stream editor",
         blockedArgs: [
             /\|\s*(bash|sh|zsh)/,  // block piping to shells
-            /\s-i\b/,              // block -i in-place file modification
+            /(^|\s)-i/,            // block -i / -i.bak in-place file modification
+            /--in-place/,
+            /(^|\s)(-f|--file)\b/, // a script file cannot be inspected here
+            // The `e` command/flag executes a shell command, `w` / `r` write and read
+            // arbitrary files (GNU sed): "1e id", "s/a/b/e", "w /tmp/x".
+            /(^|[;{}'"\s])\d*[ewr]\s+\S/,
+            /s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gpIi\d]*[ew]/,
         ],
     },
     { command: "cut",    description: "Remove sections from lines" },
@@ -106,6 +128,19 @@ export const DEFAULT_SHELL_ALLOWLIST: ShellAllowlistEntry[] = [
                       "tag", "stash", "remote", "config", "ls-files", "ls-tree", "shortlog",
                       "blame", "grep", "check-ignore", "format-patch"],
         description: "Git version control (read-only subcommands)",
+        blockedArgs: [
+            // `git config` may read, never write: core.fsmonitor, core.pager and
+            // aliases are all ways to make a later git command run a program.
+            /^config\s+(?!(--get|--get-all|--get-regexp|--list|-l)\b)/,
+            /^config\s*$/,
+            /--open-files-in-pager|(^|\s)-O\S*/,   // git grep: runs a program
+            /--output\b/,                           // writes a file
+            /--ext-diff|--textconv/,                // run configured external programs
+            /^stash(\s+(?!list\b|show\b)|\s*$)/,   // only inspect stashes
+            /^branch\b.*(\s-[dDmMcCf]\b|--delete|--move|--copy|--force)/,
+            /^tag\s+(?!(-l|--list|-n\d*|--contains|--points-at)\b)/,
+            /^remote\s+(add|remove|rm|rename|set-url|set-head|set-branches|prune|update)\b/,
+        ],
     },
 
     // ── npm / pnpm / yarn (safe subcommands) ─────────────────────────────────

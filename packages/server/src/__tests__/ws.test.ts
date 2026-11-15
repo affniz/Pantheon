@@ -12,6 +12,8 @@ for (const k of ENV) delete process.env[k];
 process.env["HOME"] = tmpHome;
 process.env["PANTHEON_DB_PATH"] = path.join(tmpHome, "ws-test.db");
 process.env["NODE_ENV"] = "production";
+// Each request below names its own client address (x-forwarded-for) to stay clear of the rate limiter
+process.env["PANTHEON_TRUST_PROXY"] = "1";
 
 vi.mock("@pantheon/core", async (importOriginal) => {
     const original = await importOriginal<typeof import("@pantheon/core")>();

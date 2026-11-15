@@ -571,4 +571,68 @@ describe("AgentRuntime — run options", () => {
             expect(withMap["systemPromptHash"]).toBe(base["systemPromptHash"]);
         });
     });
+
+    describe("live text and turn transcript (v0.9.1)", () => {
+        const toolCall = (id: string): ChatMessage => ({ role: "assistant", content: "Let me check.", toolCalls: [{ id, name: "testTool", arguments: { input: "x" } }] });
+
+        it("returns every message the turn produced, in order", async () => {
+            const gateway = createMockGateway([toolCall("t1"), { role: "assistant", content: "All done." }]);
+            const registry = new ToolRegistry();
+            registry.register(createTestTool());
+            const result = await new AgentRuntime(gateway, registry, config).run([{ role: "user", content: "go" }]);
+
+            expect(result.messages.map((m) => m.role)).toEqual(["assistant", "tool", "assistant"]);
+            expect(result.messages[0]).toMatchObject({ content: "Let me check.", toolCalls: [{ id: "t1", name: "testTool" }] });
+            expect(result.messages[1]).toMatchObject({ content: "tool result content", toolCallId: "t1" });
+            expect(result.messages[2]).toMatchObject({ content: "All done." });
+            expect(result.messages.every((m) => m.timestamp instanceof Date)).toBe(true);
+            // The user's own message is not part of what the turn added
+            expect(result.messages.some((m) => m.role === "user")).toBe(false);
+        });
+
+        it("records failed and unknown tool calls in the transcript too", async () => {
+            const gateway = createMockGateway([
+                { role: "assistant", content: "", toolCalls: [{ id: "u1", name: "no_such_tool", arguments: {} }] },
+                { role: "assistant", content: "That tool does not exist." },
+            ]);
+            const result = await new AgentRuntime(gateway, new ToolRegistry(), config).run([{ role: "user", content: "go" }]);
+            expect(result.messages.map((m) => m.role)).toEqual(["assistant", "tool", "assistant"]);
+            expect(result.messages[1]!.content).toContain('Unknown tool "no_such_tool"');
+        });
+
+        it("forwards text through onText — the whole response, exactly once, with a break between iterations", async () => {
+            // This mock does not stream, so each message arrives in one piece
+            const gateway = createMockGateway([toolCall("t1"), { role: "assistant", content: "All done." }]);
+            const registry = new ToolRegistry();
+            registry.register(createTestTool());
+            const chunks: string[] = [];
+            const result = await new AgentRuntime(gateway, registry, { ...config, onText: (d) => chunks.push(d) })
+                .run([{ role: "user", content: "go" }]);
+
+            expect(chunks).toEqual(["Let me check.", "\n\n", "All done."]);
+            expect(chunks.join("").endsWith(result.response)).toBe(true);
+        });
+
+        it("uses the gateway's token stream when it provides one, without sending the text again", async () => {
+            const gateway = {
+                resolveRouting: vi.fn().mockResolvedValue({ tier: "standard", selectedModelId: "m", reason: "mock" }),
+                complete: vi.fn(async (_m: ChatMessage[], _model: string, _tools: unknown, options?: { onToken?: (d: string) => void }) => {
+                    options?.onToken?.("Str");
+                    options?.onToken?.("eamed");
+                    return { message: { role: "assistant" as const, content: "Streamed" }, usage: { inputTokens: 1, outputTokens: 1 } };
+                }),
+                stream: vi.fn(),
+            } as unknown as Gateway;
+            const chunks: string[] = [];
+            await new AgentRuntime(gateway, new ToolRegistry(), { ...config, onText: (d) => chunks.push(d) })
+                .run([{ role: "user", content: "go" }]);
+            expect(chunks).toEqual(["Str", "eamed"]);
+        });
+
+        it("does not ask the gateway to stream when nobody is listening", async () => {
+            const gateway = createMockGateway([{ role: "assistant", content: "quiet" }]);
+            await new AgentRuntime(gateway, new ToolRegistry(), config).run([{ role: "user", content: "go" }]);
+            expect(vi.mocked(gateway.complete).mock.calls[0]![3]).toBeUndefined();
+        });
+    });
 });
