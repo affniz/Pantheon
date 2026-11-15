@@ -20,6 +20,8 @@ IMPORTANT: When conversation history is provided, use it to judge the true scope
 For example, "debug this" alone may look simple, but if prior messages describe a complex system or a
 hard-to-reproduce bug, classify it as "complex". Always consider cumulative context.`;
 
+export type ClassifierUsageCallback = (modelId: string, inputTokens: number, outputTokens: number, prompt: string) => Promise<void>;
+
 type Tier = RoutingDecision["tier"];
 const TIER_ORDER: Tier[] = ["general", "simple", "standard", "complex"];
 
@@ -66,10 +68,16 @@ function atLeast(tier: Tier, floor: Tier): Tier {
 export class Classifier {
     private client: OpenAI;
     private config: RoutingConfig;
+    private onUsage: ClassifierUsageCallback | undefined;
 
-    constructor(client: OpenAI, config: RoutingConfig) {
+    /**
+     * @param onUsage Called with the token usage of each classifier call, so routing
+     *   shows up in cost tracking like every other model call.
+     */
+    constructor(client: OpenAI, config: RoutingConfig, onUsage?: ClassifierUsageCallback) {
         this.client = client;
         this.config = config;
+        this.onUsage = onUsage;
     }
 
     /**
@@ -136,6 +144,16 @@ export class Classifier {
                         temperature: 0,
                     });
                     raw = response.choices[0]?.message?.content?.trim().toLowerCase() ?? "";
+                    if (this.onUsage) {
+                        await this.onUsage(
+                            classifierModel,
+                            response.usage?.prompt_tokens ?? 0,
+                            response.usage?.completion_tokens ?? 0,
+                            prompt,
+                        ).catch(() => {
+                            // Bookkeeping must not affect routing
+                        });
+                    }
                 } catch (err) {
                     // The classifier is an optimisation, not a dependency: if it is
                     // unreachable or rate-limited, route on structure alone rather than

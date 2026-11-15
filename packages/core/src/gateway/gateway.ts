@@ -75,8 +75,11 @@ export class Gateway {
 
         this.client = new OpenAI({ baseURL: baseUrl, apiKey: masterKey });
 
-        this.classifier = new Classifier(this.client, registry.getRoutingConfig());
         this.tracker = new CostTracker();
+        // Routing calls cost tokens too — they were previously missing from `pantheon cost`
+        this.classifier = new Classifier(this.client, registry.getRoutingConfig(), (modelId, input, output, prompt) =>
+            this.recordUsage(modelId, input, output, [{ role: "user", content: `[routing] ${prompt}` }]),
+        );
     }
 
     /** Returns the correct OpenAI client for the given model id. */

@@ -16,10 +16,9 @@ const DEFAULTS: PantheonConfig = {
             extraParams: { thinking: { type: "enabled" }, reasoning_effort: "high" },
         },
     ],
-    gateway: {
-        baseUrl: process.env["LITELLM_BASE_URL"] ?? "http://localhost:4000",
-        masterKey: process.env["LITELLM_MASTER_KEY"] ?? "sk-pantheon-local",
-    },
+    // Placeholder — the real values are read from the environment on every
+    // loadConfig() call (see gatewayDefaults), not frozen at import time.
+    gateway: { baseUrl: "http://localhost:4000", masterKey: "sk-pantheon-local" },
     routing: {
         enabled: true,
         tiers: {
@@ -53,11 +52,23 @@ function findConfigPath(): string | null {
     return null;
 }
 
+/**
+ * Gateway address and key from the environment. Read at call time: reading them
+ * once at module load meant a .env loaded (or a variable set) after the first
+ * import of this module was silently ignored.
+ */
+function gatewayDefaults(): PantheonConfig["gateway"] {
+    return {
+        baseUrl: process.env["LITELLM_BASE_URL"] ?? "http://localhost:4000",
+        masterKey: process.env["LITELLM_MASTER_KEY"] ?? "sk-pantheon-local",
+    };
+}
+
 export function loadConfig(): PantheonConfig {
     const configPath = findConfigPath();
 
     if (!configPath) {
-        return DEFAULTS;
+        return { ...DEFAULTS, gateway: gatewayDefaults() };
     }
 
     const raw = fs.readFileSync(configPath, "utf-8");
@@ -77,7 +88,7 @@ export function loadConfig(): PantheonConfig {
         ...DEFAULTS,
         ...parsed,
         models,
-        gateway: { ...DEFAULTS.gateway, ...parsed.gateway },
+        gateway: { ...gatewayDefaults(), ...parsed.gateway },
         routing: {
             ...DEFAULTS.routing,
             ...parsed.routing,

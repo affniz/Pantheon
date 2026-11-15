@@ -281,6 +281,19 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                         break;
                     }
 
+                    case "verification": {
+                        const d = evt.data;
+                        const label = d.round === 0 ? "Verification" : `Verification after fix ${d.round}`;
+                        const outcome = d.passed
+                            ? "✓ passed"
+                            : d.baselineFailing
+                                ? "✗ failing (already failing before this request)"
+                                : "✗ failed";
+                        accumulatedText += `\n🔎 ${label}: ${outcome}\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
                     case "orchestration_done":
                         // Final response arrives via the "text" event — nothing extra needed here
                         break;

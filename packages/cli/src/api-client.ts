@@ -43,6 +43,8 @@ export type ChatSSEEvent =
     | { event: "plan_created"; data: { type: string; plan: Record<string, unknown> } }
     | { event: "review_result"; data: { type: string; approved: boolean; feedback: string; finalResponse: string } }
     | { event: "orchestration_done"; data: { type: string; planId: string; finalResponse: string } }
+    // v0.9: compile/test verification after orchestration (round ≥ 1 follows a fix attempt)
+    | { event: "verification"; data: { type: string; round: number; passed: boolean; summary: string; baselineFailing?: boolean } }
     // v0.7 additions
     | { event: "warning"; data: { message: string } }
     // v0.8 additions
