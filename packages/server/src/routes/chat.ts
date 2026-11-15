@@ -20,6 +20,7 @@ import {
     ABRouter,
     ABStore,
     QualityJudge,
+    eventBus,
 } from "@pantheon/core";
 import type { ABResolution, PermissionDecision } from "@pantheon/core";
 import { scopeUserId } from "../middleware/auth.js";
@@ -104,7 +105,16 @@ chatRouter.post("/", async (c) => {
     }
 
     return streamSSE(c, async (stream) => {
+        // Set once the session is known; until then there is nothing to attribute events to.
+        let liveSessionId: string | undefined;
+        const liveUserId = c.get("user")?.id;
+
         const sendEvent = async (event: string, data: unknown) => {
+            // Mirror to the event bus first, so observers (WebSocket feed) still see the
+            // activity when the requesting client has disconnected mid-turn.
+            if (liveSessionId) {
+                eventBus.publish({ type: event, sessionId: liveSessionId, userId: liveUserId, data });
+            }
             await stream.writeSSE({ event, data: JSON.stringify(data) });
         };
 
@@ -123,6 +133,8 @@ chatRouter.post("/", async (c) => {
                 await sendEvent("error", { message: `Session "${effectiveSessionId}" not found` });
                 return;
             }
+
+            liveSessionId = effectiveSessionId;
 
             // Load existing messages for context
             let messages: ChatMessage[] = await sm.getMessages(effectiveSessionId);

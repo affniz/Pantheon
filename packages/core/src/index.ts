@@ -53,6 +53,8 @@ export { DbStore } from "./db/store.js";
 export { eq, desc, and, sql } from "drizzle-orm";
 export { AuthStore, NotAuthorizedError, hashToken, safeEqual, normalizeEmail, TOKEN_PREFIX } from "./auth/auth-store.js";
 export type { User, UserRole, AuthProvider, ApiTokenInfo } from "./auth/auth-store.js";
+export { EventBus, eventBus } from "./events/event-bus.js";
+export type { PantheonEvent, EventListener } from "./events/event-bus.js";
 export { SessionManager } from "./session/session-manager.js";
 export { SessionSummarizer } from "./session/summarizer.js";
 export { Tracer } from "./tracing/tracer.js";

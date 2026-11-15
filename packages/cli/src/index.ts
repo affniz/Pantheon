@@ -12,7 +12,7 @@ import { listModels, addModel, removeModel, setDefaultModel } from "./commands/m
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
 import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./commands/sessions.js";
 import { traceList, traceShow, traceClear } from "./commands/trace.js";
-import { agentsList, agentsShow, agentsPlan } from "./commands/agents.js";
+import { agentsList, agentsShow, agentsPlan, agentsWatch } from "./commands/agents.js";
 import { pluginsList, pluginsInstall, pluginsRemove, pluginsInfo } from "./commands/plugins.js";
 import { consensusList, consensusShow } from "./commands/consensus.js";
 import { abList, abComparison } from "./commands/ab.js";
@@ -220,6 +220,13 @@ agentsCmd
     .description("Show agent details")
     .argument("<id>", "Agent ID")
     .action(agentsShow);
+
+agentsCmd
+    .command("watch")
+    .description("Follow live agent activity (routing, tool calls, agent lifecycle) as it happens")
+    .option("-s, --session <id>", "Only this session")
+    .option("--json", "Print raw events, one JSON object per line")
+    .action((opts) => agentsWatch(opts));
 
 agentsCmd
     .command("plan")

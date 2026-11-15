@@ -3,8 +3,9 @@ try { (process as any).loadEnvFile(); } catch { /* no .env — ok */ }
 
 import { serve } from "@hono/node-server";
 import { initDb, closeDb, dialectOf, describeTarget, resolveDatabaseTarget, TraceCollector } from "@pantheon/core";
-import { app } from "./app.js";
+import { app, injectWebSocket } from "./app.js";
 import { getAuthConfig } from "./auth/config.js";
+import { closeAllWebSockets } from "./routes/ws.js";
 import { jwtSecret } from "./auth/jwt.js";
 
 const PORT = Number(process.env["PORT"] ?? 3000);
@@ -51,6 +52,8 @@ const server = serve(
     }
 );
 
+injectWebSocket(server);
+
 // Graceful shutdown — stop accepting requests, flush buffered trace spans, then
 // close the database (releases the SQLite WAL / returns Postgres connections).
 let shuttingDown = false;
@@ -60,6 +63,7 @@ const shutdown = (signal: string) => {
     process.stdout.write(`\n[server] received ${signal}, shutting down...\n`);
     // Force-exit after 5 seconds if graceful close hangs
     setTimeout(() => process.exit(1), 5000).unref();
+    closeAllWebSockets(); // long-lived connections would otherwise keep server.close() waiting
     server.close(() => {
         TraceCollector.flush()
             .then(() => closeDb())
