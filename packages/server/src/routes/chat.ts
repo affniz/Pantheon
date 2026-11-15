@@ -134,7 +134,9 @@ chatRouter.post("/", async (c) => {
                 registry,
                 (from, to, reason) => {
                     sendEvent("model_fallback", { from, to, reason }).catch(() => {});
-                }
+                },
+                // Every usage record of this request is attributed to the session
+                { sessionId: effectiveSessionId },
             );
 
             // Build episodic memory context
@@ -319,6 +321,8 @@ chatRouter.post("/", async (c) => {
                         maxConcurrency: 5,
                         maxSubTasks: Math.min(6, Math.max(1, maxSubTasks)),
                         ...(episodicMemory ? { episodicMemory } : {}),
+                        ...(repoMapContent ? { repoMap: repoMapContent } : {}),
+                        refreshRepoMap: () => buildRepoMap(workingDir),
                         onEvent: (event: OrchestrationEvent) => {
                             sendEvent(event.type, event).catch(() => {});
                         },
@@ -376,6 +380,8 @@ chatRouter.post("/", async (c) => {
                         sessionId: effectiveSessionId,
                         ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
                         ...(repoMapContent ? { repoMap: repoMapContent } : {}),
+                        // Rebuilt mid-turn whenever the agent writes a source file
+                        refreshRepoMap: () => buildRepoMap(workingDir),
                         onToolCall,
                         onToolResult,
                     });

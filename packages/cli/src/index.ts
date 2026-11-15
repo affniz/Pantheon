@@ -160,13 +160,15 @@ const costCmd = program.command("cost").description("View usage and cost stats")
 costCmd
     .command("summary", { isDefault: true })
     .description("Show total usage summary (default)")
-    .action(costSummary);
+    .option("-s, --session <id>", "Only usage from this session")
+    .action((opts) => costSummary(opts));
 
 costCmd
     .command("recent")
     .description("Show last 10 calls")
     .option("-n, --num <n>", "Number of calls to show", "10")
-    .action((opts) => costRecent(Number(opts.num)));
+    .option("-s, --session <id>", "Only calls from this session")
+    .action((opts) => costRecent(Number(opts.num), opts.session));
 
 costCmd
     .command("reset")

@@ -78,6 +78,12 @@ export interface ABExperimentConfig {
     controlModelId: string;
     variantModelId: string;
     active: boolean;
+    /**
+     * Restrict the experiment to prompts routed to these complexity tiers, e.g.
+     * `["simple", "standard"]` to compare two coding models without touching
+     * greetings or orchestrated tasks. Omit (or leave empty) to apply to every request.
+     */
+    tiers?: Array<"general" | "simple" | "standard" | "complex">;
 }
 
 /** Global A/B testing configuration */

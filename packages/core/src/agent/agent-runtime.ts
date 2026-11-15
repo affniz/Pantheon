@@ -9,7 +9,16 @@ import type { Gateway } from "../gateway/gateway.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
+import { createHash } from "node:crypto";
 import { Tracer } from "../tracing/tracer.js";
+
+/** Source files whose changes can alter the repo map (it indexes exported TS/JS symbols). */
+const REPO_MAP_SOURCE = /\.(tsx?|jsx?|mts|cts|mjs|cjs)$/i;
+
+/** Short, stable identifier for a system prompt — recorded on traces for A/B attribution. */
+export function hashPrompt(prompt: string): string {
+    return createHash("sha256").update(prompt).digest("hex").slice(0, 12);
+}
 
 const BASE_SYSTEM_PROMPT = `You are Pantheon, an AI assistant with access to tools for interacting with the local filesystem and shell.
 
@@ -72,6 +81,13 @@ export interface AgentConfig {
      * so the agent starts every session with structural awareness of the codebase.
      */
     repoMap?: string;
+    /**
+     * Rebuilds the repo map. When provided, the runtime calls it after any iteration
+     * in which the agent created or edited a source file, and swaps the fresh map
+     * into the system prompt — so symbols added mid-turn are visible to later steps
+     * instead of only after the next request.
+     */
+    refreshRepoMap?: () => Promise<string>;
     /**
      * Maximum total character count of all messages in workingMessages before
      * mid-turn pruning is triggered. When exceeded, the oldest tool-result
@@ -142,6 +158,9 @@ export class AgentRuntime {
         modelId?: string,
         options: AgentRunOptions = {}
     ): Promise<AgentTurnResult> {
+        let systemPromptHash = "";
+        let repoMapRefreshes = 0;
+
         const runFn = async (): Promise<AgentTurnResult> => {
             // Resolve routing once for the entire turn (or reuse the caller's decision)
             const decision = options.decision ?? await this.gateway.resolveRouting(messages, modelId);
@@ -162,10 +181,14 @@ export class AgentRuntime {
                 ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
                 : BASE_SYSTEM_PROMPT;
 
-            // Append the codebase repo map if provided (built at session start)
-            const systemPrompt = this.config.repoMap
-                ? `${systemPromptBase}\n\n## Codebase Map\n${this.config.repoMap}`
-                : systemPromptBase;
+            // Append the codebase repo map if provided (built at session start,
+            // refreshed below whenever the agent changes a source file)
+            const withRepoMap = (map: string | undefined) =>
+                map ? `${systemPromptBase}\n\n## Codebase Map\n${map}` : systemPromptBase;
+            const systemPrompt = withRepoMap(this.config.repoMap);
+            // Hash of the instructions only: the repo map changes with every edit and
+            // would make otherwise-identical prompt versions look different.
+            systemPromptHash = hashPrompt(systemPromptBase);
 
             // Build the working message list with system prompt
             const workingMessages: ChatMessage[] = [
@@ -182,6 +205,7 @@ export class AgentRuntime {
             const ESCALATION_THRESHOLD = 3; // escalate after this many error iterations
             let escalated = false;
             let currentDecision = decision; // may be updated mid-turn on escalation
+            let repoMapDirty = false; // a source file was written since the map was built
 
             const MAX_CONTEXT_CHARS = this.config.maxContextChars ?? 80_000;
 
@@ -434,6 +458,15 @@ export class AgentRuntime {
 
                     if (isError) iterationHadErrors = true;
 
+                    if (
+                        !isError &&
+                        (toolCall.name === "write_file" || toolCall.name === "edit_file") &&
+                        typeof toolCall.arguments["path"] === "string" &&
+                        REPO_MAP_SOURCE.test(toolCall.arguments["path"])
+                    ) {
+                        repoMapDirty = true;
+                    }
+
                     allToolResults.push(result);
                     this.config.onToolResult?.(result);
 
@@ -443,6 +476,23 @@ export class AgentRuntime {
                         content: result.content,
                         toolCallId: toolCall.id,
                     });
+                }
+
+                // ── Repo map refresh ───────────────────────────────────────────────
+                // The map is a snapshot. If this iteration created or edited source
+                // files, rebuild it before the next LLM call.
+                if (this.config.refreshRepoMap && repoMapDirty) {
+                    repoMapDirty = false;
+                    try {
+                        const fresh = await this.config.refreshRepoMap();
+                        workingMessages[0] = { role: "system", content: withRepoMap(fresh) };
+                        repoMapRefreshes++;
+                    } catch (e) {
+                        // Non-fatal — keep working with the previous map
+                        process.stderr.write(
+                            `[agent] repo map refresh failed: ${e instanceof Error ? e.message : String(e)}\n`,
+                        );
+                    }
                 }
 
                 // Track consecutive error iterations for escalation
@@ -498,6 +548,10 @@ export class AgentRuntime {
                     span.attributes.escalated = result.escalated;
                     span.attributes.inputTokens = result.usage.inputTokens;
                     span.attributes.outputTokens = result.usage.outputTokens;
+                    // Prompt versioning: lets A/B and consensus results be attributed
+                    // to the exact instructions that produced them.
+                    span.attributes.systemPromptHash = systemPromptHash;
+                    if (repoMapRefreshes > 0) span.attributes.repoMapRefreshes = repoMapRefreshes;
                     return result;
                 }
             );

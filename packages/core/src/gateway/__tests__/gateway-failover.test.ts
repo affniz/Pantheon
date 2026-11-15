@@ -410,3 +410,68 @@ describe("Gateway — cost computation", () => {
         expect(row?.cost_usd).toBe(0);
     });
 });
+
+describe("Gateway — per-session usage attribution", () => {
+    beforeEach(() => {
+        _testDb = createTestDb(new Database(":memory:"));
+    });
+
+    const okResponse = async () => ({
+        choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+    });
+    const usageRows = () =>
+        rawExecutor(_testDb!).all<{ session_id: string | null; input_tokens: number }>(
+            "SELECT session_id, input_tokens FROM usage_records",
+        );
+    const createSession = async (id: string) => {
+        await rawExecutor(_testDb!).exec(
+            `INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('${id}', 't', 'now', 'now')`,
+        );
+    };
+
+    it("stamps usage with the gateway's sessionId", async () => {
+        await createSession("sess-1");
+        const gateway = new Gateway(makeRegistry() as any, undefined, { ...FAST, sessionId: "sess-1" });
+        patchCompletionsFn(gateway, okResponse);
+        await gateway.complete(MESSAGES, "m");
+        expect(await usageRows()).toEqual([{ session_id: "sess-1", input_tokens: 7 }]);
+    });
+
+    it("falls back to the session of the active trace", async () => {
+        await createSession("traced");
+        const { Tracer } = await import("../../tracing/tracer.js");
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        await Tracer.startTrace("traced", () => gateway.complete(MESSAGES, "m"));
+        expect((await usageRows())[0]?.session_id).toBe("traced");
+    });
+
+    it("records usage without a session when none is known", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        await gateway.complete(MESSAGES, "m");
+        expect(await usageRows()).toEqual([{ session_id: null, input_tokens: 7 }]);
+    });
+
+    it("still records the usage when the session row does not exist", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, { ...FAST, sessionId: "never-saved" });
+        patchCompletionsFn(gateway, okResponse);
+        const result = await gateway.complete(MESSAGES, "m");
+        expect(result.message.content).toBe("ok");
+        expect(await usageRows()).toEqual([{ session_id: null, input_tokens: 7 }]);
+    });
+
+    it("a completely failing usage write never fails the model call", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        (gateway as any).tracker = { record: vi.fn().mockRejectedValue(new Error("disk full")) };
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        try {
+            await expect(gateway.complete(MESSAGES, "m")).resolves.toMatchObject({ message: { content: "ok" } });
+            expect(String(stderr.mock.calls.at(-1)?.[0])).toMatch(/failed to record usage.*disk full/);
+        } finally {
+            stderr.mockRestore();
+        }
+    });
+});

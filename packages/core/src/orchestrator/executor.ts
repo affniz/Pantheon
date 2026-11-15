@@ -18,6 +18,10 @@ export interface ExecutorConfig {
     permissionManager: PermissionManager;
     onToolCall?: (call: ToolCall, safety: "safe" | "destructive") => void;
     onToolResult?: (result: ToolResult) => void;
+    /** Codebase map injected into the agent's system prompt. */
+    repoMap?: string;
+    /** Rebuilds the map after the agent writes source files (see AgentConfig.refreshRepoMap). */
+    refreshRepoMap?: () => Promise<string>;
 }
 
 export interface ExecutorResult {
@@ -89,6 +93,8 @@ Focus only on your assigned task — do not try to complete other tasks.`;
                     joinTrace: true, // join the orchestrator's trace
                     ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
                     ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
+                    ...(this.config.repoMap ? { repoMap: this.config.repoMap } : {}),
+                    ...(this.config.refreshRepoMap ? { refreshRepoMap: this.config.refreshRepoMap } : {}),
                 },
             );
 

@@ -18,6 +18,12 @@ export interface GatewayOptions {
      * `retryBaseDelayMs * N`. Default: 500ms. Tests pass 0 to avoid real sleeps.
      */
     retryBaseDelayMs?: number;
+    /**
+     * Chat session this gateway is serving. Stamped on every usage record so cost
+     * can be broken down per session. When omitted, the session of the active
+     * trace (if any) is used.
+     */
+    sessionId?: string;
 }
 
 /** Number of attempts made against a single model before giving up on it. */
@@ -30,11 +36,13 @@ export class Gateway {
     private tracker: CostTracker;
     private onModelFallback?: ModelFallbackCallback;
     private retryBaseDelayMs: number;
+    private sessionId: string | undefined;
 
     constructor(registry: ModelRegistry, onModelFallback?: ModelFallbackCallback, options: GatewayOptions = {}) {
         this.registry = registry;
         if (onModelFallback !== undefined) this.onModelFallback = onModelFallback;
         this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
+        this.sessionId = options.sessionId;
         const { baseUrl, masterKey } = registry.getGatewayConfig();
 
         this.client = new OpenAI({ baseURL: baseUrl, apiKey: masterKey });
@@ -442,15 +450,26 @@ export class Gateway {
         outputTokens: number,
         messages: ChatMessage[],
     ): Promise<void> {
+        const record = {
+            timestamp: new Date().toISOString(),
+            modelId,
+            inputTokens,
+            outputTokens,
+            costUsd: this.computeCost(modelId, inputTokens, outputTokens),
+            promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
+        };
+        const sessionId = this.sessionId ?? Tracer.currentSessionId();
         try {
-            await this.tracker.record({
-                timestamp: new Date().toISOString(),
-                modelId,
-                inputTokens,
-                outputTokens,
-                costUsd: this.computeCost(modelId, inputTokens, outputTokens),
-                promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-            });
+            if (sessionId) {
+                try {
+                    await this.tracker.record({ ...record, sessionId });
+                    return;
+                } catch {
+                    // The session row may not exist (unsaved chat, deleted mid-turn).
+                    // Losing the attribution is acceptable; losing the usage is not.
+                }
+            }
+            await this.tracker.record(record);
         } catch (err) {
             process.stderr.write(
                 `[gateway] failed to record usage for ${modelId}: ${err instanceof Error ? err.message : String(err)}\n`,

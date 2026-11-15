@@ -151,12 +151,12 @@ export class PantheonApiClient {
 
     // ── Cost ─────────────────────────────────────────────────────────────────
 
-    async getCostSummary(): Promise<{ summary: CostSummary; byModel: Record<string, unknown> }> {
-        return this.get("/api/cost");
+    async getCostSummary(sessionId?: string): Promise<{ summary: CostSummary; byModel: Record<string, unknown> }> {
+        return this.get("/api/cost", sessionId ? { sessionId } : undefined);
     }
 
-    async getCostRecent(n = 10): Promise<UsageRecord[]> {
-        const result = await this.get<{ records: UsageRecord[] }>("/api/cost/recent", { n });
+    async getCostRecent(n = 10, sessionId?: string): Promise<UsageRecord[]> {
+        const result = await this.get<{ records: UsageRecord[] }>("/api/cost/recent", { n, ...(sessionId ? { sessionId } : {}) });
         return result.records;
     }
 

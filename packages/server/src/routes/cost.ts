@@ -6,15 +6,19 @@ export const costRouter = new Hono();
 
 const tracker = new CostTracker();
 
-/** GET /api/cost — total usage summary */
+/** GET /api/cost[?sessionId=…] — usage summary, overall or for one session */
 costRouter.get("/", async (c) => {
-    const [summary, byModel] = await Promise.all([tracker.getSummary(), tracker.getByModel()]);
-    return c.json({ summary, byModel });
+    const sessionId = c.req.query("sessionId") || undefined;
+    const [summary, byModel] = await Promise.all([tracker.getSummary(sessionId), tracker.getByModel(sessionId)]);
+    return c.json({ summary, byModel, ...(sessionId ? { sessionId } : {}) });
 });
 
 /** GET /api/cost/recent — last N records */
 costRouter.get("/recent", async (c) => {
-    const records = await tracker.getRecent(intParam(c.req.query("n"), 10, 1, 1000));
+    const records = await tracker.getRecent(
+        intParam(c.req.query("n"), 10, 1, 1000),
+        c.req.query("sessionId") || undefined,
+    );
     return c.json({ records });
 });
 

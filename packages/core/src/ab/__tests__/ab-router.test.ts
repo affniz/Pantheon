@@ -159,4 +159,50 @@ describe("ABRouter — explicit experimentId", () => {
         expect(router.resolveArm(decision, "s1", "exp-off")).toBeNull();
         expect(router.resolveArm(decision, "s1", "does-not-exist")).toBeNull();
     });
+
+    describe("tier-scoped experiments", () => {
+        const exp = (id: string, tiers?: Array<"general" | "simple" | "standard" | "complex">) => ({
+            id,
+            name: id,
+            splitPercent: 100, // always the variant arm — keeps assertions simple
+            controlModelId: "control",
+            variantModelId: `${id}-variant`,
+            active: true,
+            ...(tiers ? { tiers } : {}),
+        });
+        const decide = (tier: RoutingDecision["tier"]): RoutingDecision => ({ tier, selectedModelId: "m", reason: "test" });
+
+        it("applies only when the prompt's tier is listed", () => {
+            const router = new ABRouter({ experiments: [exp("coding", ["simple", "standard"])] });
+            expect(router.resolveArm(decide("simple"), "s")?.experimentId).toBe("coding");
+            expect(router.resolveArm(decide("standard"), "s")?.experimentId).toBe("coding");
+            expect(router.resolveArm(decide("general"), "s")).toBeNull();
+            expect(router.resolveArm(decide("complex"), "s")).toBeNull();
+        });
+
+        it("an experiment without tiers (or with an empty list) applies to every tier", () => {
+            for (const tiers of [undefined, [] as never[]]) {
+                const router = new ABRouter({ experiments: [exp("all", tiers)] });
+                for (const tier of ["general", "simple", "standard", "complex"] as const) {
+                    expect(router.resolveArm(decide(tier), "s")?.experimentId).toBe("all");
+                }
+            }
+        });
+
+        it("picks the first experiment that covers the tier, skipping ones that do not", () => {
+            const router = new ABRouter({
+                experiments: [exp("general-only", ["general"]), exp("complex-only", ["complex"]), exp("catch-all")],
+            });
+            expect(router.resolveArm(decide("general"), "s")?.experimentId).toBe("general-only");
+            expect(router.resolveArm(decide("complex"), "s")?.experimentId).toBe("complex-only");
+            expect(router.resolveArm(decide("standard"), "s")?.experimentId).toBe("catch-all");
+        });
+
+        it("an explicitly requested experiment is not used outside its tiers", () => {
+            const router = new ABRouter({ experiments: [exp("coding", ["standard"]), exp("catch-all")] });
+            expect(router.resolveArm(decide("standard"), "s", "coding")?.experimentId).toBe("coding");
+            // Must not silently fall through to "catch-all"
+            expect(router.resolveArm(decide("general"), "s", "coding")).toBeNull();
+        });
+    });
 });

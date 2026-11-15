@@ -48,6 +48,10 @@ export interface OrchestratorConfig {
     onToolResult?: AgentConfig["onToolResult"];
     /** Episodic memory to append to system prompts */
     episodicMemory?: string;
+    /** Codebase map handed to every specialist agent (they previously started blind). */
+    repoMap?: string;
+    /** Rebuilds the map after an agent writes source files. */
+    refreshRepoMap?: () => Promise<string>;
 }
 
 export interface OrchestratorResult {
@@ -302,6 +306,8 @@ export class Orchestrator {
                         permissionManager: this.config.permissionManager.fork(),
                         ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
                         ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
+                        ...(this.config.repoMap ? { repoMap: this.config.repoMap } : {}),
+                        ...(this.config.refreshRepoMap ? { refreshRepoMap: this.config.refreshRepoMap } : {}),
                     };
 
                     let execResult: { taskId: string; agentId: string; result: string; toolCalls: ToolCall[]; toolResults: ToolResult[]; iterations: number };

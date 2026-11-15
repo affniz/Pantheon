@@ -101,6 +101,11 @@ export class Tracer {
         });
     }
 
+    /** Returns the session the active trace belongs to, if any. */
+    static currentSessionId(): string | undefined {
+        return traceStorage.getStore()?.sessionId;
+    }
+
     /** Returns the active traceId, or undefined if called outside a trace context. */
     static currentTraceId(): string | undefined {
         return traceStorage.getStore()?.traceId;

@@ -405,4 +405,170 @@ describe("AgentRuntime — run options", () => {
         expect(result.usage).toEqual({ inputTokens: 20, outputTokens: 40 });
         expect(result.iterations).toBe(2);
     });
+
+    describe("repo map refresh (v0.9)", () => {
+        const writeTool = (name: string): Tool => ({
+            definition: {
+                name,
+                description: name,
+                parameters: { type: "object" as const, properties: { path: { type: "string" as const, description: "p" } }, required: ["path"] },
+                safety: "safe" as const,
+            },
+            execute: vi.fn().mockResolvedValue("Successfully wrote 3 lines"),
+        });
+        const call = (id: string, name: string, path: string): ChatMessage => ({
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id, name, arguments: { path } }],
+        });
+        /**
+         * System prompt the gateway saw on its Nth complete() call. Captured at call
+         * time: the runtime passes its live message array, so inspecting the mock's
+         * recorded arguments afterwards would only ever show the final state.
+         */
+        const seenPrompts = new WeakMap<Gateway, string[]>();
+        const systemPromptOf = (gateway: Gateway, n: number): string => seenPrompts.get(gateway)![n]!;
+        const createMockGateway = (responses: ChatMessage[]): Gateway => {
+            const prompts: string[] = [];
+            const queue = [...responses];
+            const gateway = {
+                resolveRouting: vi.fn().mockResolvedValue({ tier: "standard", selectedModelId: "test-model", reason: "mock" }),
+                complete: vi.fn(async (msgs: ChatMessage[]) => {
+                    prompts.push(msgs[0]!.content);
+                    return { message: queue.shift()!, usage: { inputTokens: 1, outputTokens: 1 } };
+                }),
+                stream: vi.fn(),
+            } as unknown as Gateway;
+            seenPrompts.set(gateway, prompts);
+            return gateway;
+        };
+
+        it("rebuilds the map after a source file is written and uses it for the next LLM call", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/new-module.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            const refreshRepoMap = vi.fn().mockResolvedValue("MAP v2: new-module.ts exports fn added()");
+
+            const runtime = new AgentRuntime(gateway, registry, { ...config, repoMap: "MAP v1", refreshRepoMap });
+            await runtime.run([{ role: "user", content: "add a module" }]);
+
+            expect(refreshRepoMap).toHaveBeenCalledTimes(1);
+            expect(systemPromptOf(gateway, 0)).toContain("MAP v1");
+            expect(systemPromptOf(gateway, 1)).toContain("MAP v2: new-module.ts exports fn added()");
+            expect(systemPromptOf(gateway, 1)).not.toContain("MAP v1");
+        });
+
+        it("refreshes once per iteration even when several files are edited", async () => {
+            const gateway = createMockGateway([
+                {
+                    role: "assistant",
+                    content: "",
+                    toolCalls: [
+                        { id: "1", name: "edit_file", arguments: { path: "a.ts" } },
+                        { id: "2", name: "edit_file", arguments: { path: "b.tsx" } },
+                    ],
+                },
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("edit_file"));
+            const refreshRepoMap = vi.fn().mockResolvedValue("fresh");
+
+            await new AgentRuntime(gateway, registry, { ...config, repoMap: "old", refreshRepoMap })
+                .run([{ role: "user", content: "x" }]);
+            expect(refreshRepoMap).toHaveBeenCalledTimes(1);
+        });
+
+        it("does not refresh for non-source files, read-only tools, or failed writes", async () => {
+            const failing = writeTool("edit_file");
+            vi.mocked(failing.execute).mockResolvedValue("Error: targetContent not found");
+            const gateway = createMockGateway([
+                call("1", "write_file", "README.md"),
+                call("2", "testTool", "src/a.ts"),
+                call("3", "edit_file", "src/a.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            registry.register(failing);
+            registry.register(createTestTool());
+            const refreshRepoMap = vi.fn().mockResolvedValue("fresh");
+
+            await new AgentRuntime(gateway, registry, { ...config, repoMap: "old", refreshRepoMap })
+                .run([{ role: "user", content: "x" }]);
+            expect(refreshRepoMap).not.toHaveBeenCalled();
+        });
+
+        it("keeps the previous map when the refresh fails", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/a.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+            try {
+                const result = await new AgentRuntime(gateway, registry, {
+                    ...config,
+                    repoMap: "MAP v1",
+                    refreshRepoMap: vi.fn().mockRejectedValue(new Error("ts-morph blew up")),
+                }).run([{ role: "user", content: "x" }]);
+
+                expect(result.response).toBe("done");
+                expect(systemPromptOf(gateway, 1)).toContain("MAP v1");
+            } finally {
+                stderr.mockRestore();
+            }
+        });
+
+        it("adds a map on refresh even when none was supplied initially", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/first.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+
+            await new AgentRuntime(gateway, registry, { ...config, refreshRepoMap: async () => "BRAND NEW MAP" })
+                .run([{ role: "user", content: "x" }]);
+            expect(systemPromptOf(gateway, 0)).not.toContain("## Codebase Map");
+            expect(systemPromptOf(gateway, 1)).toContain("## Codebase Map\nBRAND NEW MAP");
+        });
+    });
+
+    describe("prompt versioning in traces (v0.9)", () => {
+        async function turnSpanAttributes(cfg: Partial<AgentConfig>): Promise<Record<string, unknown>> {
+            const { TraceCollector } = await import("../../tracing/collector.js");
+            const { TraceStore } = await import("../../tracing/store.js");
+            _testDb = createTestDb(new Database(":memory:"));
+            const gateway = createMockGateway([{ role: "assistant", content: "hi" }]);
+            await new AgentRuntime(gateway, new ToolRegistry(), { ...config, ...cfg }).run([{ role: "user", content: "x" }]);
+            await TraceCollector.flush();
+            const store = new TraceStore(_testDb);
+            const [trace] = await store.listTraces(1);
+            const spans = await store.getSpans(trace!.traceId);
+            return spans.find((s) => s.name === "agent.turn")!.attributes;
+        }
+
+        it("records a stable hash of the system prompt on the agent.turn span", async () => {
+            const { hashPrompt } = await import("../agent-runtime.js");
+            const a = await turnSpanAttributes({});
+            const b = await turnSpanAttributes({});
+            expect(a["systemPromptHash"]).toMatch(/^[0-9a-f]{12}$/);
+            expect(a["systemPromptHash"]).toBe(b["systemPromptHash"]);
+            expect(hashPrompt("x")).toBe(hashPrompt("x"));
+            expect(hashPrompt("x")).not.toBe(hashPrompt("y"));
+        });
+
+        it("changes when the instructions change, but not when only the repo map does", async () => {
+            const base = await turnSpanAttributes({});
+            const custom = await turnSpanAttributes({ systemPrompt: "Always answer in French." });
+            const withMap = await turnSpanAttributes({ repoMap: "some map" });
+            expect(custom["systemPromptHash"]).not.toBe(base["systemPromptHash"]);
+            expect(withMap["systemPromptHash"]).toBe(base["systemPromptHash"]);
+        });
+    });
 });

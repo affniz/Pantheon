@@ -1,4 +1,4 @@
-import { desc, count, sum } from "drizzle-orm";
+import { desc, eq, count, sum } from "drizzle-orm";
 import type { UsageRecord } from "@pantheon/shared";
 import { DbStore } from "../db/store.js";
 
@@ -12,10 +12,14 @@ export class CostTracker extends DbStore {
             outputTokens: usage.outputTokens,
             costUsd: usage.costUsd,
             promptPreview: usage.promptPreview,
+            ...(usage.sessionId ? { sessionId: usage.sessionId } : {}),
         });
     }
 
-    async getSummary(): Promise<{ totalCalls: number; totalInputTokens: number; totalOutputTokens: number; totalCostUsd: number }> {
+    /**
+     * Totals for all usage, or for a single session when `sessionId` is given.
+     */
+    async getSummary(sessionId?: string): Promise<{ totalCalls: number; totalInputTokens: number; totalOutputTokens: number; totalCostUsd: number }> {
         const { usageRecords } = this.t;
         // Aggregates come back as numbers on SQLite but as strings on PostgreSQL
         // (COUNT/SUM are bigint/numeric there), hence the Number() coercion.
@@ -26,7 +30,8 @@ export class CostTracker extends DbStore {
                 totalOutputTokens: sum(usageRecords.outputTokens),
                 totalCostUsd: sum(usageRecords.costUsd),
             })
-            .from(usageRecords);
+            .from(usageRecords)
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined);
         return {
             totalCalls: Number(row?.totalCalls ?? 0),
             totalInputTokens: Number(row?.totalInputTokens ?? 0),
@@ -35,7 +40,7 @@ export class CostTracker extends DbStore {
         };
     }
 
-    async getByModel(): Promise<Record<string, { calls: number; inputTokens: number; outputTokens: number; costUsd: number }>> {
+    async getByModel(sessionId?: string): Promise<Record<string, { calls: number; inputTokens: number; outputTokens: number; costUsd: number }>> {
         const { usageRecords } = this.t;
         const rows = await this.db
             .select({
@@ -46,6 +51,7 @@ export class CostTracker extends DbStore {
                 costUsd: sum(usageRecords.costUsd),
             })
             .from(usageRecords)
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined)
             .groupBy(usageRecords.modelId);
 
         return Object.fromEntries(
@@ -61,11 +67,12 @@ export class CostTracker extends DbStore {
         );
     }
 
-    async getRecent(n = 10): Promise<UsageRecord[]> {
+    async getRecent(n = 10, sessionId?: string): Promise<UsageRecord[]> {
         const { usageRecords } = this.t;
         return this.db
             .select()
             .from(usageRecords)
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined)
             .orderBy(desc(usageRecords.id))
             .limit(n);
     }

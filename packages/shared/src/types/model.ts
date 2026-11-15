@@ -29,4 +29,6 @@ export interface UsageRecord {
     outputTokens: number;
     costUsd: number;
     promptPreview: string;
+    /** Chat session the call belongs to, when known — enables per-session cost. */
+    sessionId?: string | null | undefined;
 }

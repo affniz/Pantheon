@@ -19,6 +19,10 @@ export interface CoderConfig {
     permissionManager: PermissionManager;
     onToolCall?: (call: ToolCall, safety: "safe" | "destructive") => void;
     onToolResult?: (result: ToolResult) => void;
+    /** Codebase map injected into the agent's system prompt. */
+    repoMap?: string;
+    /** Rebuilds the map after the agent writes source files (see AgentConfig.refreshRepoMap). */
+    refreshRepoMap?: () => Promise<string>;
 }
 
 export interface CoderResult {
@@ -92,6 +96,8 @@ Guidelines:
                     joinTrace: true,
                     ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
                     ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
+                    ...(this.config.repoMap ? { repoMap: this.config.repoMap } : {}),
+                    ...(this.config.refreshRepoMap ? { refreshRepoMap: this.config.refreshRepoMap } : {}),
                 },
             );
 
