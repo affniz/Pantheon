@@ -122,6 +122,21 @@ export class OrchestrationStore extends DbStore {
         );
     }
 
+    /** Add a sub-task to an existing plan (e.g. a fix task created after verification failed). */
+    async addSubTask(planId: string, task: { id: string; title: string; description: string; dependencies: string[]; taskRole?: string | undefined }): Promise<void> {
+        const { subTasks } = this.t;
+        await this.db.insert(subTasks).values({
+            id: task.id,
+            planId,
+            title: task.title,
+            description: task.description,
+            dependencies: JSON.stringify(task.dependencies),
+            taskRole: task.taskRole ?? "general",
+            status: "pending",
+            createdAt: new Date().toISOString(),
+        });
+    }
+
     /** Update a sub-task's lifecycle fields. Only the provided fields are written. */
     async updateSubTask(
         taskId: string,

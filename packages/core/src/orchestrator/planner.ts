@@ -36,6 +36,8 @@ export interface PlannerConfig {
     parentAgentId?: string;
     /** Maximum number of sub-tasks to generate. Default: 3. Clamped to 1–6. */
     maxSubTasks?: number;
+    /** Background the planner should know: repo map, memory of earlier sessions. */
+    context?: string;
 }
 
 /**
@@ -72,6 +74,9 @@ export class PlannerAgent {
                 // Call the LLM to decompose the prompt
                 const messages: ChatMessage[] = [
                     { role: "system", content: buildPlannerPrompt(Math.min(6, Math.max(1, this.config.maxSubTasks ?? 3))) },
+                    ...(this.config.context
+                        ? [{ role: "system" as const, content: `Background (for planning only):\n${this.config.context}` }]
+                        : []),
                     { role: "user", content: prompt },
                 ];
 

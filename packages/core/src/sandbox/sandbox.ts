@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import type { SandboxConfig as SandboxSettings } from "@pantheon/shared";
 import { DockerExecutor, HostExecutor, type CommandExecutor, type ExecResult } from "./executor.js";
+import type { FileCoordinator } from "./file-coordinator.js";
 
 export interface ShellAllowlistEntry {
     /** Command binary name (e.g. "git", "ls", "npm") */
@@ -215,6 +216,8 @@ export class Sandbox {
     private readonly allowlist: AllowlistConfig;
     /** Where validated shell commands run (host process or throw-away container). */
     readonly executor: CommandExecutor;
+    /** Set on the per-agent views created by `forAgent()` during orchestration. */
+    private writer: { agentId: string; coordinator: FileCoordinator } | undefined;
 
     constructor(config: SandboxConfig) {
         const resolved = path.resolve(config.projectRoot);
@@ -270,6 +273,26 @@ export class Sandbox {
                 })
                 : new HostExecutor(),
         });
+    }
+
+    /**
+     * A view of this sandbox for one agent of a multi-agent run. It behaves
+     * identically, except that file writes go through `coordinator`, which
+     * serialises them per file and stops agents overwriting each other's work.
+     */
+    forAgent(agentId: string, coordinator: FileCoordinator): Sandbox {
+        const view = Object.create(this) as Sandbox;
+        view.writer = { agentId, coordinator };
+        return view;
+    }
+
+    /**
+     * Wrap a file write. Outside orchestration this simply runs `write`; inside,
+     * it is coordinated with the other agents (see FileCoordinator).
+     */
+    async guardWrite<T>(resolvedPath: string, mode: "create" | "edit", write: () => T | Promise<T>): Promise<T> {
+        if (!this.writer) return write();
+        return this.writer.coordinator.withWrite(resolvedPath, this.writer.agentId, mode, write);
     }
 
     /**

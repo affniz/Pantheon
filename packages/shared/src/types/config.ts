@@ -9,6 +9,12 @@ export interface ModelConfig {
      * When omitted, cost is recorded as 0 (tokens are still tracked).
      */
     pricing?: ModelPricing;
+    /**
+     * Extra request parameters sent with every completion for this model — e.g.
+     * `{ thinking: { type: "enabled" }, reasoning_effort: "high" }` for a reasoning
+     * model. Provider-specific knobs belong here, not in code.
+     */
+    extraParams?: Record<string, unknown>;
 }
 
 /** Per-token pricing in USD per 1M tokens. */

@@ -75,7 +75,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                                 const session = await client.getSession(targetId);
                                 setSessionId(session.id);
                                 const msgs = await client.getSessionMessages(session.id);
-                                setMessages(msgs);
+                                // Tool calls and results are part of the stored transcript; show the conversation only
+                                setMessages(msgs.filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== ""));
                             } catch {
                                 // Session not found — start fresh
                                 setSessionId(null);
@@ -87,7 +88,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                                 const session = sessions[0];
                                 setSessionId(session.id);
                                 const msgs = await client.getSessionMessages(session.id);
-                                setMessages(msgs);
+                                // Tool calls and results are part of the stored transcript; show the conversation only
+                                setMessages(msgs.filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== ""));
                             }
                         }
                     }

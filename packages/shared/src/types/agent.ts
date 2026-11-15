@@ -58,4 +58,10 @@ export type OrchestrationEvent =
     | { type: "agent_failed"; agentId: string; error: string }
     | { type: "plan_created"; plan: TaskPlan }
     | { type: "review_result"; approved: boolean; feedback: string; finalResponse: string }
+    /**
+     * Compile/test verification ran. `round` 0 is the check after the planned tasks;
+     * rounds ≥ 1 follow a fix attempt. `baselineFailing` means the project was
+     * already failing before the run, so no fix is attempted.
+     */
+    | { type: "verification"; round: number; passed: boolean; summary: string; baselineFailing?: boolean }
     | { type: "orchestration_done"; planId: string; finalResponse: string };

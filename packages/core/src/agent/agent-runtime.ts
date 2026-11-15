@@ -57,6 +57,13 @@ export interface AgentConfig {
     /** Called when a tool returns a result (for UI rendering) */
     onToolResult?: (result: ToolResult) => void;
     /**
+     * Receives the assistant's text as it is generated — both the commentary it
+     * writes before calling tools and the final answer. When set, every character
+     * of `AgentTurnResult.response` is guaranteed to have passed through here, so a
+     * caller that streams must not send the response again afterwards.
+     */
+    onText?: (delta: string) => void;
+    /**
      * Optional traceId to associate this agent turn with an existing trace.
      * If provided, spans from this turn are recorded under that traceId.
      */
@@ -112,6 +119,13 @@ export interface AgentTurnResult {
     escalated: boolean;
     /** Token usage summed across every LLM call made during this turn */
     usage: { inputTokens: number; outputTokens: number };
+    /**
+     * Everything this turn added to the conversation, in order: assistant messages
+     * with their tool calls, the tool results, and the final assistant message.
+     * Persist these (not just `response`) so a follow-up turn can see what the
+     * agent read and did.
+     */
+    messages: ChatMessage[];
 }
 
 export interface AgentRunOptions {
@@ -175,6 +189,48 @@ export class AgentRuntime {
                 usage.inputTokens += result.usage?.inputTokens ?? 0;
                 usage.outputTokens += result.usage?.outputTokens ?? 0;
                 return result;
+            };
+
+            // Like complete(), but the assistant's text is forwarded to onText as it
+            // arrives. If the gateway produced the message without streaming (a mock,
+            // or a provider fallback), the text is forwarded in one piece instead, so
+            // onText always sees the whole message exactly once.
+            let textEmitted = false; // anything sent to onText so far this turn
+            const completeLive = async (
+                msgs: ChatMessage[],
+                model: string,
+                tools?: ReturnType<ToolRegistry["toOpenAITools"]>,
+            ) => {
+                const onText = this.config.onText;
+                if (!onText) return complete(msgs, model, tools);
+
+                let streamed = "";
+                const result = await this.gateway.complete(msgs, model, tools, {
+                    onToken: (delta) => {
+                        // Separate this message from text of an earlier iteration
+                        if (streamed === "" && textEmitted) onText("\n\n");
+                        streamed += delta;
+                        textEmitted = true;
+                        onText(delta);
+                    },
+                });
+                usage.inputTokens += result.usage?.inputTokens ?? 0;
+                usage.outputTokens += result.usage?.outputTokens ?? 0;
+
+                const content = result.message.content ?? "";
+                if (streamed === "" && content !== "") {
+                    if (textEmitted) onText("\n\n");
+                    textEmitted = true;
+                    onText(content);
+                }
+                return result;
+            };
+
+            /** Messages produced during this turn (returned as AgentTurnResult.messages). */
+            const transcript: ChatMessage[] = [];
+            const finish = (response: string, extra: Omit<AgentTurnResult, "response" | "messages" | "usage" | "toolCalls" | "toolResults">): AgentTurnResult => {
+                transcript.push({ role: "assistant", content: response, timestamp: new Date() });
+                return { response, toolCalls: allToolCalls, toolResults: allToolResults, usage, messages: transcript, ...extra };
             };
 
             const systemPromptBase = this.config.systemPrompt
@@ -251,7 +307,8 @@ export class AgentRuntime {
                                     },
                                     { role: "user", content: combinedContent },
                                 ],
-                                "llama-smart", // fast, cheap summarization model
+                                // The general-tier model: fast and cheap is what a summary needs
+                                this.gateway.getRoutingConfig().tiers.general,
                             );
 
                             const summary = summaryResp.message.content;
@@ -309,7 +366,7 @@ export class AgentRuntime {
                 // Send to LLM with tool definitions
                 let message: ChatMessage;
                 try {
-                    const result = await complete(
+                    const result = await completeLive(
                         workingMessages,
                         currentDecision.selectedModelId,
                         tools.length > 0 ? tools : undefined
@@ -328,37 +385,22 @@ export class AgentRuntime {
                             "Please summarize what you accomplished so far and provide a final response without calling any more tools.",
                         toolCallId: syntheticId,
                     });
-                    const fallback = await complete(
+                    const fallback = await completeLive(
                         workingMessages,
                         currentDecision.selectedModelId
                         // No tools — force plain text
                     );
-                    return {
-                        response: fallback.message.content,
-                        toolCalls: allToolCalls,
-                        toolResults: allToolResults,
-                        decision: currentDecision,
-                        iterations,
-                        escalated,
-                        usage,
-                    };
+                    return finish(fallback.message.content, { decision: currentDecision, iterations, escalated });
                 }
 
                 // If no tool calls → this is the final response
                 if (!message.toolCalls || message.toolCalls.length === 0) {
-                    return {
-                        response: message.content,
-                        toolCalls: allToolCalls,
-                        toolResults: allToolResults,
-                        decision: currentDecision,
-                        iterations,
-                        escalated,
-                        usage,
-                    };
+                    return finish(message.content, { decision: currentDecision, iterations, escalated });
                 }
 
                 // LLM wants to call tools — add the assistant message to history
                 workingMessages.push(message);
+                transcript.push({ ...message, timestamp: new Date() });
 
                 // Track whether this iteration produced any errors
                 let iterationHadErrors = false;
@@ -383,6 +425,7 @@ export class AgentRuntime {
                             content: result.content,
                             toolCallId: toolCall.id,
                         });
+                        transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
                         iterationHadErrors = true;
                         continue;
                     }
@@ -414,6 +457,7 @@ export class AgentRuntime {
                             content: result.content,
                             toolCallId: toolCall.id,
                         });
+                        transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
                         iterationHadErrors = true;
                         continue;
                     }
@@ -476,6 +520,7 @@ export class AgentRuntime {
                         content: result.content,
                         toolCallId: toolCall.id,
                     });
+                    transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
                 }
 
                 // ── Repo map refresh ───────────────────────────────────────────────
@@ -511,21 +556,13 @@ export class AgentRuntime {
                     "Please provide your final response based on the information gathered so far.",
             });
 
-            const { message: finalMessage } = await complete(
+            const { message: finalMessage } = await completeLive(
                 workingMessages,
                 currentDecision.selectedModelId
                 // No tools — force a text response
             );
 
-            return {
-                response: finalMessage.content,
-                toolCalls: allToolCalls,
-                toolResults: allToolResults,
-                decision: currentDecision,
-                iterations,
-                escalated,
-                usage,
-            };
+            return finish(finalMessage.content, { decision: currentDecision, iterations, escalated });
         }; // end runFn
 
 

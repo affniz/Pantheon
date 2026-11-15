@@ -55,40 +55,44 @@ export const editFileTool: Tool = {
         try {
             const resolved = sandbox.resolvePath(filePath);
 
-            // Read the file
-            let original: string;
-            try {
-                original = fs.readFileSync(resolved, "utf-8");
-            } catch (readError) {
-                const message = readError instanceof Error ? readError.message : String(readError);
-                return `Error reading file: ${message}`;
-            }
+            // Read-modify-write as one step: during orchestration another agent may be
+            // editing the same file, and the two must not interleave.
+            return await sandbox.guardWrite(resolved, "edit", () => {
+                // Read the file
+                let original: string;
+                try {
+                    original = fs.readFileSync(resolved, "utf-8");
+                } catch (readError) {
+                    const message = readError instanceof Error ? readError.message : String(readError);
+                    return `Error reading file: ${message}`;
+                }
 
-            // Check that targetContent is present
-            const idx = original.indexOf(targetContent);
-            if (idx === -1) {
+                // Check that targetContent is present
+                const idx = original.indexOf(targetContent);
+                if (idx === -1) {
+                    return (
+                        `Error: targetContent not found in ${resolved}. ` +
+                        `The string you provided does not exist verbatim in the file. ` +
+                        `Use read_file to inspect the current contents and try again.`
+                    );
+                }
+
+                // Replace the first occurrence
+                const edited =
+                    original.slice(0, idx) +
+                    replacementContent +
+                    original.slice(idx + targetContent.length);
+
+                fs.writeFileSync(resolved, edited, "utf-8");
+
+                const oldLines = targetContent.split("\n").length;
+                const newLines = replacementContent.split("\n").length;
+
                 return (
-                    `Error: targetContent not found in ${resolved}. ` +
-                    `The string you provided does not exist verbatim in the file. ` +
-                    `Use read_file to inspect the current contents and try again.`
+                    `Successfully edited ${resolved}: ` +
+                    `replaced ${oldLines} line(s) with ${newLines} line(s) at position ${idx}.`
                 );
-            }
-
-            // Replace the first occurrence
-            const edited =
-                original.slice(0, idx) +
-                replacementContent +
-                original.slice(idx + targetContent.length);
-
-            fs.writeFileSync(resolved, edited, "utf-8");
-
-            const oldLines = targetContent.split("\n").length;
-            const newLines = replacementContent.split("\n").length;
-
-            return (
-                `Successfully edited ${resolved}: ` +
-                `replaced ${oldLines} line(s) with ${newLines} line(s) at position ${idx}.`
-            );
+            });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return `Error editing file: ${message}`;

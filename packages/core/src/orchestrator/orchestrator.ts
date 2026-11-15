@@ -19,6 +19,9 @@ import { ExecutorAgent } from "./executor.js";
 import { CoderAgent } from "./coder.js";
 import { DebuggerAgent } from "./debugger.js";
 import { ReviewerAgent } from "./reviewer.js";
+import { runVerification, type VerificationResult } from "./verifier.js";
+import { FileCoordinator } from "../sandbox/file-coordinator.js";
+import type { SpecialistCommon } from "./specialist.js";
 import type { AgentConfig } from "../agent/agent-runtime.js";
 
 export interface OrchestratorConfig {
@@ -52,6 +55,15 @@ export interface OrchestratorConfig {
     repoMap?: string;
     /** Rebuilds the map after an agent writes source files. */
     refreshRepoMap?: () => Promise<string>;
+    /**
+     * After the planned tasks, the project is compiled and tested. When that fails
+     * because of this run's changes, a debugger agent is given the failure output
+     * and asked to fix it — up to this many times. 0 disables fixing (verification
+     * is still reported). Default: 2.
+     */
+    maxFixRounds?: number;
+    /** Receives the reviewer's final answer as it is generated. */
+    onText?: (delta: string) => void;
 }
 
 export interface OrchestratorResult {
@@ -61,6 +73,12 @@ export interface OrchestratorResult {
     finalResponse: string;
     reviewApproved: boolean;
     reviewFeedback: string;
+    /** Outcome of the final compile/test verification. */
+    verification: VerificationResult;
+    /** Automatic fix attempts made after verification failed. */
+    fixRounds: number;
+    /** True when the reviewer's answer was streamed through `onText`. */
+    streamed: boolean;
 }
 
 /**
@@ -74,7 +92,9 @@ export interface OrchestratorResult {
  *              "code"    → CoderAgent    (deepseek-v4-pro, coding-optimised prompt)
  *              "debug"   → DebuggerAgent (deepseek-v4-pro, debug-optimised prompt)
  *              "general" → ExecutorAgent (deepseek-v4-pro, generic prompt)
- * 4. Review — ReviewerAgent (deepseek-v4-pro) synthesizes all results
+ * 4. Verify — compile and run the tests; if this run broke them, a DebuggerAgent
+ *             is given the failures and asked to fix them (bounded retries)
+ * 5. Review — ReviewerAgent synthesizes all results and the verification outcome
  */
 export class Orchestrator {
     private config: OrchestratorConfig;
@@ -102,6 +122,11 @@ export class Orchestrator {
                 span.attributes.agentId = orchestratorAgentId;
 
                 try {
+                    const maxFixRounds = Math.max(0, this.config.maxFixRounds ?? 2);
+                    // Shared by every agent of this run: serialises writes per file and
+                    // records which files were touched.
+                    const files = new FileCoordinator();
+
                     // ── 1. Plan ──────────────────────────────────────
                     const planner = new PlannerAgent({
                         gateway: this.config.gateway,
@@ -109,9 +134,20 @@ export class Orchestrator {
                         sessionId: this.config.sessionId,
                         parentAgentId: orchestratorAgentId,
                         maxSubTasks: this.config.maxSubTasks ?? 3,
+                        ...(this.planningContext() ? { context: this.planningContext()! } : {}),
                     });
 
-                    const plan = await planner.plan(prompt);
+                    // Baseline verification runs while the planner thinks, and finishes
+                    // before any agent touches a file. It tells us whether the project
+                    // was healthy to begin with — without it, pre-existing failures would
+                    // be blamed on (and "fixed" by) this run.
+                    const baselinePromise: Promise<VerificationResult | undefined> = maxFixRounds > 0
+                        ? runVerification(this.config.sandbox).catch(() => undefined)
+                        : Promise.resolve(undefined);
+
+                    const [plan, baseline] = await Promise.all([planner.plan(prompt), baselinePromise]);
+                    const baselineFailing = baseline !== undefined && baseline.ran && !baseline.passed;
+                    span.attributes.baselineFailing = baselineFailing;
 
                     this.emit({ type: "plan_created", plan });
                     this.emit({
@@ -137,11 +173,14 @@ export class Orchestrator {
                             messages,
                             orchestratorAgentId,
                             taskResults,
+                            files,
                         );
 
                         for (const result of results) {
                             taskResults.set(result.id, result);
                         }
+                        // The next wave (and any fix agent) builds on these files
+                        files.endPhase();
                     }
 
                     // Collect final task states
@@ -149,16 +188,51 @@ export class Orchestrator {
                         taskResults.get(t.id) ?? { ...t, status: "cancelled" as const },
                     );
 
-                    // ── 4. Review ────────────────────────────────────
+                    // ── 4. Verify, and fix what this run broke ───────
+                    let verification = await runVerification(this.config.sandbox);
+                    this.emitVerification(0, verification, baselineFailing);
+
+                    let fixRounds = 0;
+                    while (
+                        !verification.passed &&
+                        !baselineFailing &&        // do not "fix" failures that were already there
+                        files.hasWrites &&         // nor failures this run cannot have caused
+                        fixRounds < maxFixRounds
+                    ) {
+                        fixRounds++;
+                        const fixTask = await this.runFixTask(plan, verification, fixRounds, orchestratorAgentId, files);
+                        completedTasks.push(fixTask);
+                        files.endPhase();
+
+                        verification = await runVerification(this.config.sandbox);
+                        this.emitVerification(fixRounds, verification, false);
+                    }
+                    span.attributes.fixRounds = fixRounds;
+                    span.attributes.verificationPassed = verification.passed;
+
+                    // ── 5. Review ────────────────────────────────────
+                    let streamed = false;
+                    const onText = this.config.onText;
                     const reviewer = new ReviewerAgent({
                         gateway: this.config.gateway,
                         reviewerModelId: this.config.reviewerModelId,
                         sessionId: this.config.sessionId,
                         parentAgentId: orchestratorAgentId,
                         sandbox: this.config.sandbox,
+                        ...(onText
+                            ? {
+                                onText: (delta: string) => {
+                                    streamed = true;
+                                    onText(delta);
+                                },
+                            }
+                            : {}),
                     });
 
-                    const reviewResult = await reviewer.review(plan, completedTasks);
+                    const reviewResult = await reviewer.review(plan, completedTasks, verification, {
+                        baselineFailing,
+                        fixRounds,
+                    });
 
                     this.emit({
                         type: "review_result",
@@ -185,6 +259,9 @@ export class Orchestrator {
                         finalResponse: reviewResult.finalResponse,
                         reviewApproved: reviewResult.approved,
                         reviewFeedback: reviewResult.feedback,
+                        verification,
+                        fixRounds,
+                        streamed,
                     };
                 } catch (error) {
                     await store.failAgent(orchestratorAgentId, error);
@@ -207,6 +284,7 @@ export class Orchestrator {
         messages: ChatMessage[],
         orchestratorAgentId: string,
         previousResults: Map<string, SubTask>,
+        files: FileCoordinator,
     ): Promise<SubTask[]> {
         // Filter out tasks whose dependencies failed
         const runnableTasks = wave.filter((task) => {
@@ -295,20 +373,7 @@ export class Orchestrator {
                         },
                     ];
 
-                    const commonConfig = {
-                        gateway: this.config.gateway,
-                        sessionId: this.config.sessionId,
-                        parentAgentId: orchestratorAgentId,
-                        sandbox: this.config.sandbox,
-                        // Each sub-agent gets its own PermissionManager forked from the parent,
-                        // pre-seeded with the session's existing grants so previously approved
-                        // tools don't re-prompt — but concurrent agents don't race on shared state.
-                        permissionManager: this.config.permissionManager.fork(),
-                        ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
-                        ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
-                        ...(this.config.repoMap ? { repoMap: this.config.repoMap } : {}),
-                        ...(this.config.refreshRepoMap ? { refreshRepoMap: this.config.refreshRepoMap } : {}),
-                    };
+                    const commonConfig = this.specialistConfig(orchestratorAgentId, files);
 
                     let execResult: { taskId: string; agentId: string; result: string; toolCalls: ToolCall[]; toolResults: ToolResult[]; iterations: number };
 
@@ -378,6 +443,105 @@ export class Orchestrator {
             }));
 
         return [...results, ...cancelledTasks];
+    }
+
+    /** Configuration shared by every specialist agent of a run. */
+    private specialistConfig(orchestratorAgentId: string, files: FileCoordinator): SpecialistCommon {
+        return {
+            gateway: this.config.gateway,
+            sessionId: this.config.sessionId,
+            parentAgentId: orchestratorAgentId,
+            sandbox: this.config.sandbox,
+            // Each sub-agent gets its own PermissionManager forked from the parent,
+            // pre-seeded with the session's existing grants so previously approved
+            // tools don't re-prompt — but concurrent agents don't race on shared state.
+            permissionManager: this.config.permissionManager.fork(),
+            fileCoordinator: files,
+            // The session's tools, plugins and MCP servers included; built-ins when empty
+            toolRegistry: this.config.toolRegistry,
+            ...(this.config.episodicMemory ? { memory: this.config.episodicMemory } : {}),
+            ...(this.config.onToolCall ? { onToolCall: this.config.onToolCall } : {}),
+            ...(this.config.onToolResult ? { onToolResult: this.config.onToolResult } : {}),
+            ...(this.config.repoMap ? { repoMap: this.config.repoMap } : {}),
+            ...(this.config.refreshRepoMap ? { refreshRepoMap: this.config.refreshRepoMap } : {}),
+        };
+    }
+
+    /** What the planner is told besides the prompt: project structure and memory. */
+    private planningContext(): string | undefined {
+        const parts = [
+            this.config.repoMap ? `## Codebase Map\n${this.config.repoMap.slice(0, 6000)}` : "",
+            this.config.episodicMemory ?? "",
+        ].filter(Boolean);
+        return parts.length > 0 ? parts.join("\n\n") : undefined;
+    }
+
+    private emitVerification(round: number, verification: VerificationResult, baselineFailing: boolean): void {
+        this.emit({
+            type: "verification",
+            round,
+            passed: verification.passed,
+            summary: verification.notes.join("; "),
+            ...(baselineFailing ? { baselineFailing: true } : {}),
+        });
+    }
+
+    /**
+     * Hand the verification failures to a debugger agent. The attempt is recorded
+     * as an extra sub-task of the plan, so it shows up in `pantheon agents plan`.
+     * A fix agent that itself fails does not abort the run — the failure is
+     * reported and the next verification decides what happens.
+     */
+    private async runFixTask(
+        plan: TaskPlan,
+        verification: VerificationResult,
+        round: number,
+        orchestratorAgentId: string,
+        files: FileCoordinator,
+    ): Promise<SubTask> {
+        const changed = files.writtenFiles().map((f) => `  - ${f.path}`).join("\n");
+        const task: SubTask = {
+            id: `${plan.planId}_fix-${round}`,
+            title: `Fix verification failures (round ${round})`,
+            description:
+                "The changes made for this request broke the project's checks, which passed before. " +
+                "Find the cause and fix it with the smallest change that makes the checks pass again. " +
+                "Do not weaken, skip or delete tests to get there.\n\n" +
+                `Files changed during this request:\n${changed}\n\n` +
+                `Failing checks:\n${verification.failures}`,
+            dependencies: [],
+            status: "pending",
+            taskRole: "debug",
+        };
+        await new OrchestrationStore().addSubTask(plan.planId, task);
+
+        this.emit({
+            type: "agent_spawned",
+            agent: {
+                agentId: task.id,
+                role: "debugger",
+                modelId: this.config.agentModelId,
+                parentAgentId: orchestratorAgentId,
+                sessionId: this.config.sessionId,
+                taskId: task.id,
+                status: "running",
+                startTime: Date.now(),
+            },
+        });
+
+        try {
+            const agent = new DebuggerAgent({
+                ...this.specialistConfig(orchestratorAgentId, files),
+                debuggerModelId: this.config.agentModelId,
+            });
+            const result = await agent.execute(task, [{ role: "user", content: plan.originalPrompt }]);
+            this.emit({ type: "agent_completed", agentId: result.agentId, result: result.result });
+            return { ...task, status: "completed", result: result.result, agentId: result.agentId };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.emit({ type: "agent_failed", agentId: task.id, error: message });
+            return { ...task, status: "failed", error: message };
+        }
     }
 
     /**
