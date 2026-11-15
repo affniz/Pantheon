@@ -173,6 +173,34 @@ export interface SandboxConfig {
     additionalAllowlist: ShellAllowlistEntry[];
     /** Command binary names to remove from the default allowlist */
     denyFromDefault: string[];
+    /** Where shell commands issued by agents run (v0.9). Default: on the host. */
+    execution?: ExecutionConfig;
+}
+
+/**
+ * Execution backend for the `shell` tool and the reviewer's verification commands.
+ *
+ * `host` runs them as ordinary processes of the Pantheon server — fine for a
+ * single user on their own machine. `docker` runs each command in a throw-away
+ * container that can see only the project directory: use it whenever the server
+ * is reachable by other people.
+ */
+export interface ExecutionConfig {
+    mode: "host" | "docker";
+    /** Container image with the project's toolchain. Default: node:22-slim */
+    image?: string;
+    /** "none" (default) blocks all network access; "bridge" allows outbound connections. */
+    network?: "none" | "bridge";
+    /** Memory limit in docker syntax, e.g. "2g". Default: 2g */
+    memory?: string;
+    /** CPU limit. Default: 2 */
+    cpus?: number;
+    /** Process limit inside the container. Default: 512 */
+    pidsLimit?: number;
+    /** Mount the project read-only for shell commands. Default: false */
+    readOnlyProject?: boolean;
+    /** Path of the docker (or podman) binary. Default: "docker" */
+    dockerPath?: string;
 }
 
 export interface PluginsConfig {

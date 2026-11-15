@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
 import type { SubTask, TaskPlan, ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
@@ -38,19 +37,29 @@ export interface ReviewResult {
     agentId: string;
 }
 
-/** Run a command and return { success, output } */
+/**
+ * Run a verification command and return { success, output }.
+ *
+ * These are fixed commands chosen by Pantheon (not by the model), so they skip the
+ * allowlist — but they go through the sandbox's executor like any shell command:
+ * in docker mode the project's test suite runs inside the container, and on the
+ * host it runs with credentials stripped from its environment. A test suite is
+ * arbitrary code from the project; it used to inherit every API key.
+ */
 async function runCheck(
+    sandbox: Sandbox,
     bin: string,
     args: string[],
-    cwd: string,
     timeoutMs = 60_000,
 ): Promise<{ success: boolean; output: string }> {
-    return new Promise((resolve) => {
-        execFile(bin, args, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 512 }, (err, stdout, stderr) => {
-            const output = [stdout, stderr].filter(Boolean).join("\n").trim();
-            resolve({ success: !err, output });
-        });
+    const result = await sandbox.executor.run({
+        command: [bin, ...args].join(" "),
+        cwd: sandbox.projectRoot,
+        timeoutMs,
+        maxBuffer: 1024 * 512,
     });
+    const output = [result.stdout, result.stderr, result.spawnError].filter(Boolean).join("\n").trim();
+    return { success: result.exitCode === 0 && !result.timedOut && !result.spawnError, output };
 }
 
 /**
@@ -112,12 +121,7 @@ export class ReviewerAgent {
                 //    ("No inputs were found") and every orchestration would be flagged as
                 //    failed verification even when nothing is wrong.
                 if (fs.existsSync(path.join(this.config.sandbox.projectRoot, "tsconfig.json"))) {
-                    const tscResult = await runCheck(
-                        "npx",
-                        ["tsc", "--noEmit"],
-                        this.config.sandbox.projectRoot,
-                        60_000,
-                    );
+                    const tscResult = await runCheck(this.config.sandbox, "npx", ["tsc", "--noEmit"], 60_000);
                     if (!tscResult.success) {
                         verificationPassed = false;
                         verificationNotes.push(
@@ -134,12 +138,7 @@ export class ReviewerAgent {
                 // 2. Test suite
                 const testCmd = detectTestCommand(this.config.sandbox.projectRoot);
                 if (testCmd) {
-                    const testResult = await runCheck(
-                        testCmd.bin,
-                        testCmd.args,
-                        this.config.sandbox.projectRoot,
-                        120_000,
-                    );
+                    const testResult = await runCheck(this.config.sandbox, testCmd.bin, testCmd.args, 120_000);
                     if (!testResult.success) {
                         verificationPassed = false;
                         verificationNotes.push(

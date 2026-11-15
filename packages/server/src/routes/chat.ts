@@ -24,6 +24,8 @@ import {
 } from "@pantheon/core";
 import type { ABResolution, PermissionDecision } from "@pantheon/core";
 import { scopeUserId } from "../middleware/auth.js";
+import { getAuthConfig } from "../auth/config.js";
+import { resolveWorkingDir } from "../workspace.js";
 import type { ChatMessage, OrchestrationEvent, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
@@ -103,6 +105,16 @@ chatRouter.post("/", async (c) => {
     if (!prompt?.trim()) {
         return c.json({ error: "prompt is required" }, 400);
     }
+
+    // The working directory is the root of everything the agent's file and shell
+    // tools can touch. A local user may point it anywhere; a remote (authenticated)
+    // one must stay inside the workspace the operator configured, or "workingDir: /"
+    // would hand them the server's whole filesystem.
+    const workspace = resolveWorkingDir(workingDir, getAuthConfig().mode === "required");
+    if ("error" in workspace) {
+        return c.json({ error: workspace.error }, 400);
+    }
+    const projectDir = workspace.dir;
 
     return streamSSE(c, async (stream) => {
         // Set once the session is known; until then there is nothing to attribute events to.
@@ -275,14 +287,16 @@ chatRouter.post("/", async (c) => {
                 // Emit the routing decision for the CLI
                 await sendEvent("routing", routingDecision);
 
-                const sandbox = Sandbox.create(workingDir);
+                // Allowlist additions/removals and the execution backend (host or
+                // docker) come from the `sandbox:` block of config.yml.
+                const sandbox = Sandbox.fromConfig(projectDir, cfg.sandbox);
 
                 // Build codebase map at session start — injected into agent system prompt
                 // as a ## Codebase Map section. Gives agents structural awareness without
                 // any listDirectory/readFile exploration loops.
                 let repoMapContent: string | undefined;
                 try {
-                    repoMapContent = await buildRepoMap(workingDir);
+                    repoMapContent = await buildRepoMap(projectDir);
                 } catch (e) {
                     process.stderr.write(
                         `[chat] repo map build failed (non-fatal): ${e instanceof Error ? e.message : String(e)}\n`,
@@ -337,7 +351,7 @@ chatRouter.post("/", async (c) => {
                         maxSubTasks: Math.min(6, Math.max(1, maxSubTasks)),
                         ...(episodicMemory ? { episodicMemory } : {}),
                         ...(repoMapContent ? { repoMap: repoMapContent } : {}),
-                        refreshRepoMap: () => buildRepoMap(workingDir),
+                        refreshRepoMap: () => buildRepoMap(projectDir),
                         onEvent: (event: OrchestrationEvent) => {
                             sendEvent(event.type, event).catch(() => {});
                         },
@@ -396,7 +410,7 @@ chatRouter.post("/", async (c) => {
                         ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
                         ...(repoMapContent ? { repoMap: repoMapContent } : {}),
                         // Rebuilt mid-turn whenever the agent writes a source file
-                        refreshRepoMap: () => buildRepoMap(workingDir),
+                        refreshRepoMap: () => buildRepoMap(projectDir),
                         onToolCall,
                         onToolResult,
                     });

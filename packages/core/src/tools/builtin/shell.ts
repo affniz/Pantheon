@@ -1,23 +1,5 @@
-import { execFile } from "node:child_process";
 import type { Tool } from "../tool-registry.js";
 import type { Sandbox } from "../../sandbox/sandbox.js";
-
-/**
- * Strip secrets from the environment before passing it to child processes.
- * Prevents prompt-injection attacks from exfiltrating API keys via allowlisted
- * commands like `echo $GROQ_API_KEY`.
- */
-const SECRET_PATTERNS = [/_API_KEY$/i, /_TOKEN$/i, /_SECRET$/i, /_PASSWORD$/i];
-
-function filterEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    const filtered: NodeJS.ProcessEnv = {};
-    for (const [key, value] of Object.entries(env)) {
-        if (!SECRET_PATTERNS.some((re) => re.test(key))) {
-            filtered[key] = value;
-        }
-    }
-    return filtered;
-}
 
 export const shellTool: Tool = {
     definition: {
@@ -25,7 +7,9 @@ export const shellTool: Tool = {
         description:
             "Execute a shell command and return its output. " +
             "Use this for running build tools, git commands, searching with grep/find, etc. " +
-            "Commands run in the project root directory.",
+            "Commands run in the project root directory. Pipelines and && / || / ; are allowed when every " +
+            "command in them is on the allowlist; command substitution, redirection to files and " +
+            "background jobs are not.",
         parameters: {
             type: "object",
             properties: {
@@ -55,79 +39,33 @@ export const shellTool: Tool = {
                 ? args["timeout"]
                 : sandbox.shellTimeout;
 
+        // Validate against the allowlist, then run through the sandbox's executor —
+        // a host process by default, a throw-away container in docker mode.
+        let result;
         try {
-            // Validate command against allowlist
-            sandbox.validateCommand(command);
+            result = await sandbox.exec(command, { timeoutMs: timeout });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return `Error: ${message}`;
         }
 
-        // Resolve shell at runtime: honour $SHELL, then try common paths.
-        // /bin/sh is not guaranteed in distroless / Alpine Docker images.
-        const shellBin =
-            process.env["SHELL"] ??
-            (() => {
-                const candidates = ["/bin/sh", "/bin/bash", "/usr/bin/sh", "/busybox/sh"];
-                for (const c of candidates) {
-                    try {
-                        // Use statSync from node:fs (already in scope via sandbox)
-                        // We do a sync probe once per invocation — acceptable for a CLI tool.
-                        // eslint-disable-next-line @typescript-eslint/no-require-imports
-                        require("node:fs").statSync(c);
-                        return c;
-                    } catch {
-                        // not found, try next
-                    }
-                }
-                return "/bin/sh"; // last resort — will surface a clear error if missing
-            })();
+        if (result.spawnError) {
+            return `Error: ${result.spawnError}`;
+        }
 
-        return new Promise<string>((resolve) => {
-            execFile(
-                shellBin,
-                ["-c", command],
-                {
-                    cwd: sandbox.projectRoot,
-                    timeout,
-                    maxBuffer: 1024 * 1024, // 1 MB buffer
-                    env: filterEnv(process.env),
-                },
-                (error, stdout, stderr) => {
-                    const parts: string[] = [];
-
-                    if (stdout) {
-                        parts.push(sandbox.truncateOutput(stdout));
-                    }
-                    if (stderr) {
-                        parts.push(`STDERR:\n${sandbox.truncateOutput(stderr)}`);
-                    }
-
-                    if (error) {
-                        const exitCode =
-                            "code" in error && typeof error.code === "number"
-                                ? error.code
-                                : 1;
-
-                        if (error.killed) {
-                            parts.push(
-                                `\nProcess killed (timeout after ${timeout}ms)`
-                            );
-                        }
-
-                        // Still return output even on error — many commands
-                        // use non-zero exit codes for valid output (e.g., grep)
-                        if (parts.length === 0) {
-                            parts.push(error.message);
-                        }
-                        parts.push(`\nExit code: ${exitCode}`);
-                    } else {
-                        parts.push("\nExit code: 0");
-                    }
-
-                    resolve(parts.join("\n"));
-                }
-            );
-        });
+        const parts: string[] = [];
+        if (result.stdout) {
+            parts.push(sandbox.truncateOutput(result.stdout));
+        }
+        if (result.stderr) {
+            parts.push(`STDERR:\n${sandbox.truncateOutput(result.stderr)}`);
+        }
+        if (result.timedOut) {
+            parts.push(`\nProcess killed (timeout after ${timeout}ms)`);
+        }
+        // Output is returned even on failure — many commands use a non-zero exit
+        // code for a perfectly valid answer (e.g. grep with no matches).
+        parts.push(`\nExit code: ${result.exitCode}`);
+        return parts.join("\n");
     },
 };

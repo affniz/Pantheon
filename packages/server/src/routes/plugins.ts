@@ -24,7 +24,7 @@ function getPluginsDir(): string {
 pluginsRouter.get("/", async (c) => {
     const pluginsDir = getPluginsDir();
     const workingDir = process.env["PANTHEON_WORKSPACE"] ?? process.cwd();
-    const sandbox = Sandbox.create(workingDir);
+    const sandbox = Sandbox.fromConfig(workingDir, loadConfig().sandbox);
     const toolRegistry = new ToolRegistry();
     const registry = new PluginRegistry(toolRegistry, pluginsDir);
 
@@ -45,7 +45,7 @@ pluginsRouter.get("/:name", async (c) => {
     const name = decodeURIComponent(c.req.param("name"));
     const pluginsDir = getPluginsDir();
     const workingDir = process.env["PANTHEON_WORKSPACE"] ?? process.cwd();
-    const sandbox = Sandbox.create(workingDir);
+    const sandbox = Sandbox.fromConfig(workingDir, loadConfig().sandbox);
     const toolRegistry = new ToolRegistry();
     const registry = new PluginRegistry(toolRegistry, pluginsDir);
 

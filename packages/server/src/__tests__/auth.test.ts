@@ -305,6 +305,62 @@ describe("session isolation between users", () => {
     });
 });
 
+describe("working directory confinement", () => {
+    const chat = (token: string, workingDir: string) =>
+        api("POST", "/api/chat", { token, body: { prompt: "hi", noTools: true, workingDir } });
+
+    it("an authenticated (remote) user cannot point the agent outside the server's workspace", async () => {
+        const { token } = await makeUser("alice@example.com");
+        process.env["PANTHEON_WORKSPACE"] = tmpHome;
+        try {
+            const inside = path.join(tmpHome, "project");
+            fs.mkdirSync(inside, { recursive: true });
+            expect((await chat(token, inside)).status).toBe(200);
+            expect((await chat(token, tmpHome)).status).toBe(200);
+
+            for (const outside of ["/", "/etc", os.tmpdir(), path.join(tmpHome, ".."), tmpHome + "-sibling"]) {
+                const res = await chat(token, outside);
+                expect(res.status, outside).toBe(400);
+            }
+            expect((await json(await chat(token, "/etc"))).error).toMatch(/inside the server's workspace/);
+        } finally {
+            delete process.env["PANTHEON_WORKSPACE"];
+        }
+    });
+
+    it("a symlink inside the workspace that points outside does not count as inside", async () => {
+        const { token } = await makeUser("alice@example.com");
+        const workspace = path.join(tmpHome, "ws-link");
+        fs.mkdirSync(workspace, { recursive: true });
+        fs.symlinkSync("/etc", path.join(workspace, "escape"));
+        process.env["PANTHEON_WORKSPACE"] = workspace;
+        try {
+            expect((await chat(token, path.join(workspace, "escape"))).status).toBe(400);
+        } finally {
+            delete process.env["PANTHEON_WORKSPACE"];
+        }
+    });
+
+    it("rejects a working directory that does not exist or is a file", async () => {
+        const { token } = await makeUser("alice@example.com");
+        expect((await json(await chat(token, path.join(tmpHome, "nope")))).error).toBe("workingDir does not exist");
+        const file = path.join(tmpHome, "a-file");
+        fs.writeFileSync(file, "x");
+        expect((await chat(token, file)).status).toBe(400);
+    });
+
+    it("with auth off the local user may work anywhere", async () => {
+        process.env["PANTHEON_AUTH"] = "off";
+        process.env["PANTHEON_WORKSPACE"] = path.join(tmpHome, "project");
+        try {
+            const res = await api("POST", "/api/chat", { body: { prompt: "hi", noTools: true, workingDir: os.tmpdir() } });
+            expect(res.status).toBe(200);
+        } finally {
+            delete process.env["PANTHEON_WORKSPACE"];
+        }
+    });
+});
+
 describe("API token management", () => {
     it("creates, lists and revokes tokens; the secret is shown exactly once", async () => {
         const { token } = await makeUser("alice@example.com");
