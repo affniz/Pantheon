@@ -56,10 +56,17 @@ describe.skipIf(!available)("DockerExecutor — real daemon", () => {
     }, 120_000);
 
     it("cannot see the host filesystem outside the project", async () => {
-        const result = await run(`cat ${path.join(outside, "secret.txt")}; ls ${outside}; ls ${os.homedir()}`);
+        const result = await run(
+            `cat ${path.join(outside, "secret.txt")}; echo cat=$?; ls ${outside}; echo ls=$?; echo home:; ls -A ${os.homedir()}`,
+        );
         expect(result.stdout).not.toContain("must not be readable");
         expect(result.stdout).not.toContain("secret.txt");
-        expect(result.exitCode).not.toBe(0);
+        expect(result.stdout).toContain("cat=1");
+        expect(result.stdout).not.toContain("ls=0");
+        // The project is mounted at its host path, so Docker creates its parent directories
+        // in the container: $HOME exists there, but holds only the test's own base directory.
+        const home = result.stdout.split("home:\n")[1]?.trim().split("\n") ?? [];
+        expect(home).toEqual([path.basename(path.dirname(project))]);
     }, 120_000);
 
     it("receives none of the server's environment", async () => {

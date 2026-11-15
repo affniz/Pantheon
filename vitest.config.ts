@@ -22,6 +22,11 @@ export default defineConfig({
         // are still alive, and their later garbage collection aborts the whole worker
         // ("RemoveEnvironmentCleanupHook ... Assertion failed: (env) != nullptr").
         pool: 'forks',
+        // Booting PGlite (PostgreSQL as WASM) takes ~2s in an idle process but 6–7s or
+        // more when every fork boots one at once, which overran the 5s/10s defaults
+        // whenever the machine was busy. These limits only bound a genuine hang.
+        testTimeout: 30_000,
+        hookTimeout: 60_000,
         // Closes every test SQLite handle after each file (see vitest.setup.ts).
         setupFiles: ['./vitest.setup.ts'],
     },
