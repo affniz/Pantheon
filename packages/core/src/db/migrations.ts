@@ -211,6 +211,20 @@ const LEGACY_SQLITE_COLUMNS: Array<{ table: string; column: string; type: string
     { table: "consensus_runs", column: "quality_score", type: "REAL" },
 ];
 
+/**
+ * ALTER TABLE … ADD COLUMN, skipped when the column is already there. SQLite has no
+ * `ADD COLUMN IF NOT EXISTS`, and a migration interrupted between its ALTER and the
+ * version bookkeeping must be safe to run again.
+ */
+function* addColumnIfMissing(dialect: Dialect, table: string, column: string, definition: string): Steps {
+    const rows = dialect === "sqlite"
+        ? yield { all: `PRAGMA table_info(${table})` }
+        : yield { all: `SELECT column_name AS name FROM information_schema.columns WHERE table_name = '${table}'` };
+    if (!rows.some((r) => r["name"] === column)) {
+        yield { exec: `ALTER TABLE ${table} ADD COLUMN ${column} ${definition};` };
+    }
+}
+
 export const MIGRATIONS: Migration[] = [
     {
         version: 1,
@@ -219,10 +233,7 @@ export const MIGRATIONS: Migration[] = [
             yield { exec: baselineDDL(dialect) };
             if (dialect === "sqlite") {
                 for (const { table, column, type } of LEGACY_SQLITE_COLUMNS) {
-                    const cols = yield { all: `PRAGMA table_info(${table})` };
-                    if (!cols.some((c) => c["name"] === column)) {
-                        yield { exec: `ALTER TABLE ${table} ADD COLUMN ${column} ${type};` };
-                    }
+                    yield* addColumnIfMissing(dialect, table, column, type);
                 }
             }
             yield { exec: BASELINE_INDEXES };
@@ -233,6 +244,43 @@ export const MIGRATIONS: Migration[] = [
         name: "index spans.created_at for retention pruning",
         *up() {
             yield { exec: "CREATE INDEX IF NOT EXISTS idx_spans_created_at ON spans(created_at);" };
+        },
+    },
+    {
+        version: 3,
+        name: "auth: users, api_tokens, sessions.user_id",
+        *up(dialect) {
+            yield {
+                exec: `
+    CREATE TABLE IF NOT EXISTS users (
+        id                TEXT PRIMARY KEY,
+        email             TEXT NOT NULL UNIQUE,
+        name              TEXT,
+        provider          TEXT NOT NULL,
+        provider_user_id  TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        created_at        TEXT NOT NULL,
+        last_login_at     TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_identity ON users(provider, provider_user_id);
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        id            TEXT PRIMARY KEY,
+        user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name          TEXT NOT NULL,
+        token_hash    TEXT NOT NULL UNIQUE,
+        token_prefix  TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        last_used_at  TEXT,
+        expires_at    TEXT,
+        revoked_at    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
+    `,
+            };
+            // Sessions created before auth existed (or with auth off) have no owner.
+            yield* addColumnIfMissing(dialect, "sessions", "user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+            yield { exec: "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);" };
         },
     },
 ];

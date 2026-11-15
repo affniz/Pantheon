@@ -22,6 +22,7 @@ import {
     QualityJudge,
 } from "@pantheon/core";
 import type { ABResolution, PermissionDecision } from "@pantheon/core";
+import { scopeUserId } from "../middleware/auth.js";
 import type { ChatMessage, OrchestrationEvent, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
@@ -113,9 +114,11 @@ chatRouter.post("/", async (c) => {
 
             // Resolve or create session
             let effectiveSessionId = sessionId;
+            const ownerId = scopeUserId(c);
             if (!effectiveSessionId) {
-                effectiveSessionId = await sm.create();
-            } else if (!(await sm.exists(effectiveSessionId))) {
+                effectiveSessionId = await sm.create(undefined, c.get("user")?.id);
+            } else if (!(ownerId ? await sm.isAccessibleBy(effectiveSessionId, ownerId) : await sm.exists(effectiveSessionId))) {
+                // Someone else's session is indistinguishable from a missing one.
                 // Previously this surfaced as an opaque foreign-key error from the first insert.
                 await sendEvent("error", { message: `Session "${effectiveSessionId}" not found` });
                 return;

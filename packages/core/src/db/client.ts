@@ -368,6 +368,8 @@ export interface DatabaseStatus {
 
 /** Table names in foreign-key-safe order (parents before children). */
 export const TABLE_NAMES = [
+    "users",
+    "api_tokens",
     "sessions",
     "messages",
     "usage_records",

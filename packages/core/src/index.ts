@@ -14,7 +14,7 @@ export type { Tool, OpenAITool } from "./tools/tool-registry.js";
 export { registerBuiltinTools, editFileTool, grepTool } from "./tools/builtin/index.js";
 export { buildRepoMap } from "./tools/repo-map/index.js";
 
-export { AgentRuntime } from "./agent/agent-runtime.js";
+export { AgentRuntime, hashPrompt } from "./agent/agent-runtime.js";
 export type { AgentConfig, AgentTurnResult, AgentRunOptions } from "./agent/agent-runtime.js";
 export {
     getDb,
@@ -51,6 +51,8 @@ export { DbStore } from "./db/store.js";
 // Drizzle queries against `schema` without depending on drizzle-orm themselves —
 // a second drizzle-orm instance would not type-unify with the one `schema` uses.
 export { eq, desc, and, sql } from "drizzle-orm";
+export { AuthStore, NotAuthorizedError, hashToken, safeEqual, normalizeEmail, TOKEN_PREFIX } from "./auth/auth-store.js";
+export type { User, UserRole, AuthProvider, ApiTokenInfo } from "./auth/auth-store.js";
 export { SessionManager } from "./session/session-manager.js";
 export { SessionSummarizer } from "./session/summarizer.js";
 export { Tracer } from "./tracing/tracer.js";

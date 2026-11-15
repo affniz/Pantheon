@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
-import { eq, desc, count } from "drizzle-orm";
+import { eq, and, desc, count } from "drizzle-orm";
 import type { ChatMessage, Session } from "@pantheon/shared";
 import { DbStore } from "../db/store.js";
 
 export class SessionManager extends DbStore {
-    async create(title?: string): Promise<string> {
+    /** @param userId Owner of the session, when created by an authenticated user. */
+    async create(title?: string, userId?: string): Promise<string> {
         const { sessions } = this.t;
         const id = crypto.randomUUID();
         const now = new Date().toISOString();
@@ -14,8 +15,19 @@ export class SessionManager extends DbStore {
             createdAt: now,
             updatedAt: now,
             isArchived: false,
+            ...(userId ? { userId } : {}),
         });
         return id;
+    }
+
+    /**
+     * True when `userId` may access the session: they own it, or it has no owner
+     * (created before auth was enabled). Unknown sessions are never accessible.
+     */
+    async isAccessibleBy(id: string, userId: string): Promise<boolean> {
+        const { sessions } = this.t;
+        const [row] = await this.db.select({ userId: sessions.userId }).from(sessions).where(eq(sessions.id, id)).limit(1);
+        return row !== undefined && (row.userId === null || row.userId === userId);
     }
 
     /** True when a session with this id exists (cheaper than `get`, no message count). */
@@ -42,11 +54,13 @@ export class SessionManager extends DbStore {
             updatedAt: session.updatedAt,
             modelId: session.modelId ?? undefined,
             isArchived: session.isArchived,
+            ...(session.userId ? { userId: session.userId } : {}),
             messageCount: Number(countResult?.count ?? 0),
         };
     }
 
-    async list(options?: { limit?: number; offset?: number; includeArchived?: boolean }): Promise<Session[]> {
+    /** @param options.userId Only sessions owned by this user. */
+    async list(options?: { limit?: number; offset?: number; includeArchived?: boolean; userId?: string | undefined }): Promise<Session[]> {
         const { sessions, messages } = this.t;
         const limit = options?.limit ?? 50;
         const offset = options?.offset ?? 0;
@@ -60,11 +74,15 @@ export class SessionManager extends DbStore {
                 updatedAt: sessions.updatedAt,
                 modelId: sessions.modelId,
                 isArchived: sessions.isArchived,
+                userId: sessions.userId,
                 messageCount: count(messages.id),
             })
             .from(sessions)
             .leftJoin(messages, eq(sessions.id, messages.sessionId))
-            .where(includeArchived ? undefined : eq(sessions.isArchived, false))
+            .where(and(
+                includeArchived ? undefined : eq(sessions.isArchived, false),
+                options?.userId ? eq(sessions.userId, options.userId) : undefined,
+            ))
             .groupBy(sessions.id)
             // id is a tiebreaker so paging is deterministic when timestamps collide
             .orderBy(desc(sessions.createdAt), desc(sessions.id))
@@ -78,6 +96,7 @@ export class SessionManager extends DbStore {
             updatedAt: row.updatedAt,
             modelId: row.modelId ?? undefined,
             isArchived: row.isArchived,
+            ...(row.userId ? { userId: row.userId } : {}),
             messageCount: Number(row.messageCount),
         }));
     }

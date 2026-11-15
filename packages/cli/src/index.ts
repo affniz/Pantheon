@@ -19,6 +19,7 @@ import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { dbStatus, dbMigrate } from "./commands/db.js";
+import { authLogin, authLogout, authStatus, authTokenCreate, authTokenList, authTokenRevoke } from "./commands/auth.js";
 
 // Brand colors matching theme.ts
 const brand = chalk.hex("#F5A623");
@@ -340,6 +341,53 @@ serverCmd
         }
     });
 
+// ── Auth (v0.9) ───────────────────────────────────────────────────────────────
+
+const authCmd = program.command("auth").description("Sign in to a Pantheon server and manage API tokens");
+
+authCmd
+    .command("login")
+    .description("Sign in through the browser (OAuth) and save an API token")
+    .option("-p, --provider <name>", "Sign-in provider: github or google (default: the server's first)")
+    .option("--server <url>", "Pantheon server to sign in to (default: the local server)")
+    .action((opts) => authLogin(opts));
+
+authCmd
+    .command("logout")
+    .description("Revoke and remove the saved API token")
+    .option("--server <url>", "Pantheon server to sign out of")
+    .action((opts) => authLogout(opts));
+
+authCmd
+    .command("status", { isDefault: true })
+    .description("Show the server's auth mode and who you are signed in as")
+    .option("--server <url>", "Pantheon server to check")
+    .action((opts) => authStatus(opts));
+
+const authTokenCmd = authCmd.command("token").description("Manage API tokens");
+
+authTokenCmd
+    .command("create")
+    .description("Create an API token directly in the database (no OAuth needed; run on the server's machine)")
+    .option("-n, --name <name>", "Label for the token")
+    .option("-e, --email <email>", "User the token belongs to (created if missing)")
+    .option("--expires <days>", "Expire the token after this many days")
+    .option("--no-save", "Print the token without saving it to ~/.pantheon/credentials")
+    .action((opts) => authTokenCreate(opts));
+
+authTokenCmd
+    .command("list")
+    .description("List your API tokens")
+    .option("--server <url>", "Pantheon server")
+    .action((opts) => authTokenList(opts));
+
+authTokenCmd
+    .command("revoke")
+    .description("Revoke one of your API tokens")
+    .argument("<id>", "Token id (or its first characters) from `pantheon auth token list`")
+    .option("--server <url>", "Pantheon server")
+    .action((id, opts) => authTokenRevoke(id, opts));
+
 // ── Database (v0.9) ───────────────────────────────────────────────────────────
 
 const dbCmd = program.command("db").description("Inspect and migrate the storage backend (SQLite / PostgreSQL)");
@@ -365,4 +413,10 @@ program
     .description("Check prerequisites, API key health, and gateway reachability")
     .action(doctorCommand);
 
-program.parse();
+// parseAsync + a single catch: command handlers are async, and a rejected one used
+// to surface as a raw stack trace ("file:///…/api-client.js:29 … Node.js v22").
+program.parseAsync().catch((err: unknown) => {
+    console.error(chalk.red(`\n  ✗ ${err instanceof Error ? err.message : String(err)}\n`));
+    if (process.env["PANTHEON_DEBUG"] && err instanceof Error && err.stack) console.error(dim(err.stack));
+    process.exit(1);
+});

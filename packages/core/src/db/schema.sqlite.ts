@@ -1,5 +1,30 @@
 import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
 
+// ─── Users & API tokens (v0.9 auth) ──────────────────────────────────────────
+
+export const users = sqliteTable("users", {
+    id: text("id").primaryKey(),                             // UUID
+    email: text("email").notNull().unique(),                 // lower-cased
+    name: text("name"),
+    provider: text("provider").notNull(),                    // "github" | "google" | "local"
+    providerUserId: text("provider_user_id").notNull(),      // stable id at the provider
+    role: text("role").notNull(),                            // "owner" | "member"
+    createdAt: text("created_at").notNull(),
+    lastLoginAt: text("last_login_at"),
+});
+
+export const apiTokens = sqliteTable("api_tokens", {
+    id: text("id").primaryKey(),                             // UUID (public, used to revoke)
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),        // SHA-256 of the token; the token itself is never stored
+    tokenPrefix: text("token_prefix").notNull(),             // first characters, to recognise a token in listings
+    createdAt: text("created_at").notNull(),
+    lastUsedAt: text("last_used_at"),
+    expiresAt: text("expires_at"),
+    revokedAt: text("revoked_at"),
+});
+
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 export const sessions = sqliteTable("sessions", {
@@ -8,6 +33,8 @@ export const sessions = sqliteTable("sessions", {
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
     modelId: text("model_id"),
+    /** Owner, when the session was created by an authenticated user. */
+    userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
     isArchived: integer("is_archived", { mode: "boolean" }).notNull().default(false),
 });
 

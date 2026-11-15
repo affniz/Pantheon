@@ -48,6 +48,10 @@ COPY --from=builder /app/packages/core/dist ./packages/core/dist
 COPY --from=builder /app/packages/server/dist ./packages/server/dist
 
 ENV NODE_ENV=production
+# Inside a container the server must listen on all interfaces to be reachable
+# through the published port. Publish that port to localhost only, or set
+# PANTHEON_AUTH=required, before exposing it further.
+ENV HOST=0.0.0.0
 # SQLite location when DATABASE_URL is not set — mount a volume here to persist it.
 ENV PANTHEON_DB_PATH=/data/pantheon.db
 VOLUME ["/data"]

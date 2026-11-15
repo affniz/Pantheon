@@ -104,6 +104,39 @@ export interface PantheonConfig {
     ab?: ABConfig;
     /** Storage backend (v0.9). Omit to use SQLite at ~/.pantheon/pantheon.db. */
     database?: DatabaseConfig;
+    /** API authentication (v0.9). Omit for the local single-user default (no auth). */
+    auth?: AuthConfig;
+}
+
+/** OAuth application credentials for one sign-in provider. */
+export interface OAuthProviderConfig {
+    clientId: string;
+    /** Prefer the PANTHEON_<PROVIDER>_CLIENT_SECRET environment variable over this field. */
+    clientSecret?: string;
+}
+
+/**
+ * Who may call the API.
+ *
+ * `off` (default) suits the local single-user setup, where the server only listens
+ * on localhost. Set `required` before exposing the server on a network: every
+ * request must then carry an API token or a signed-in session.
+ * Environment variables override this block (see README → Authentication).
+ */
+export interface AuthConfig {
+    mode?: "off" | "required";
+    /**
+     * E-mail addresses allowed to sign in, besides the owner and existing users.
+     * Empty (default): only the first person to sign in — who becomes the owner — gets in.
+     * `["*"]` lets anyone with an account at a configured provider in.
+     */
+    allowedEmails?: string[];
+    /** Public base URL of the server, used to build OAuth redirect URIs. */
+    publicUrl?: string;
+    providers?: {
+        github?: OAuthProviderConfig;
+        google?: OAuthProviderConfig;
+    };
 }
 
 /**

@@ -9,11 +9,16 @@ import { TraceStore } from "../../tracing/store.js";
 import { ABStore } from "../../ab/ab-store.js";
 import { ConsensusStore } from "../../consensus/consensus-store.js";
 import { OrchestrationStore } from "../../orchestrator/store.js";
+import { AuthStore } from "../../auth/auth-store.js";
 
 /** Put at least one row — with awkward values — into every table. */
 async function seed(db: PantheonDatabase): Promise<{ sessionId: string; archivedId: string }> {
+    const auth = new AuthStore(db);
+    const user = await auth.upsertUser({ email: "Owner@Example.com", name: "Owner", provider: "github", providerUserId: "42" });
+    await auth.createToken(user.id, "laptop");
+
     const sessions = new SessionManager(db);
-    const sessionId = await sessions.create("Migrating session");
+    const sessionId = await sessions.create("Migrating session", user.id);
     const archivedId = await sessions.create("Archived");
     await sessions.archive(archivedId);
 
@@ -82,6 +87,8 @@ async function snapshot(db: PantheonDatabase, sessionId: string) {
     const orch = new OrchestrationStore(db);
     const t = tablesFor(db);
     return {
+        users: await new AuthStore(db).listUsers(),
+        tokens: (await db.select().from(t.apiTokens)),
         sessions: await sessions.list({ includeArchived: true }),
         messages: await sessions.getMessages(sessionId),
         costSummary: await new CostTracker(db).getSummary(),
@@ -99,6 +106,8 @@ async function snapshot(db: PantheonDatabase, sessionId: string) {
 }
 
 const EXPECTED_COUNTS = {
+    users: 1,
+    api_tokens: 1,
     sessions: 2,
     messages: 3,
     usage_records: 2,

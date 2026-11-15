@@ -6,6 +6,8 @@ export interface Session {
     updatedAt: string;
     modelId?: string | undefined;
     isArchived: boolean;
+    /** Owning user, when the session was created by an authenticated user. */
+    userId?: string | undefined;
     /** Message count — populated by queries, not stored directly */
     messageCount?: number | undefined;
 }

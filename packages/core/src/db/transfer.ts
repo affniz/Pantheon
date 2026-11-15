@@ -7,6 +7,8 @@ import { dialectOf, rawExecutor, tablesFor, type PantheonDatabase, type Tables }
  * stable paging and whether that key is an auto-incrementing integer.
  */
 const COPY_PLAN: Array<{ key: keyof Tables; sqlName: string; pk: string; serial: boolean }> = [
+    { key: "users", sqlName: "users", pk: "id", serial: false },
+    { key: "apiTokens", sqlName: "api_tokens", pk: "id", serial: false },
     { key: "sessions", sqlName: "sessions", pk: "id", serial: false },
     { key: "messages", sqlName: "messages", pk: "id", serial: true },
     { key: "usageRecords", sqlName: "usage_records", pk: "id", serial: true },

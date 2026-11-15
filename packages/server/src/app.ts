@@ -13,6 +13,8 @@ import { agentsRouter } from "./routes/agents.js";
 import { pluginsRouter } from "./routes/plugins.js";
 import { consensusRouter } from "./routes/consensus.js";
 import { abRouter } from "./routes/ab.js";
+import { authRouter } from "./routes/auth.js";
+import { authMiddleware } from "./middleware/auth.js";
 
 // Initialize Sentry before the app is configured (no-op if SENTRY_DSN is unset)
 initSentry();
@@ -24,6 +26,8 @@ app.use("*", sentryMiddleware);
 app.use("*", requestLogger);
 app.use("*", globalRateLimiter);
 app.use("/api/chat/*", llmRateLimiter);
+// After rate limiting, so unauthenticated floods are throttled before any token lookup
+app.use("/api/*", authMiddleware);
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.route("/api/health", healthRouter);
@@ -36,6 +40,7 @@ app.route("/api/agents", agentsRouter);
 app.route("/api/plugins", pluginsRouter);
 app.route("/api/consensus", consensusRouter);
 app.route("/api/ab", abRouter);
+app.route("/api/auth", authRouter);
 
 // ── Global error handler ─────────────────────────────────────────────────────
 app.onError((err, c) => {

@@ -1,5 +1,7 @@
 import type { ChatMessage, ModelConfig, Session, UsageRecord, Span, Trace } from "@pantheon/shared";
 import type { PermissionDecision } from "@pantheon/core";
+import { getServerUrl } from "./server-manager.js";
+import { resolveToken } from "./credentials.js";
 
 export interface CostSummary {
     totalCalls: number;
@@ -56,9 +58,35 @@ export type ChatSSEEvent =
  */
 export class PantheonApiClient {
     private baseUrl: string;
+    private token: string | undefined;
 
-    constructor(baseUrl = "http://localhost:3000") {
-        this.baseUrl = baseUrl;
+    /**
+     * @param baseUrl Defaults to the running server's address (which is not always
+     *   :3000 — the CLI picks the next free port when 3000 is taken).
+     * @param token   API token; defaults to PANTHEON_API_TOKEN or the saved credentials.
+     */
+    constructor(baseUrl: string = getServerUrl(), token?: string) {
+        this.baseUrl = baseUrl.replace(/\/+$/, "");
+        this.token = token ?? resolveToken(this.baseUrl);
+    }
+
+    /** Headers for every request: JSON body type (when sending one) and the bearer token. */
+    private headers(json = false): Record<string, string> {
+        return {
+            ...(json ? { "Content-Type": "application/json" } : {}),
+            ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+        };
+    }
+
+    private async fail(res: Response): Promise<never> {
+        const body = await res.json().catch(() => ({})) as { error?: string };
+        if (res.status === 401) {
+            throw new Error(
+                (body.error ?? "Authentication required") +
+                " — run `pantheon auth login` (or set PANTHEON_API_TOKEN).",
+            );
+        }
+        throw new Error(body.error ?? `HTTP ${res.status}`);
     }
 
     private url(path: string): string {
@@ -72,36 +100,32 @@ export class PantheonApiClient {
                 url.searchParams.set(k, String(v));
             }
         }
-        const res = await fetch(url.toString());
-        if (!res.ok) {
-            const body = await res.json().catch(() => ({})) as { error?: string };
-            throw new Error(body.error ?? `HTTP ${res.status}`);
-        }
+        const res = await fetch(url.toString(), { headers: this.headers() });
+        if (!res.ok) return this.fail(res);
         return res.json() as Promise<T>;
     }
 
-    private async post<T>(path: string, body?: unknown): Promise<T> {
-        const init: RequestInit = {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-        };
-        if (body !== undefined) {
-            (init as any).body = JSON.stringify(body);
-        }
-        const res = await fetch(this.url(path), init);
-        if (!res.ok) {
-            const errBody = await res.json().catch(() => ({})) as { error?: string };
-            throw new Error(errBody.error ?? `HTTP ${res.status}`);
-        }
+    private async send<T>(method: "POST" | "PUT", path: string, body?: unknown): Promise<T> {
+        const res = await fetch(this.url(path), {
+            method,
+            headers: this.headers(true),
+            ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        });
+        if (!res.ok) return this.fail(res);
         return res.json() as Promise<T>;
+    }
+
+    private post<T>(path: string, body?: unknown): Promise<T> {
+        return this.send<T>("POST", path, body);
+    }
+
+    private put<T>(path: string, body?: unknown): Promise<T> {
+        return this.send<T>("PUT", path, body);
     }
 
     private async del<T>(path: string): Promise<T> {
-        const res = await fetch(this.url(path), { method: "DELETE" });
-        if (!res.ok) {
-            const errBody = await res.json().catch(() => ({})) as { error?: string };
-            throw new Error(errBody.error ?? `HTTP ${res.status}`);
-        }
+        const res = await fetch(this.url(path), { method: "DELETE", headers: this.headers() });
+        if (!res.ok) return this.fail(res);
         return res.json() as Promise<T>;
     }
 
@@ -146,7 +170,8 @@ export class PantheonApiClient {
     }
 
     async setDefaultModel(id: string): Promise<void> {
-        await this.post("/api/models/default", { id });
+        // The route is PUT; this used to POST and therefore always failed with 404.
+        await this.put("/api/models/default", { id });
     }
 
     // ── Cost ─────────────────────────────────────────────────────────────────
@@ -210,18 +235,19 @@ export class PantheonApiClient {
     async *chat(opts: ChatRequestOptions): AsyncGenerator<ChatSSEEvent> {
         const res = await fetch(this.url("/api/chat"), {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: this.headers(true),
             body: JSON.stringify(opts),
         });
 
-        if (!res.ok || !res.body) {
-            const errBody = await res.json().catch(() => ({})) as { error?: string };
-            throw new Error(errBody.error ?? `HTTP ${res.status}`);
-        }
+        if (!res.ok || !res.body) return this.fail(res);
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        // Declared outside the read loop: an "event:" line and its "data:" line can
+        // arrive in different network chunks, and resetting this per chunk dropped
+        // such events.
+        let currentEvent = "";
 
         while (true) {
             const { done, value } = await reader.read();
@@ -231,7 +257,6 @@ export class PantheonApiClient {
             const lines = buffer.split("\n");
             buffer = lines.pop() ?? ""; // Keep the incomplete last line
 
-            let currentEvent = "";
             for (const line of lines) {
                 if (line.startsWith("event: ")) {
                     currentEvent = line.slice(7).trim();

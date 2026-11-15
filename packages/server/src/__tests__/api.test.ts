@@ -68,7 +68,7 @@ async function sse(res: Response): Promise<Array<{ event: string; data: Record<s
 async function wipe() {
     const db = core.getDb();
     const t = core.tablesFor(db);
-    for (const table of [t.abRuns, t.consensusRuns, t.subTasks, t.taskPlans, t.agentNodes, t.spans, t.sessionSummaries, t.usageRecords, t.messages, t.sessions]) {
+    for (const table of [t.abRuns, t.consensusRuns, t.subTasks, t.taskPlans, t.agentNodes, t.spans, t.sessionSummaries, t.usageRecords, t.messages, t.sessions, t.apiTokens, t.users]) {
         await db.delete(table);
     }
 }
@@ -349,6 +349,7 @@ describe("A/B", () => {
         const base = { experimentId: "exp", sessionId: "", promptHash: "h", inputTokens: 1, outputTokens: 1 };
         await store.save({ ...base, arm: "control", modelId: "a", latencyMs: 100 });
         await store.save({ ...base, arm: "control", modelId: "a", latencyMs: 300 });
+        await new Promise((r) => setTimeout(r, 5)); // distinct createdAt, so "most recent" is unambiguous
         const variant = await store.save({ ...base, arm: "variant", modelId: "b", latencyMs: 50 });
         await store.updateQualityScore(variant.id, 8);
 
