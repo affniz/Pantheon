@@ -1,9 +1,7 @@
 import type { SubTask, TaskPlan, ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
 import { Tracer } from "../tracing/tracer.js";
-import { getDb } from "../db/client.js";
-import { taskPlans, subTasks, agentNodes } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { OrchestrationStore } from "./store.js";
 import { randomUUID } from "node:crypto";
 
 const PLANNER_BASE_PROMPT = `You are a Planner agent for a multi-agent coding assistant system.
@@ -38,6 +36,8 @@ export interface PlannerConfig {
     parentAgentId?: string;
     /** Maximum number of sub-tasks to generate. Default: 3. Clamped to 1–6. */
     maxSubTasks?: number;
+    /** Background the planner should know: repo map, memory of earlier sessions. */
+    context?: string;
 }
 
 /**
@@ -58,26 +58,25 @@ export class PlannerAgent {
 
     async plan(prompt: string): Promise<TaskPlan> {
         return Tracer.startSpan("planner.decompose", "planner", async (span) => {
-            const db = getDb();
+            const store = new OrchestrationStore();
             const agentId = randomUUID();
             const now = new Date().toISOString();
 
-            // Register the planner agent node
-            db.insert(agentNodes).values({
+            await store.startAgent({
                 agentId,
                 role: "planner",
                 modelId: this.config.plannerModelId,
-                parentAgentId: this.config.parentAgentId ?? null,
+                parentAgentId: this.config.parentAgentId,
                 sessionId: this.config.sessionId,
-                status: "running",
-                startTime: Date.now(),
-                createdAt: now,
-            }).run();
+            });
 
             try {
                 // Call the LLM to decompose the prompt
                 const messages: ChatMessage[] = [
                     { role: "system", content: buildPlannerPrompt(Math.min(6, Math.max(1, this.config.maxSubTasks ?? 3))) },
+                    ...(this.config.context
+                        ? [{ role: "system" as const, content: `Background (for planning only):\n${this.config.context}` }]
+                        : []),
                     { role: "user", content: prompt },
                 ];
 
@@ -172,48 +171,16 @@ export class PlannerAgent {
                     createdAt: now,
                 };
 
-                // Persist the plan
-                db.insert(taskPlans).values({
-                    planId,
-                    sessionId: this.config.sessionId,
-                    originalPrompt: prompt,
-                    createdAt: now,
-                }).run();
-
-                // Persist each sub-task
-                for (const task of cappedTasks) {
-                    db.insert(subTasks).values({
-                        id: task.id, // already globally unique (`${planId}_${localId}`)
-                        planId,
-                        title: task.title,
-                        description: task.description,
-                        dependencies: JSON.stringify(task.dependencies),
-                        taskRole: task.taskRole ?? "general",
-                        status: "pending",
-                        createdAt: now,
-                    }).run();
-                }
-
-                // Mark planner agent as completed
-                db.update(agentNodes)
-                    .set({ status: "completed", endTime: Date.now() })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
+                // Persist the plan and its sub-tasks (ids are already globally unique)
+                await store.savePlan(plan);
+                await store.completeAgent(agentId);
 
                 span.attributes.taskCount = plan.tasks.length;
                 span.attributes.agentId = agentId;
 
                 return plan;
             } catch (error) {
-                // Mark planner agent as failed
-                db.update(agentNodes)
-                    .set({
-                        status: "failed",
-                        error: error instanceof Error ? error.message : String(error),
-                        endTime: Date.now(),
-                    })
-                    .where(eq(agentNodes.agentId, agentId))
-                    .run();
+                await store.failAgent(agentId, error);
                 throw error;
             }
         });

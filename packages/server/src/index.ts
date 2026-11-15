@@ -2,27 +2,96 @@
 try { (process as any).loadEnvFile(); } catch { /* no .env — ok */ }
 
 import { serve } from "@hono/node-server";
-import { app } from "./app.js";
+import { initDb, closeDb, dialectOf, describeTarget, resolveDatabaseTarget, TraceCollector, Sandbox, loadConfig } from "@pantheon/core";
+import { app, injectWebSocket } from "./app.js";
+import { getAuthConfig } from "./auth/config.js";
+import { closeAllWebSockets } from "./routes/ws.js";
+import { jwtSecret } from "./auth/jwt.js";
 
 const PORT = Number(process.env["PORT"] ?? 3000);
+/**
+ * Listen on localhost only unless told otherwise. The API can run shell commands
+ * and read files, so it must not be reachable from the network by accident —
+ * set HOST=0.0.0.0 (and PANTHEON_AUTH=required) to expose it deliberately.
+ */
+const HOST = process.env["HOST"]?.trim() || "127.0.0.1";
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+
+// Connect and migrate before accepting traffic. Required for PostgreSQL (async
+// driver); for SQLite it surfaces a bad path or schema problem at boot instead of
+// on the first request.
+try {
+    const db = await initDb();
+    process.stdout.write(`[db] ${dialectOf(db)} · ${describeTarget(resolveDatabaseTarget())}\n`);
+} catch (err) {
+    process.stderr.write(
+        `[db] failed to initialise database: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+}
+
+const authConfig = getAuthConfig();
+if (authConfig.mode === "required") {
+    jwtSecret(); // fail at boot, not on the first sign-in, if PANTHEON_JWT_SECRET is unusable
+    const providers = Object.keys(authConfig.providers);
+    process.stdout.write(
+        `[auth] required · sign-in providers: ${providers.length > 0 ? providers.join(", ") : "none (API tokens only — `pantheon auth token create`)"}\n`,
+    );
+} else if (!LOOPBACK.has(HOST)) {
+    process.stderr.write(
+        `[auth] WARNING: listening on ${HOST} with authentication OFF. Anyone who can reach this port can run\n` +
+        `       commands and read files through the agent. Set PANTHEON_AUTH=required.\n`,
+    );
+}
+
+// The host executor runs agent commands as this server's own user. That is the
+// intended setup for one person on their machine, and the wrong one for a server
+// other people can reach — say so at boot rather than leaving it to the README.
+try {
+    const exec = Sandbox.fromConfig(process.cwd(), loadConfig().sandbox).executor;
+    if (exec.kind === "docker") {
+        process.stdout.write(`[sandbox] ${exec.describe()}\n`);
+    } else if (authConfig.mode === "required" || !LOOPBACK.has(HOST)) {
+        process.stderr.write(
+            "[sandbox] WARNING: agent commands run directly on this host. The command allowlist limits what a\n" +
+            "          model may start, but allowed commands such as `npm test` or `node script.js` run project\n" +
+            "          code with this server's privileges. For a shared or exposed server set PANTHEON_EXEC=docker.\n",
+        );
+    }
+} catch (err) {
+    process.stderr.write(`[sandbox] invalid configuration: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+}
 
 const server = serve(
-    { fetch: app.fetch, port: PORT },
+    { fetch: app.fetch, port: PORT, hostname: HOST },
     (info) => {
         process.stdout.write(`\n  ◆ Pantheon API Server\n`);
-        process.stdout.write(`    Listening on http://localhost:${info.port}\n\n`);
+        process.stdout.write(`    Listening on http://${LOOPBACK.has(HOST) ? "localhost" : HOST}:${info.port}\n\n`);
     }
 );
 
-// Graceful shutdown — close DB connections and in-flight requests cleanly
+injectWebSocket(server);
+
+// Graceful shutdown — stop accepting requests, flush buffered trace spans, then
+// close the database (releases the SQLite WAL / returns Postgres connections).
+let shuttingDown = false;
 const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     process.stdout.write(`\n[server] received ${signal}, shutting down...\n`);
-    server.close(() => {
-        process.stdout.write("[server] closed.\n");
-        process.exit(0);
-    });
     // Force-exit after 5 seconds if graceful close hangs
     setTimeout(() => process.exit(1), 5000).unref();
+    closeAllWebSockets(); // long-lived connections would otherwise keep server.close() waiting
+    server.close(() => {
+        TraceCollector.flush()
+            .then(() => closeDb())
+            .catch(() => {})
+            .finally(() => {
+                process.stdout.write("[server] closed.\n");
+                process.exit(0);
+            });
+    });
 };
 
 process.on("SIGINT", () => shutdown("SIGINT"));

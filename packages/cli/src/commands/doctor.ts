@@ -1,6 +1,14 @@
 import { execSync, execFileSync } from "node:child_process";
 import chalk from "chalk";
-import { getCapabilities } from "@pantheon/core";
+import {
+    getCapabilities,
+    loadConfig,
+    openDatabase,
+    closeDatabase,
+    getDatabaseStatus,
+    resolveDatabaseTarget,
+    describeTarget,
+} from "@pantheon/core";
 
 const brand = chalk.hex("#F5A623");
 const dim = chalk.hex("#6B7280");
@@ -81,6 +89,35 @@ async function checkGateway(): Promise<CheckResult> {
     }
 }
 
+/** Connect to the configured database, apply pending migrations, and report where it lives. */
+async function checkDatabase(): Promise<CheckResult> {
+    let where = "";
+    try {
+        const target = resolveDatabaseTarget();
+        where = target.dialect + " · " + describeTarget(target);
+        const db = await openDatabase(target);
+        try {
+            const status = await getDatabaseStatus(db);
+            return {
+                label: "Database",
+                passed: true,
+                value: where + " (schema v" + status.schemaVersion + ", " + (status.tables["sessions"] ?? 0) + " sessions)",
+            };
+        } finally {
+            await closeDatabase(db);
+        }
+    } catch (err) {
+        return {
+            label: "Database",
+            passed: false,
+            ...(where ? { value: where } : {}),
+            hint:
+                (err instanceof Error ? err.message : String(err)) +
+                " — check DATABASE_URL / PANTHEON_DB_PATH, or unset them to use the default SQLite file.",
+        };
+    }
+}
+
 async function checkApiKey(
     envVar: string,
     label: string,
@@ -143,9 +180,12 @@ export async function doctorCommand(): Promise<void> {
     results.push(checkNodeVersion());
     results.push(checkPnpm());
     results.push(checkDocker());
+    results.push(await checkDatabase());
     results.push(await checkGateway());
-    results.push(await checkApiKey("GROQ_API_KEY", "GROQ_API_KEY (routing)", "llama-smart", true));
-    results.push(await checkApiKey("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY (coding agents)", "deepseek-v4-flash", false));
+    // Ping the models the configuration actually routes to, not fixed names
+    const tiers = loadConfig().routing.tiers;
+    results.push(await checkApiKey("GROQ_API_KEY", "GROQ_API_KEY (routing)", tiers.general, true));
+    results.push(await checkApiKey("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY (coding agents)", tiers.simple, false));
 
     if (!caps.anthropicFallbackEnabled && !caps.openaiFallbackEnabled) {
         results.push({

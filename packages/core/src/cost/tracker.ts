@@ -1,78 +1,84 @@
-import { desc, sql } from "drizzle-orm";
+import { desc, eq, count, sum } from "drizzle-orm";
 import type { UsageRecord } from "@pantheon/shared";
-import { getDb, type PantheonDatabase } from "../db/client.js";
-import { usageRecords } from "../db/schema.js";
+import { DbStore } from "../db/store.js";
 
-export class CostTracker {
-    private db: PantheonDatabase;
-
-    constructor(db?: PantheonDatabase) {
-        this.db = db ?? getDb();
+export class CostTracker extends DbStore {
+    async record(usage: Omit<UsageRecord, "id">): Promise<void> {
+        const { usageRecords } = this.t;
+        await this.db.insert(usageRecords).values({
+            timestamp: usage.timestamp,
+            modelId: usage.modelId,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            costUsd: usage.costUsd,
+            promptPreview: usage.promptPreview,
+            ...(usage.sessionId ? { sessionId: usage.sessionId } : {}),
+        });
     }
 
-    record(usage: Omit<UsageRecord, "id">): void {
-        this.db
-            .insert(usageRecords)
-            .values({
-                timestamp: usage.timestamp,
-                modelId: usage.modelId,
-                inputTokens: usage.inputTokens,
-                outputTokens: usage.outputTokens,
-                costUsd: usage.costUsd,
-                promptPreview: usage.promptPreview,
-            })
-            .run();
-    }
-
-    getSummary(): { totalCalls: number; totalInputTokens: number; totalOutputTokens: number; totalCostUsd: number } {
-        const result = this.db
+    /**
+     * Totals for all usage, or for a single session when `sessionId` is given.
+     */
+    async getSummary(sessionId?: string): Promise<{ totalCalls: number; totalInputTokens: number; totalOutputTokens: number; totalCostUsd: number }> {
+        const { usageRecords } = this.t;
+        // Aggregates come back as numbers on SQLite but as strings on PostgreSQL
+        // (COUNT/SUM are bigint/numeric there), hence the Number() coercion.
+        const [row] = await this.db
             .select({
-                totalCalls: sql<number>`CAST(COUNT(*) AS INTEGER)`,
-                totalInputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.inputTokens}), 0) AS INTEGER)`,
-                totalOutputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.outputTokens}), 0) AS INTEGER)`,
-                totalCostUsd: sql<number>`CAST(COALESCE(SUM(${usageRecords.costUsd}), 0) AS REAL)`,
+                totalCalls: count(),
+                totalInputTokens: sum(usageRecords.inputTokens),
+                totalOutputTokens: sum(usageRecords.outputTokens),
+                totalCostUsd: sum(usageRecords.costUsd),
             })
             .from(usageRecords)
-            .get();
-        return result || { totalCalls: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 };
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined);
+        return {
+            totalCalls: Number(row?.totalCalls ?? 0),
+            totalInputTokens: Number(row?.totalInputTokens ?? 0),
+            totalOutputTokens: Number(row?.totalOutputTokens ?? 0),
+            totalCostUsd: Number(row?.totalCostUsd ?? 0),
+        };
     }
 
-    getByModel(): Record<string, { calls: number; inputTokens: number; outputTokens: number; costUsd: number }> {
-        const rows = this.db
+    async getByModel(sessionId?: string): Promise<Record<string, { calls: number; inputTokens: number; outputTokens: number; costUsd: number }>> {
+        const { usageRecords } = this.t;
+        const rows = await this.db
             .select({
                 modelId: usageRecords.modelId,
-                calls: sql<number>`CAST(COUNT(*) AS INTEGER)`,
-                inputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.inputTokens}), 0) AS INTEGER)`,
-                outputTokens: sql<number>`CAST(COALESCE(SUM(${usageRecords.outputTokens}), 0) AS INTEGER)`,
-                costUsd: sql<number>`CAST(COALESCE(SUM(${usageRecords.costUsd}), 0) AS REAL)`,
+                calls: count(),
+                inputTokens: sum(usageRecords.inputTokens),
+                outputTokens: sum(usageRecords.outputTokens),
+                costUsd: sum(usageRecords.costUsd),
             })
             .from(usageRecords)
-            .groupBy(usageRecords.modelId)
-            .all();
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined)
+            .groupBy(usageRecords.modelId);
 
         return Object.fromEntries(
             rows.map((r) => [
                 r.modelId,
                 {
-                    calls: r.calls,
-                    inputTokens: r.inputTokens,
-                    outputTokens: r.outputTokens,
-                    costUsd: r.costUsd,
+                    calls: Number(r.calls),
+                    inputTokens: Number(r.inputTokens ?? 0),
+                    outputTokens: Number(r.outputTokens ?? 0),
+                    costUsd: Number(r.costUsd ?? 0),
                 },
             ])
         );
     }
 
-    getRecent(n = 10): UsageRecord[] {
+    async getRecent(n = 10, sessionId?: string): Promise<UsageRecord[]> {
+        const { usageRecords } = this.t;
         return this.db
             .select()
             .from(usageRecords)
+            .where(sessionId ? eq(usageRecords.sessionId, sessionId) : undefined)
             .orderBy(desc(usageRecords.id))
-            .limit(n)
-            .all();
+            .limit(n);
     }
 
-    reset(): void {
-        this.db.delete(usageRecords).run();
+    async reset(): Promise<void> {
+        const { usageRecords } = this.t;
+        await this.db.delete(usageRecords);
     }
 }

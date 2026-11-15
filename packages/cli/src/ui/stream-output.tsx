@@ -18,7 +18,7 @@ export function StreamOutput({ stream, onDone }: Props) {
             }
             onDone(accumulated);
         };
-        run();
+        void run();
     }, []);
 
     return (

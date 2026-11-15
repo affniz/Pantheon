@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import Database from "better-sqlite3";
-import { createTestDb } from "../../db/client.js";
+import { createTestDb, rawExecutor } from "../../db/client.js";
 import { Gateway } from "../gateway.js";
 import type { ChatMessage } from "@pantheon/shared";
 
@@ -390,9 +390,9 @@ describe("Gateway — cost computation", () => {
 
         await gateway.complete(MESSAGES, "priced");
 
-        const row = _testDb!.$client.prepare("SELECT cost_usd, model_id FROM usage_records").get() as
-            | { cost_usd: number; model_id: string }
-            | undefined;
+        const [row] = await rawExecutor(_testDb!).all<{ cost_usd: number; model_id: string }>(
+            "SELECT cost_usd, model_id FROM usage_records",
+        );
         expect(row?.model_id).toBe("priced");
         expect(row?.cost_usd).toBeCloseTo(1 * 1 + 0.5 * 2, 6);
     });
@@ -406,7 +406,226 @@ describe("Gateway — cost computation", () => {
         }));
 
         await gateway.complete(MESSAGES, "free");
-        const row = _testDb!.$client.prepare("SELECT cost_usd FROM usage_records").get() as { cost_usd: number };
-        expect(row.cost_usd).toBe(0);
+        const [row] = await rawExecutor(_testDb!).all<{ cost_usd: number }>("SELECT cost_usd FROM usage_records");
+        expect(row?.cost_usd).toBe(0);
+    });
+});
+
+describe("Gateway — per-session usage attribution", () => {
+    beforeEach(() => {
+        _testDb = createTestDb(new Database(":memory:"));
+    });
+
+    const okResponse = async () => ({
+        choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+    });
+    const usageRows = () =>
+        rawExecutor(_testDb!).all<{ session_id: string | null; input_tokens: number }>(
+            "SELECT session_id, input_tokens FROM usage_records",
+        );
+    const createSession = async (id: string) => {
+        await rawExecutor(_testDb!).exec(
+            `INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('${id}', 't', 'now', 'now')`,
+        );
+    };
+
+    it("stamps usage with the gateway's sessionId", async () => {
+        await createSession("sess-1");
+        const gateway = new Gateway(makeRegistry() as any, undefined, { ...FAST, sessionId: "sess-1" });
+        patchCompletionsFn(gateway, okResponse);
+        await gateway.complete(MESSAGES, "m");
+        expect(await usageRows()).toEqual([{ session_id: "sess-1", input_tokens: 7 }]);
+    });
+
+    it("falls back to the session of the active trace", async () => {
+        await createSession("traced");
+        const { Tracer } = await import("../../tracing/tracer.js");
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        await Tracer.startTrace("traced", () => gateway.complete(MESSAGES, "m"));
+        expect((await usageRows())[0]?.session_id).toBe("traced");
+    });
+
+    it("records usage without a session when none is known", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        await gateway.complete(MESSAGES, "m");
+        expect(await usageRows()).toEqual([{ session_id: null, input_tokens: 7 }]);
+    });
+
+    it("still records the usage when the session row does not exist", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, { ...FAST, sessionId: "never-saved" });
+        patchCompletionsFn(gateway, okResponse);
+        const result = await gateway.complete(MESSAGES, "m");
+        expect(result.message.content).toBe("ok");
+        expect(await usageRows()).toEqual([{ session_id: null, input_tokens: 7 }]);
+    });
+
+    it("a completely failing usage write never fails the model call", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, okResponse);
+        (gateway as any).tracker = { record: vi.fn().mockRejectedValue(new Error("disk full")) };
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        try {
+            await expect(gateway.complete(MESSAGES, "m")).resolves.toMatchObject({ message: { content: "ok" } });
+            expect(String(stderr.mock.calls.at(-1)?.[0])).toMatch(/failed to record usage.*disk full/);
+        } finally {
+            stderr.mockRestore();
+        }
+    });
+});
+
+describe("Gateway — streaming completions (onToken)", () => {
+    beforeEach(() => {
+        _testDb = createTestDb(new Database(":memory:"));
+    });
+
+    type Chunk = { choices: Array<{ delta?: Record<string, unknown> }>; usage?: { prompt_tokens: number; completion_tokens: number } };
+    const chunk = (delta: Record<string, unknown>): Chunk => ({ choices: [{ delta }] });
+    /** A fake streaming response: yields the chunks, optionally failing part-way. */
+    function streamOf(chunks: Chunk[], failAfter?: number) {
+        return (async function* () {
+            for (let i = 0; i < chunks.length; i++) {
+                if (failAfter !== undefined && i === failAfter) throw new Error("connection reset");
+                yield chunks[i]!;
+            }
+        })();
+    }
+
+    it("forwards text as it arrives and returns the same message a non-streaming call would", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        const create = patchCompletionsFn(gateway, async () => streamOf([
+            chunk({ role: "assistant", content: "Hel" }),
+            chunk({ content: "lo " }),
+            chunk({ content: "world" }),
+            { choices: [], usage: { prompt_tokens: 9, completion_tokens: 4 } },
+        ]) as never);
+
+        const tokens: string[] = [];
+        const result = await gateway.complete(MESSAGES, "m", undefined, { onToken: (t) => tokens.push(t) });
+
+        expect(tokens).toEqual(["Hel", "lo ", "world"]);
+        expect(result.message).toEqual({ role: "assistant", content: "Hello world" });
+        expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 4 });
+        expect((create.mock.calls[0]![0] as any).stream).toBe(true);
+        expect((create.mock.calls[0]![0] as any).stream_options).toEqual({ include_usage: true });
+    });
+
+    it("stitches tool calls back together from fragments, including two calls interleaved by index", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, async () => streamOf([
+            chunk({ content: "Looking." }),
+            chunk({ tool_calls: [{ index: 0, id: "call_a", function: { name: "read_file", arguments: "" } }] }),
+            chunk({ tool_calls: [{ index: 0, function: { arguments: '{"path":' } }] }),
+            chunk({ tool_calls: [{ index: 1, id: "call_b", function: { name: "grep", arguments: '{"pat' } }] }),
+            chunk({ tool_calls: [{ index: 0, function: { arguments: '"a.ts"}' } }] }),
+            chunk({ tool_calls: [{ index: 1, function: { arguments: 'tern":"x"}' } }] }),
+        ]) as never);
+
+        const tokens: string[] = [];
+        const result = await gateway.complete(MESSAGES, "m", [], { onToken: (t) => tokens.push(t) });
+
+        expect(tokens).toEqual(["Looking."]); // tool-call fragments are not text
+        expect(result.message.content).toBe("Looking.");
+        expect(result.message.toolCalls).toEqual([
+            { id: "call_a", name: "read_file", arguments: { path: "a.ts" } },
+            { id: "call_b", name: "grep", arguments: { pattern: "x" } },
+        ]);
+    });
+
+    it("does not request a stream when no onToken is given", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        const create = patchCompletions(gateway, new Map([["m", "plain"]]));
+        await gateway.complete(MESSAGES, "m");
+        expect((create.mock.calls[0]![0] as any).stream).toBeUndefined();
+    });
+
+    it("retries a stream that failed before producing any text", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        let attempt = 0;
+        const create = patchCompletionsFn(gateway, async () => {
+            attempt++;
+            return (attempt === 1 ? streamOf([chunk({ content: "x" })], 0) : streamOf([chunk({ content: "recovered" })])) as never;
+        });
+        const tokens: string[] = [];
+        const result = await gateway.complete(MESSAGES, "m", undefined, { onToken: (t) => tokens.push(t) });
+        expect(result.message.content).toBe("recovered");
+        expect(tokens).toEqual(["recovered"]);
+        expect(create).toHaveBeenCalledTimes(2);
+    });
+
+    it("never retries or fails over once text has reached the caller (it would be repeated)", async () => {
+        const registry = makeRegistry(["model-a", "model-b"]);
+        const onFallback = vi.fn();
+        const gateway = new Gateway(registry as any, onFallback, FAST);
+        const create = patchCompletionsFn(gateway, async () =>
+            streamOf([chunk({ content: "Half an ans" }), chunk({ content: "wer" })], 1) as never);
+
+        const tokens: string[] = [];
+        await expect(gateway.complete(MESSAGES, "model-a", undefined, { onToken: (t) => tokens.push(t) }))
+            .rejects.toThrow("connection reset");
+        expect(tokens).toEqual(["Half an ans"]);
+        expect(create).toHaveBeenCalledTimes(1);   // no retry on model-a
+        expect(onFallback).not.toHaveBeenCalled(); // no failover to model-b
+    });
+
+    it("fails over before any text was produced", async () => {
+        const registry = makeRegistry(["model-a", "model-b"]);
+        const onFallback = vi.fn();
+        const gateway = new Gateway(registry as any, onFallback, FAST);
+        patchCompletionsFn(gateway, async (params) => {
+            if (params.model === "model-a") throw new Error("503");
+            return streamOf([chunk({ content: "from b" })]) as never;
+        });
+        const tokens: string[] = [];
+        const result = await gateway.complete(MESSAGES, "model-a", undefined, { onToken: (t) => tokens.push(t) });
+        expect(result.message.content).toBe("from b");
+        expect(tokens).toEqual(["from b"]);
+        expect(onFallback).toHaveBeenCalledWith("model-a", "model-b", expect.any(String));
+    });
+});
+
+describe("Gateway — model parameters come from config", () => {
+    beforeEach(() => {
+        _testDb = createTestDb(new Database(":memory:"));
+    });
+
+    it("sends a model's extraParams with every request, and nothing extra for other models", async () => {
+        const registry = makeRegistry();
+        registry.get = vi.fn((id: string) =>
+            id === "reasoner" ? { id, provider: "x", extraParams: { thinking: { type: "enabled" }, reasoning_effort: "high" } } : { id, provider: "x" },
+        ) as any;
+        const gateway = new Gateway(registry as any, undefined, FAST);
+        const create = patchCompletions(gateway, new Map());
+
+        await gateway.complete(MESSAGES, "reasoner");
+        await gateway.complete(MESSAGES, "plain");
+
+        expect(create.mock.calls[0]![0]).toMatchObject({ thinking: { type: "enabled" }, reasoning_effort: "high" });
+        expect(create.mock.calls[1]![0]).not.toHaveProperty("thinking");
+    });
+
+    it("the default failover chain starts at the configured complex-tier model", async () => {
+        const registry = makeRegistry(); // no explicit chain; tiers.complex = deepseek-v4-pro
+        const onFallback = vi.fn();
+        const gateway = new Gateway(registry as any, onFallback, FAST);
+        patchCompletions(gateway, new Map<string, string | Error>([["deepseek-v4-pro", new Error("down")], ["claude-fallback", "rescued"]]));
+        const result = await gateway.complete(MESSAGES, "deepseek-v4-pro");
+        expect(result.message.content).toBe("rescued");
+        expect(onFallback).toHaveBeenCalledWith("deepseek-v4-pro", "claude-fallback", expect.any(String));
+    });
+
+    it("records the classifier's own token usage", async () => {
+        const gateway = new Gateway(makeRegistry() as any, undefined, FAST);
+        patchCompletionsFn(gateway, async () => ({
+            choices: [{ message: { role: "assistant", content: "standard 0.9" } }],
+            usage: { prompt_tokens: 120, completion_tokens: 3 },
+        }));
+        await gateway.resolveRouting([{ role: "user", content: "refactor the session manager to use transactions" }]);
+        const rows = await rawExecutor(_testDb!).all<{ model_id: string; input_tokens: number; prompt_preview: string }>(
+            "SELECT model_id, input_tokens, prompt_preview FROM usage_records",
+        );
+        expect(rows).toEqual([{ model_id: "llama-smart", input_tokens: 120, prompt_preview: expect.stringContaining("[routing]") }]);
     });
 });

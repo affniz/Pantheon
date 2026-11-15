@@ -6,13 +6,13 @@ const dim = chalk.hex("#6B7280");
 const brand = chalk.hex("#F5A623");
 const accent = chalk.hex("#56B6C2");
 
-export async function costSummary() {
+export async function costSummary(opts: { session?: string } = {}) {
     await ensureServerRunning();
     const client = new PantheonApiClient();
-    const { summary, byModel } = await client.getCostSummary();
+    const { summary, byModel } = await client.getCostSummary(opts.session);
 
     console.log("");
-    console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Usage Summary")}`);
+    console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Usage Summary")}${opts.session ? dim(`  session ${opts.session.slice(0, 8)}`) : ""}`);
     console.log(`  ${dim("─".repeat(50))}`);
     console.log(`  ${dim("Total calls:")}         ${summary.totalCalls}`);
     console.log(`  ${dim("Total input tokens:")}  ${summary.totalInputTokens.toLocaleString()}`);
@@ -33,10 +33,10 @@ export async function costSummary() {
     console.log("");
 }
 
-export async function costRecent(n = 10) {
+export async function costRecent(n = 10, sessionId?: string) {
     await ensureServerRunning();
     const client = new PantheonApiClient();
-    const records = await client.getCostRecent(n);
+    const records = await client.getCostRecent(n, sessionId);
 
     if (records.length === 0) {
         console.log(dim("\n  No usage records found.\n"));

@@ -21,12 +21,9 @@ services:
       dockerfile: Dockerfile.server
     container_name: pantheon-server
     ports:
-      - "3000:3000"
-    volumes:
-      # Mount the host home directory so the server can read/write user project files.
-      # The CLI sends its process.cwd() (e.g. /Users/foo/project) as workingDir;
-      # that path must exist inside the container at the same location.
-      - ${HOME}:${HOME}
+      # Published to this machine only. To reach the API from other hosts, change
+      # this to "3000:3000" AND set PANTHEON_AUTH=required in .env.
+      - "127.0.0.1:3000:3000"
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
@@ -39,6 +36,57 @@ services:
       # Fallback workspace root used when the CLI doesn't send workingDir.
       # Override this to point at a specific project if needed.
       - PANTHEON_WORKSPACE=${PANTHEON_WORKSPACE:-${HOME}}
+      # ── Storage ────────────────────────────────────────────────────────────
+      # Default: SQLite on the named volume below, so sessions survive container
+      # rebuilds. To use PostgreSQL instead, set DATABASE_URL in .env — e.g. for
+      # the bundled `postgres` service (docker compose --profile postgres up -d):
+      #   DATABASE_URL=postgres://pantheon:pantheon@postgres:5432/pantheon
+      - PANTHEON_DB_PATH=/data/pantheon.db
+      - DATABASE_URL=${DATABASE_URL:-}
+      # ── Authentication (see README → Authentication) ───────────────────────
+      - PANTHEON_EMBEDDING_MODEL=${PANTHEON_EMBEDDING_MODEL:-}
+      - PANTHEON_TRUST_PROXY=${PANTHEON_TRUST_PROXY:-}
+      - PANTHEON_AUTH=${PANTHEON_AUTH:-off}
+      - PANTHEON_JWT_SECRET=${PANTHEON_JWT_SECRET:-}
+      - PANTHEON_PUBLIC_URL=${PANTHEON_PUBLIC_URL:-}
+      - PANTHEON_ALLOWED_EMAILS=${PANTHEON_ALLOWED_EMAILS:-}
+      - PANTHEON_GITHUB_CLIENT_ID=${PANTHEON_GITHUB_CLIENT_ID:-}
+      - PANTHEON_GITHUB_CLIENT_SECRET=${PANTHEON_GITHUB_CLIENT_SECRET:-}
+      - PANTHEON_GOOGLE_CLIENT_ID=${PANTHEON_GOOGLE_CLIENT_ID:-}
+      - PANTHEON_GOOGLE_CLIENT_SECRET=${PANTHEON_GOOGLE_CLIENT_SECRET:-}
+    volumes:
+      # Mount the host home directory so the server can read/write user project files.
+      # The CLI sends its process.cwd() (e.g. /Users/foo/project) as workingDir;
+      # that path must exist inside the container at the same location.
+      - ${HOME}:${HOME}
+      - pantheon-data:/data
     depends_on:
       - litellm
     restart: unless-stopped
+
+  # Optional PostgreSQL backend (v0.9). Not started by a plain `docker compose up`:
+  #   docker compose --profile postgres up -d
+  # Change POSTGRES_PASSWORD before exposing this beyond your own machine.
+  postgres:
+    image: postgres:16-alpine
+    container_name: pantheon-postgres
+    profiles: ["postgres"]
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-pantheon}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-pantheon}
+      - POSTGRES_DB=${POSTGRES_DB:-pantheon}
+    ports:
+      # Bound to localhost only; the host CLI (`pantheon db migrate`) reaches it here.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pantheon-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pantheon} -d ${POSTGRES_DB:-pantheon}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pantheon-data:
+  pantheon-pgdata:

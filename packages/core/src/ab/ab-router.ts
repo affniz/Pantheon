@@ -28,20 +28,24 @@ export class ABRouter {
      * Given a routing decision, check if an active experiment applies.
      * Returns the arm and model to use, or null if no experiment is active.
      *
-     * @param decision - The routing decision from the classifier (reserved for tier-scoped experiments).
+     * @param decision - The routing decision from the classifier. Experiments that declare
+     *   `tiers` only apply when `decision.tier` is one of them.
      * @param sessionId - Used to seed deterministic assignment per session.
      * @param experimentId - Optional explicit experiment to route through. When given and it
-     *   names an active experiment, that experiment is used; otherwise the first active one is.
+     *   names an applicable experiment, that experiment is used; otherwise the first applicable one is.
      */
-    resolveArm(_decision: RoutingDecision, sessionId: string, experimentId?: string): ABResolution | null {
-        const activeExperiments = this.config.experiments.filter((e) => e.active);
+    resolveArm(decision: RoutingDecision, sessionId: string, experimentId?: string): ABResolution | null {
+        const activeExperiments = this.config.experiments.filter(
+            (e) => e.active && (!e.tiers || e.tiers.length === 0 || e.tiers.includes(decision.tier)),
+        );
         if (activeExperiments.length === 0) return null;
 
         const requested = experimentId
             ? activeExperiments.find((e) => e.id === experimentId)
             : undefined;
         if (experimentId && !requested) {
-            // Caller asked for a specific experiment that is not active — do not silently
+            // Caller asked for a specific experiment that is not active (or does not
+            // cover this prompt's tier) — do not silently
             // route through a different one.
             return null;
         }

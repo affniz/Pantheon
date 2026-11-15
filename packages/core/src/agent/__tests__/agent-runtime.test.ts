@@ -405,4 +405,234 @@ describe("AgentRuntime — run options", () => {
         expect(result.usage).toEqual({ inputTokens: 20, outputTokens: 40 });
         expect(result.iterations).toBe(2);
     });
+
+    describe("repo map refresh (v0.9)", () => {
+        const writeTool = (name: string): Tool => ({
+            definition: {
+                name,
+                description: name,
+                parameters: { type: "object" as const, properties: { path: { type: "string" as const, description: "p" } }, required: ["path"] },
+                safety: "safe" as const,
+            },
+            execute: vi.fn().mockResolvedValue("Successfully wrote 3 lines"),
+        });
+        const call = (id: string, name: string, path: string): ChatMessage => ({
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id, name, arguments: { path } }],
+        });
+        /**
+         * System prompt the gateway saw on its Nth complete() call. Captured at call
+         * time: the runtime passes its live message array, so inspecting the mock's
+         * recorded arguments afterwards would only ever show the final state.
+         */
+        const seenPrompts = new WeakMap<Gateway, string[]>();
+        const systemPromptOf = (gateway: Gateway, n: number): string => seenPrompts.get(gateway)![n]!;
+        const createMockGateway = (responses: ChatMessage[]): Gateway => {
+            const prompts: string[] = [];
+            const queue = [...responses];
+            const gateway = {
+                resolveRouting: vi.fn().mockResolvedValue({ tier: "standard", selectedModelId: "test-model", reason: "mock" }),
+                complete: vi.fn(async (msgs: ChatMessage[]) => {
+                    prompts.push(msgs[0]!.content);
+                    return { message: queue.shift()!, usage: { inputTokens: 1, outputTokens: 1 } };
+                }),
+                stream: vi.fn(),
+            } as unknown as Gateway;
+            seenPrompts.set(gateway, prompts);
+            return gateway;
+        };
+
+        it("rebuilds the map after a source file is written and uses it for the next LLM call", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/new-module.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            const refreshRepoMap = vi.fn().mockResolvedValue("MAP v2: new-module.ts exports fn added()");
+
+            const runtime = new AgentRuntime(gateway, registry, { ...config, repoMap: "MAP v1", refreshRepoMap });
+            await runtime.run([{ role: "user", content: "add a module" }]);
+
+            expect(refreshRepoMap).toHaveBeenCalledTimes(1);
+            expect(systemPromptOf(gateway, 0)).toContain("MAP v1");
+            expect(systemPromptOf(gateway, 1)).toContain("MAP v2: new-module.ts exports fn added()");
+            expect(systemPromptOf(gateway, 1)).not.toContain("MAP v1");
+        });
+
+        it("refreshes once per iteration even when several files are edited", async () => {
+            const gateway = createMockGateway([
+                {
+                    role: "assistant",
+                    content: "",
+                    toolCalls: [
+                        { id: "1", name: "edit_file", arguments: { path: "a.ts" } },
+                        { id: "2", name: "edit_file", arguments: { path: "b.tsx" } },
+                    ],
+                },
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("edit_file"));
+            const refreshRepoMap = vi.fn().mockResolvedValue("fresh");
+
+            await new AgentRuntime(gateway, registry, { ...config, repoMap: "old", refreshRepoMap })
+                .run([{ role: "user", content: "x" }]);
+            expect(refreshRepoMap).toHaveBeenCalledTimes(1);
+        });
+
+        it("does not refresh for non-source files, read-only tools, or failed writes", async () => {
+            const failing = writeTool("edit_file");
+            vi.mocked(failing.execute).mockResolvedValue("Error: targetContent not found");
+            const gateway = createMockGateway([
+                call("1", "write_file", "README.md"),
+                call("2", "testTool", "src/a.ts"),
+                call("3", "edit_file", "src/a.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            registry.register(failing);
+            registry.register(createTestTool());
+            const refreshRepoMap = vi.fn().mockResolvedValue("fresh");
+
+            await new AgentRuntime(gateway, registry, { ...config, repoMap: "old", refreshRepoMap })
+                .run([{ role: "user", content: "x" }]);
+            expect(refreshRepoMap).not.toHaveBeenCalled();
+        });
+
+        it("keeps the previous map when the refresh fails", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/a.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+            const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+            try {
+                const result = await new AgentRuntime(gateway, registry, {
+                    ...config,
+                    repoMap: "MAP v1",
+                    refreshRepoMap: vi.fn().mockRejectedValue(new Error("ts-morph blew up")),
+                }).run([{ role: "user", content: "x" }]);
+
+                expect(result.response).toBe("done");
+                expect(systemPromptOf(gateway, 1)).toContain("MAP v1");
+            } finally {
+                stderr.mockRestore();
+            }
+        });
+
+        it("adds a map on refresh even when none was supplied initially", async () => {
+            const gateway = createMockGateway([
+                call("1", "write_file", "src/first.ts"),
+                { role: "assistant", content: "done" },
+            ]);
+            const registry = new ToolRegistry();
+            registry.register(writeTool("write_file"));
+
+            await new AgentRuntime(gateway, registry, { ...config, refreshRepoMap: async () => "BRAND NEW MAP" })
+                .run([{ role: "user", content: "x" }]);
+            expect(systemPromptOf(gateway, 0)).not.toContain("## Codebase Map");
+            expect(systemPromptOf(gateway, 1)).toContain("## Codebase Map\nBRAND NEW MAP");
+        });
+    });
+
+    describe("prompt versioning in traces (v0.9)", () => {
+        async function turnSpanAttributes(cfg: Partial<AgentConfig>): Promise<Record<string, unknown>> {
+            const { TraceCollector } = await import("../../tracing/collector.js");
+            const { TraceStore } = await import("../../tracing/store.js");
+            _testDb = createTestDb(new Database(":memory:"));
+            const gateway = createMockGateway([{ role: "assistant", content: "hi" }]);
+            await new AgentRuntime(gateway, new ToolRegistry(), { ...config, ...cfg }).run([{ role: "user", content: "x" }]);
+            await TraceCollector.flush();
+            const store = new TraceStore(_testDb);
+            const [trace] = await store.listTraces(1);
+            const spans = await store.getSpans(trace!.traceId);
+            return spans.find((s) => s.name === "agent.turn")!.attributes;
+        }
+
+        it("records a stable hash of the system prompt on the agent.turn span", async () => {
+            const { hashPrompt } = await import("../agent-runtime.js");
+            const a = await turnSpanAttributes({});
+            const b = await turnSpanAttributes({});
+            expect(a["systemPromptHash"]).toMatch(/^[0-9a-f]{12}$/);
+            expect(a["systemPromptHash"]).toBe(b["systemPromptHash"]);
+            expect(hashPrompt("x")).toBe(hashPrompt("x"));
+            expect(hashPrompt("x")).not.toBe(hashPrompt("y"));
+        });
+
+        it("changes when the instructions change, but not when only the repo map does", async () => {
+            const base = await turnSpanAttributes({});
+            const custom = await turnSpanAttributes({ systemPrompt: "Always answer in French." });
+            const withMap = await turnSpanAttributes({ repoMap: "some map" });
+            expect(custom["systemPromptHash"]).not.toBe(base["systemPromptHash"]);
+            expect(withMap["systemPromptHash"]).toBe(base["systemPromptHash"]);
+        });
+    });
+
+    describe("live text and turn transcript (v0.9.1)", () => {
+        const toolCall = (id: string): ChatMessage => ({ role: "assistant", content: "Let me check.", toolCalls: [{ id, name: "testTool", arguments: { input: "x" } }] });
+
+        it("returns every message the turn produced, in order", async () => {
+            const gateway = createMockGateway([toolCall("t1"), { role: "assistant", content: "All done." }]);
+            const registry = new ToolRegistry();
+            registry.register(createTestTool());
+            const result = await new AgentRuntime(gateway, registry, config).run([{ role: "user", content: "go" }]);
+
+            expect(result.messages.map((m) => m.role)).toEqual(["assistant", "tool", "assistant"]);
+            expect(result.messages[0]).toMatchObject({ content: "Let me check.", toolCalls: [{ id: "t1", name: "testTool" }] });
+            expect(result.messages[1]).toMatchObject({ content: "tool result content", toolCallId: "t1" });
+            expect(result.messages[2]).toMatchObject({ content: "All done." });
+            expect(result.messages.every((m) => m.timestamp instanceof Date)).toBe(true);
+            // The user's own message is not part of what the turn added
+            expect(result.messages.some((m) => m.role === "user")).toBe(false);
+        });
+
+        it("records failed and unknown tool calls in the transcript too", async () => {
+            const gateway = createMockGateway([
+                { role: "assistant", content: "", toolCalls: [{ id: "u1", name: "no_such_tool", arguments: {} }] },
+                { role: "assistant", content: "That tool does not exist." },
+            ]);
+            const result = await new AgentRuntime(gateway, new ToolRegistry(), config).run([{ role: "user", content: "go" }]);
+            expect(result.messages.map((m) => m.role)).toEqual(["assistant", "tool", "assistant"]);
+            expect(result.messages[1]!.content).toContain('Unknown tool "no_such_tool"');
+        });
+
+        it("forwards text through onText — the whole response, exactly once, with a break between iterations", async () => {
+            // This mock does not stream, so each message arrives in one piece
+            const gateway = createMockGateway([toolCall("t1"), { role: "assistant", content: "All done." }]);
+            const registry = new ToolRegistry();
+            registry.register(createTestTool());
+            const chunks: string[] = [];
+            const result = await new AgentRuntime(gateway, registry, { ...config, onText: (d) => chunks.push(d) })
+                .run([{ role: "user", content: "go" }]);
+
+            expect(chunks).toEqual(["Let me check.", "\n\n", "All done."]);
+            expect(chunks.join("").endsWith(result.response)).toBe(true);
+        });
+
+        it("uses the gateway's token stream when it provides one, without sending the text again", async () => {
+            const gateway = {
+                resolveRouting: vi.fn().mockResolvedValue({ tier: "standard", selectedModelId: "m", reason: "mock" }),
+                complete: vi.fn(async (_m: ChatMessage[], _model: string, _tools: unknown, options?: { onToken?: (d: string) => void }) => {
+                    options?.onToken?.("Str");
+                    options?.onToken?.("eamed");
+                    return { message: { role: "assistant" as const, content: "Streamed" }, usage: { inputTokens: 1, outputTokens: 1 } };
+                }),
+                stream: vi.fn(),
+            } as unknown as Gateway;
+            const chunks: string[] = [];
+            await new AgentRuntime(gateway, new ToolRegistry(), { ...config, onText: (d) => chunks.push(d) })
+                .run([{ role: "user", content: "go" }]);
+            expect(chunks).toEqual(["Str", "eamed"]);
+        });
+
+        it("does not ask the gateway to stream when nobody is listening", async () => {
+            const gateway = createMockGateway([{ role: "assistant", content: "quiet" }]);
+            await new AgentRuntime(gateway, new ToolRegistry(), config).run([{ role: "user", content: "go" }]);
+            expect(vi.mocked(gateway.complete).mock.calls[0]![3]).toBeUndefined();
+        });
+    });
 });

@@ -159,7 +159,7 @@ describe("ConsensusEngine (extended)", () => {
         const engine = new ConsensusEngine(gateway as any, BASE_CONFIG);
         const result = await engine.run(MESSAGES); // no sessionId
 
-        const { schema } = await import("../../db/index.js");
+        const { sqliteSchema: schema } = await import("../../db/index.js");
         const db = _testDb!;
         const rows = db.select().from(schema.consensusRuns).all();
         const row = rows.find((r) => r.id === result.runId);
@@ -170,7 +170,7 @@ describe("ConsensusEngine (extended)", () => {
 
     it("stores sessionId in DB when a valid session exists", async () => {
         // Create a real session first to satisfy the FK constraint
-        const { schema } = await import("../../db/index.js");
+        const { sqliteSchema: schema } = await import("../../db/index.js");
         const db = _testDb!;
         const realSessionId = "sess-" + Math.random().toString(36).slice(2, 10);
         const now = new Date().toISOString();

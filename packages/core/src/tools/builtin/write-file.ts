@@ -41,11 +41,13 @@ export const writeFileTool: Tool = {
         try {
             const resolved = sandbox.resolvePath(filePath);
 
-            // Ensure parent directories exist
-            const dir = path.dirname(resolved);
-            fs.mkdirSync(dir, { recursive: true });
-
-            fs.writeFileSync(resolved, content, "utf-8");
+            // During orchestration this is serialised with other agents' writes, and
+            // refused if it would replace a file another agent has just written.
+            await sandbox.guardWrite(resolved, "create", () => {
+                // Ensure parent directories exist
+                fs.mkdirSync(path.dirname(resolved), { recursive: true });
+                fs.writeFileSync(resolved, content, "utf-8");
+            });
 
             const lines = content.split("\n").length;
             return `Successfully wrote ${lines} lines to ${resolved}`;

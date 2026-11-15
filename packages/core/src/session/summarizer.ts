@@ -1,20 +1,19 @@
-import { eq, desc } from "drizzle-orm";
+import { eq, ne, and, desc, inArray } from "drizzle-orm";
 import type { ChatMessage } from "@pantheon/shared";
 import type { Gateway } from "../gateway/gateway.js";
-import { getDb, type PantheonDatabase } from "../db/client.js";
-import { sessionSummaries, sessions, messages } from "../db/schema.js";
+import type { PantheonDatabase } from "../db/client.js";
+import { DbStore } from "../db/store.js";
 
 const SUMMARY_PROMPT = `Summarize this conversation in 2-3 sentences. Focus on what was discussed and what was accomplished. Be concise and specific.`;
 
-export class SessionSummarizer {
-    private db: PantheonDatabase;
+export class SessionSummarizer extends DbStore {
     private gateway: Gateway;
     private modelId: string;
 
     constructor(gateway: Gateway, modelId: string, db?: PantheonDatabase) {
+        super(db);
         this.gateway = gateway;
         this.modelId = modelId;
-        this.db = db ?? getDb();
     }
 
     async summarize(msgs: ChatMessage[]): Promise<string> {
@@ -34,37 +33,37 @@ export class SessionSummarizer {
     }
 
     async saveForSession(sessionId: string, msgs: ChatMessage[]): Promise<void> {
-        // Check if summary already exists
-        const existing = this.db
-            .select()
-            .from(sessionSummaries)
-            .where(eq(sessionSummaries.sessionId, sessionId))
-            .get();
-        if (existing) return; // Don't regenerate
+        const { sessionSummaries } = this.t;
+        // Don't regenerate an existing summary
+        if ((await this.getSummary(sessionId)) !== undefined) return;
 
         const summary = await this.summarize(msgs);
-        this.db
+        // Two background summarisations for the same session can overlap (one per
+        // turn); session_id is UNIQUE, so the loser is simply dropped.
+        await this.db
             .insert(sessionSummaries)
             .values({
                 sessionId,
                 summary,
                 createdAt: new Date().toISOString(),
             })
-            .run();
+            .onConflictDoNothing();
     }
 
-    getSummary(sessionId: string): string | undefined {
-        const row = this.db
+    async getSummary(sessionId: string): Promise<string | undefined> {
+        const { sessionSummaries } = this.t;
+        const [row] = await this.db
             .select()
             .from(sessionSummaries)
             .where(eq(sessionSummaries.sessionId, sessionId))
-            .get();
+            .limit(1);
         return row?.summary;
     }
 
-    getRecentSummaries(limit = 5): Array<{ sessionId: string; title: string; summary: string; createdAt: string }> {
+    async getRecentSummaries(limit = 5): Promise<Array<{ sessionId: string; title: string; summary: string; createdAt: string }>> {
+        const { sessionSummaries, sessions } = this.t;
         // Join session_summaries with sessions to get title
-        const rows = this.db
+        const rows = await this.db
             .select({
                 sessionId: sessionSummaries.sessionId,
                 title: sessions.title,
@@ -74,8 +73,7 @@ export class SessionSummarizer {
             .from(sessionSummaries)
             .innerJoin(sessions, eq(sessionSummaries.sessionId, sessions.id))
             .orderBy(desc(sessionSummaries.createdAt))
-            .limit(limit)
-            .all();
+            .limit(limit);
 
         return rows.map(r => ({
             sessionId: r.sessionId,
@@ -96,34 +94,34 @@ export class SessionSummarizer {
      * @param options.recentMessageCount - Number of raw messages from the most recent session. Default: 10.
      * @param options.summaryLimit - Max older sessions to summarize. Default: 4.
      */
-    getEpisodicMemoryContext(
+    async getEpisodicMemoryContext(
         currentSessionId: string,
         options?: { recentMessageCount?: number; summaryLimit?: number }
-    ): string {
+    ): Promise<string> {
+        const { sessions, messages } = this.t;
         const recentMessageCount = options?.recentMessageCount ?? 10;
         const summaryLimit = options?.summaryLimit ?? 4;
 
         const parts: string[] = [];
 
         // ── 1. Find most recent past session ──────────────────────────────────
-        const lastSession = this.db
+        const [lastSession] = await this.db
             .select()
             .from(sessions)
-            .where(eq(sessions.isArchived, false))
+            .where(and(eq(sessions.isArchived, false), ne(sessions.id, currentSessionId)))
             .orderBy(desc(sessions.updatedAt))
-            .limit(10)
-            .all()
-            .find(s => s.id !== currentSessionId);
+            .limit(1);
 
         if (lastSession) {
-            const rawMsgs = this.db
+            // Newest-first with a LIMIT, then reversed — avoids loading a long
+            // session's entire history just to keep its last few messages.
+            const rawMsgs = (await this.db
                 .select()
                 .from(messages)
-                .where(eq(messages.sessionId, lastSession.id))
-                .orderBy(messages.id)
-                .all()
-                .filter(m => m.role === "user" || m.role === "assistant")
-                .slice(-recentMessageCount);
+                .where(and(eq(messages.sessionId, lastSession.id), inArray(messages.role, ["user", "assistant"])))
+                .orderBy(desc(messages.id))
+                .limit(recentMessageCount))
+                .reverse();
 
             if (rawMsgs.length > 0) {
                 const lines = rawMsgs.map(m => `${m.role}: ${m.content.slice(0, 500)}`);
@@ -134,10 +132,11 @@ export class SessionSummarizer {
         }
 
         // ── 2. Older session summaries ─────────────────────────────────────────
-        const allSummaries = this.getRecentSummaries(summaryLimit + 1);
-        const olderSummaries = lastSession
-            ? allSummaries.filter(s => s.sessionId !== lastSession.id)
-            : allSummaries;
+        // +2: the current session and the "last session" above may both have summaries.
+        const allSummaries = await this.getRecentSummaries(summaryLimit + 2);
+        const olderSummaries = allSummaries.filter(
+            s => s.sessionId !== currentSessionId && s.sessionId !== lastSession?.id,
+        );
 
         const cappedOlder = olderSummaries.slice(0, summaryLimit);
 

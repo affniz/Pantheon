@@ -1,0 +1,28 @@
+name: add-function-with-test
+description: Implement to a spec across two files and prove it with the project's own test command.
+prompt: >
+  Add a function `slugify(text)` to src/strings.js and export it. It lower-cases the text,
+  replaces every run of characters that are not letters or digits with a single hyphen, and
+  removes leading and trailing hyphens. Then add assertions for it to test.js.
+files:
+  package.json: |
+    { "name": "strings", "version": "1.0.0", "scripts": { "test": "node test.js" } }
+  src/strings.js: |
+    function capitalize(text) {
+      return text.charAt(0).toUpperCase() + text.slice(1);
+    }
+    module.exports = { capitalize };
+  test.js: |
+    const assert = require("node:assert");
+    const { capitalize } = require("./src/strings.js");
+    assert.strictEqual(capitalize("hello"), "Hello");
+    console.log("ok");
+checks:
+  - command: node test.js
+  - command: >-
+      node -e "const {slugify,capitalize}=require('./src/strings.js');
+      const a=require('node:assert');
+      a.strictEqual(slugify('  Hello, World!  '),'hello-world');
+      a.strictEqual(slugify('A--B__c'),'a-b-c');
+      a.strictEqual(capitalize('x'),'X')"
+  - file_contains: { path: test.js, text: slugify }

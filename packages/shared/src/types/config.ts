@@ -9,6 +9,12 @@ export interface ModelConfig {
      * When omitted, cost is recorded as 0 (tokens are still tracked).
      */
     pricing?: ModelPricing;
+    /**
+     * Extra request parameters sent with every completion for this model — e.g.
+     * `{ thinking: { type: "enabled" }, reasoning_effort: "high" }` for a reasoning
+     * model. Provider-specific knobs belong here, not in code.
+     */
+    extraParams?: Record<string, unknown>;
 }
 
 /** Per-token pricing in USD per 1M tokens. */
@@ -78,6 +84,12 @@ export interface ABExperimentConfig {
     controlModelId: string;
     variantModelId: string;
     active: boolean;
+    /**
+     * Restrict the experiment to prompts routed to these complexity tiers, e.g.
+     * `["simple", "standard"]` to compare two coding models without touching
+     * greetings or orchestrated tasks. Omit (or leave empty) to apply to every request.
+     */
+    tiers?: Array<"general" | "simple" | "standard" | "complex">;
 }
 
 /** Global A/B testing configuration */
@@ -96,6 +108,79 @@ export interface PantheonConfig {
     consensus?: ConsensusConfig;
     /** A/B traffic-splitting configuration (v0.8) */
     ab?: ABConfig;
+    /** Storage backend (v0.9). Omit to use SQLite at ~/.pantheon/pantheon.db. */
+    database?: DatabaseConfig;
+    /** API authentication (v0.9). Omit for the local single-user default (no auth). */
+    auth?: AuthConfig;
+    /** Long-term memory settings (v0.9). */
+    memory?: MemoryConfig;
+}
+
+export interface MemoryConfig {
+    /** Retrieval-augmented memory over past conversations. Off unless enabled. */
+    semantic?: SemanticMemoryConfig;
+}
+
+/**
+ * Semantic memory embeds past messages and retrieves the ones most similar to the
+ * current prompt. It needs an embedding model in litellm-config.yaml — Groq and
+ * DeepSeek do not offer one, so this is opt-in.
+ */
+export interface SemanticMemoryConfig {
+    enabled: boolean;
+    /** LiteLLM model name of the embedding model, e.g. "pantheon-embed". */
+    embeddingModel: string;
+    /** Memories injected per turn. Default 5. */
+    topK?: number;
+    /** Minimum cosine similarity (0–1) for a memory to be used. Default 0.35. */
+    minScore?: number;
+}
+
+/** OAuth application credentials for one sign-in provider. */
+export interface OAuthProviderConfig {
+    clientId: string;
+    /** Prefer the PANTHEON_<PROVIDER>_CLIENT_SECRET environment variable over this field. */
+    clientSecret?: string;
+}
+
+/**
+ * Who may call the API.
+ *
+ * `off` (default) suits the local single-user setup, where the server only listens
+ * on localhost. Set `required` before exposing the server on a network: every
+ * request must then carry an API token or a signed-in session.
+ * Environment variables override this block (see README → Authentication).
+ */
+export interface AuthConfig {
+    mode?: "off" | "required";
+    /**
+     * E-mail addresses allowed to sign in, besides the owner and existing users.
+     * Empty (default): only the first person to sign in — who becomes the owner — gets in.
+     * `["*"]` lets anyone with an account at a configured provider in.
+     */
+    allowedEmails?: string[];
+    /** Public base URL of the server, used to build OAuth redirect URIs. */
+    publicUrl?: string;
+    providers?: {
+        github?: OAuthProviderConfig;
+        google?: OAuthProviderConfig;
+    };
+}
+
+/**
+ * Where Pantheon stores sessions, traces, usage and orchestration state.
+ *
+ * Environment variables take precedence over this block: `DATABASE_URL` overrides
+ * `url`, and `PANTHEON_DB_PATH` overrides `sqlitePath`.
+ */
+export interface DatabaseConfig {
+    /**
+     * Connection URL. `postgres://user:pass@host:5432/db` selects PostgreSQL.
+     * Prefer the `DATABASE_URL` environment variable so credentials stay out of config files.
+     */
+    url?: string;
+    /** SQLite file location, used when no PostgreSQL URL is configured. */
+    sqlitePath?: string;
 }
 
 export interface ShellAllowlistEntry {
@@ -116,6 +201,34 @@ export interface SandboxConfig {
     additionalAllowlist: ShellAllowlistEntry[];
     /** Command binary names to remove from the default allowlist */
     denyFromDefault: string[];
+    /** Where shell commands issued by agents run (v0.9). Default: on the host. */
+    execution?: ExecutionConfig;
+}
+
+/**
+ * Execution backend for the `shell` tool and the reviewer's verification commands.
+ *
+ * `host` runs them as ordinary processes of the Pantheon server — fine for a
+ * single user on their own machine. `docker` runs each command in a throw-away
+ * container that can see only the project directory: use it whenever the server
+ * is reachable by other people.
+ */
+export interface ExecutionConfig {
+    mode: "host" | "docker";
+    /** Container image with the project's toolchain. Default: node:22-slim */
+    image?: string;
+    /** "none" (default) blocks all network access; "bridge" allows outbound connections. */
+    network?: "none" | "bridge";
+    /** Memory limit in docker syntax, e.g. "2g". Default: 2g */
+    memory?: string;
+    /** CPU limit. Default: 2 */
+    cpus?: number;
+    /** Process limit inside the container. Default: 512 */
+    pidsLimit?: number;
+    /** Mount the project read-only for shell commands. Default: false */
+    readOnlyProject?: boolean;
+    /** Path of the docker (or podman) binary. Default: "docker" */
+    dockerPath?: string;
 }
 
 export interface PluginsConfig {

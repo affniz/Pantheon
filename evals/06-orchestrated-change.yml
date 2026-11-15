@@ -1,0 +1,38 @@
+name: orchestrated-change
+description: A multi-part task through the planner, parallel specialists, verification and review.
+orchestrate: true
+timeoutSeconds: 600
+prompt: >
+  This project has two modules. In src/area.js add and export `circleArea(radius)`
+  (use Math.PI). In src/format.js add and export `formatArea(value)`, which returns the
+  number with two decimals followed by " m²". Add assertions for both to test.js and
+  make sure `node test.js` passes.
+files:
+  package.json: |
+    { "name": "geometry", "version": "1.0.0", "scripts": { "test": "node test.js" } }
+  src/area.js: |
+    function squareArea(side) {
+      return side * side;
+    }
+    module.exports = { squareArea };
+  src/format.js: |
+    function formatLength(value) {
+      return value.toFixed(2) + " m";
+    }
+    module.exports = { formatLength };
+  test.js: |
+    const assert = require("node:assert");
+    const { squareArea } = require("./src/area.js");
+    const { formatLength } = require("./src/format.js");
+    assert.strictEqual(squareArea(3), 9);
+    assert.strictEqual(formatLength(2), "2.00 m");
+    console.log("ok");
+checks:
+  - command: node test.js
+  - command: >-
+      node -e "const a=require('node:assert');
+      const {circleArea,squareArea}=require('./src/area.js');
+      const {formatArea,formatLength}=require('./src/format.js');
+      a.ok(Math.abs(circleArea(1)-Math.PI)<1e-9);
+      a.strictEqual(formatArea(3.14159),'3.14 m²');
+      a.strictEqual(squareArea(2),4); a.strictEqual(formatLength(1),'1.00 m')"

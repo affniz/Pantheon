@@ -4,6 +4,144 @@ All notable changes to Pantheon are documented here.
 
 ---
 
+## [0.9.1] — 2026-11-15
+
+A depth release. v0.9 widened what Pantheon can do; this one goes after the places where it was thin — an orchestrator that never checked its own work, agents that differed only in their prompts, routing that trusted a model's self-reported confidence, a shell sandbox with more holes, and an experience that hid the answer until the turn was over. It also adds the two things that were missing to keep features from shipping broken again: end-to-end tests over the real wire protocol, and an evaluation harness for real-model runs.
+
+### Added
+- **Verify-and-fix loop in orchestration.** After the planned tasks, the project's checks run (`tsc --noEmit`, the test command). If *this run* broke them, a debugger agent receives the failure output and the list of changed files and is asked to fix it — up to `maxFixRounds` (default 2) times, re-verifying after each. A baseline run before any agent starts distinguishes new failures from pre-existing ones (which are reported but neither "fixed" nor held against the run), and a run that changed no files never triggers a fix. New `verification` event; `done` carries `verified` and `fixRounds`.
+- **Write coordination between parallel agents** (`FileCoordinator`). Writes to one file are serialised, and a whole-file overwrite of a file another agent wrote in the same wave is refused with guidance to read it and use `edit_file`. Ownership resets between waves, so later tasks and fix agents can build on earlier output.
+- **Sub-agents get the session's tools, repo map and memory.** Orchestrated agents previously had only the built-in tools — no plugins or MCP servers — and neither the repo map nor memory; the planner planned without knowing the project's structure.
+- **Token streaming in agent mode.** `Gateway.complete()` accepts `onToken` and streams with tools, reassembling fragmented tool calls. The agent's text (including commentary before tool calls) and the reviewer's synthesis reach the client as they are generated instead of in one piece at the end.
+- **Tool calls in session history.** A turn's assistant tool-call messages and tool results are stored (large outputs truncated to 4,000 characters), so follow-up turns know what the agent read and did. `AgentTurnResult.messages` exposes the transcript.
+- **Structural routing signals.** A floor under the classifier's answer (code, stack traces, file names, length), small talk routed with no classifier call, and a fallback to structure-only routing when the classifier call fails. `structuralSignals()` is exported.
+- **`pantheon eval`** — repeatable end-to-end tasks defined in YAML (project files, prompt, checks), run against the real model in throw-away project copies, with a JSON report and `--compare` to show regressions and fixes. Six starter tasks in `evals/`.
+- **`models[].extraParams`** — provider-specific request parameters in config.
+- **End-to-end test suite** against a scripted model server over real HTTP: streaming, fragmented tool calls, permission prompts answered mid-stream, sandbox refusals, stored transcripts, usage attribution, orchestration, and the fix loop repairing a real project.
+- **Docker integration test** for the isolated executor against a real daemon (runs in CI; skipped where Docker is unavailable).
+- `PANTHEON_TRUST_PROXY`.
+
+### Changed
+- **`CoderAgent`, `DebuggerAgent` and `ExecutorAgent` are role presets over one `SpecialistAgent`** (three near-identical 150-line files became one implementation plus profiles). Public class names and config shapes are unchanged.
+- **The classifier, context summariser and quality judge use the `general` tier model; the default failover chain starts at the `complex` tier model; default consensus models are the configured tiers.** Previously `llama-smart` and `deepseek-v4-pro` were named in code, including a hard-coded special case that injected thinking parameters for the model id `deepseek-v4-pro`.
+- **Retries and failover never happen after text has been streamed** — a second attempt would repeat the output. They still happen when a stream fails before producing anything.
+- The CLI's resumed-session view shows only the conversation (tool messages are stored but not rendered).
+- `pantheon doctor` pings the models the configuration routes to instead of fixed model names.
+- `LITELLM_BASE_URL` / `LITELLM_MASTER_KEY` are read when the config is loaded rather than once at import.
+- `claude-fallback` in `litellm-config.yaml` now points at `anthropic/claude-sonnet-5-5` (was a 2024 model).
+- All packages and `PANTHEON_VERSION` → `0.9.1`.
+
+### Fixed
+- **Shell allowlist: argument-level escapes.** Allowlisted commands could still run programs or write files through their own options: `find -execdir/-ok/-delete/-fprint`, `awk 'BEGIN{system(…)}'` / pipes / redirection inside the program, `sed` `e`/`w`/`r` commands and `-i.bak`, `rg --pre`, `sort -o`, and `git config core.fsmonitor …` (executed by the next `git status`), `git grep -O<cmd>`, `--output`, `stash`, branch/tag/remote changes. All refused now. The README states plainly that the host executor is not a security boundary for commands that run project code.
+- **Rate limits could be bypassed by sending an `X-Forwarded-For` header**, and claiming `127.0.0.1` granted the local quota. Limits are now keyed on the TCP peer; forwarded headers are honoured only with `PANTHEON_TRUST_PROXY=1`.
+- **Classifier calls were missing from cost tracking.**
+- **An unreachable classifier failed the whole request** before any work started.
+- **Follow-up turns on `--no-tools` and `--consensus` could send tool messages to a model with no tools** once tool calls were part of history; these paths now send the conversation only.
+- **Memory context was computed for the orchestration path but never used** (the option was accepted and ignored).
+- **A config file that listed its own models silently lost the reasoning parameters** of built-in models it re-declared.
+
+### Not verified
+- The Docker integration test and CI changes have not run yet — no Docker daemon was available in the development sandbox. OAuth against real GitHub/Google, real embeddings, and real model output remain unexercised; `pantheon eval` exists to close the last of these.
+
+### Tests
+- **835 tests** across 51 files (up from 750 / 45); **964** with a real PostgreSQL server. 11 further tests need a Docker daemon and are skipped without one.
+
+---
+
+## [0.9.0] — 2026-11-15
+
+Pantheon becomes **safe to run for more than one person, and off your own machine**. It gains a PostgreSQL backend, authentication, a real-time activity feed, container-isolated command execution and retrieval-based long-term memory. The web dashboard planned for this version is deferred; everything it needs from the server (auth, WebSocket feed, REST API) is in place.
+
+Two things did not survive contact with the code and were rebuilt rather than patched: the "Postgres is a driver swap" claim (every database call was synchronous and SQLite-only), and the shell allowlist (it inspected only the first word of a command line). Several other long-standing bugs were found and fixed along the way — see **Fixed**.
+
+### Added
+
+**Storage**
+- **PostgreSQL support** — `DATABASE_URL=postgres://…` (or `database.url` in `config.yml`). Connection pool via `pg` (`PANTHEON_DB_POOL_SIZE`, default 10); schema created automatically.
+- **Versioned schema migrations** — one migration list rendered for both dialects, recorded in `schema_migrations`, applied idempotently at startup and re-runnable after an interruption. Databases from v0.4–v0.8 upgrade in place; a database written by a newer build is refused. Concurrent starts on PostgreSQL are serialised with an advisory lock.
+- **`pantheon db status`** and **`pantheon db migrate --to <location> [--from …] [--yes]`** — copy everything between any two databases (SQLite ⇄ PostgreSQL, or SQLite → SQLite as a backup). Preserves ids, advances PostgreSQL sequences, never touches the source, skips rows already present.
+- **`GET /api/health/db`**, a database check in **`pantheon doctor`**, `PANTHEON_DB_PATH` / `database.sqlitePath`.
+- **Store layer** — `OrchestrationStore`, `ConsensusStore`, `AuthStore`, `MemoryStore` join `SessionManager`, `CostTracker`, `TraceStore`, `ABStore` on a common `DbStore`. Agents and routes no longer issue their own queries.
+
+**Authentication** (off by default; `PANTHEON_AUTH=required`)
+- **API tokens** (`pth_…`) — SHA-256 hashed at rest, shown once, with expiry, last-used tracking and revocation. `Authorization: Bearer`, or `PANTHEON_API_TOKEN` for the CLI.
+- **OAuth 2.0 sign-in with GitHub and Google** — authorization-code flow; signed, expiring state bound to the initiating browser by a nonce cookie; only provider-verified e-mail addresses are accepted.
+- **JWT browser sessions** — HS256, 7 days, `HttpOnly` / `SameSite=Lax` cookie (`Secure` over https); cross-origin writes made with the cookie are rejected. Key from `PANTHEON_JWT_SECRET` or generated into `~/.pantheon/jwt-secret` (0600).
+- **`pantheon auth login`** — browser sign-in via a loopback redirect; the CLI receives a single-use code bound to a PKCE-style verifier and exchanges it for a token, which is saved to `~/.pantheon/credentials` (0600). Also `auth logout` (revokes server-side), `auth status`, `auth token create | list | revoke`. `auth token create` works with no OAuth app configured.
+- **Closed by default** — the first person to sign in becomes `owner`; others need `PANTHEON_ALLOWED_EMAILS` / `auth.allowedEmails` (`*` = anyone).
+- **Per-user isolation** of sessions, chat continuation, semantic memory and the live feed. Another user's session is reported as not found. (Traces, cost totals, agent records and plugin management remain instance-wide in this version.)
+- **`users`, `api_tokens` tables; `sessions.user_id`.**
+
+**Real-time**
+- **WebSocket feed `GET /api/ws`** — every event of the chat stream (routing, tool calls, agent lifecycle, plan, review, failover) published to an in-process `EventBus` and fanned out to subscribers, filterable by `sessionId` and `types`, re-subscribable, with heartbeat and slow-client protection. Same authentication as HTTP; `access_token` query parameter accepted on the upgrade only.
+- **`pantheon agents watch [-s <session>] [--json]`** — follow live activity from another terminal.
+
+**Execution isolation**
+- **`sandbox.execution.mode: docker`** (`PANTHEON_EXEC=docker`) — each shell command, and the reviewer's `tsc` / test run, executes in a throw-away container: project directory only (same path), no network by default, none of the server's environment, unprivileged uid, all capabilities dropped, `no-new-privileges`, read-only root filesystem, memory / CPU / pid limits, removed afterwards and killed on timeout. Image, network and limits are configurable.
+- **`CommandExecutor`** abstraction (`HostExecutor`, `DockerExecutor`) and `Sandbox.exec()`.
+- **Workspace confinement** — with auth required, a request's `workingDir` must lie inside `PANTHEON_WORKSPACE` (symlinks resolved).
+
+**Memory**
+- **Semantic memory (RAG)** — user and assistant messages are embedded after each turn; before each turn the passages most similar to the prompt, from any past session, are injected as `## Relevant memory`. Opt-in (`memory.semantic` / `PANTHEON_EMBEDDING_MODEL`); needs an embedding model (`pantheon-embed` added to `litellm-config.yaml`).
+- **pgvector** — on PostgreSQL with the extension available, search runs in the database on a native `vector` column that Pantheon creates and backfills itself; otherwise an exact in-process cosine search is used (SQLite included). Embeddings are stored portably and survive `db migrate`.
+- **`pantheon memory status | search | reindex | clear`**, `/api/memory/*`, `Gateway.embed()`.
+
+**Smaller items from the v0.9 gap list**
+- **Per-session cost** — usage records carry the session id; `pantheon cost --session <id>`, `GET /api/cost?sessionId=`.
+- **Tier-scoped A/B experiments** — optional `tiers` on an experiment.
+- **Repo map refresh mid-turn** — rebuilt after an agent writes a source file; orchestration sub-agents now receive the repo map at all.
+- **Prompt versioning in traces** — `systemPromptHash` on every `agent.turn` span.
+- `TraceCollector.flush()`, `offset` on `GET /api/sessions`, server log at `~/.pantheon/server.log`.
+
+**Tests & tooling**
+- Storage tests run on SQLite, on PGlite (in-process PostgreSQL, including pgvector), and — when `PANTHEON_TEST_POSTGRES_URL` is set, as in CI — through the production `pg` driver against a real server.
+- `packages/server` had no tests; it now has 93 (REST routes, chat SSE flow, auth, OAuth against stand-in providers, WebSocket against a live server, semantic memory).
+- `@typescript-eslint/no-floating-promises` is an error; tests resolve workspace packages to source, so no build is needed first.
+
+### Changed
+- **Every store method is `async`.** Breaking for code importing `@pantheon/core` directly; the HTTP API is unchanged.
+- **The server listens on `127.0.0.1` by default** (was all interfaces). Set `HOST=0.0.0.0` to expose it; it warns loudly if that is done with authentication off. The Docker image sets `HOST=0.0.0.0` and compose publishes the port to localhost only.
+- **Shell commands that relied on unchecked chaining now fail validation** — see the allowlist fix below. Pipelines and `&&` / `||` / `;` lists of allowlisted commands still work.
+- `getDb()` / `initDb()` / `closeDb()` split into sync-for-SQLite and async initialisation; `schema` export replaced by `tablesFor(db)`, `sqliteSchema`, `pgSchema`.
+- `OrchestratorResult.agentTree` contains the agents of that run only.
+- The CLI reports failures as a one-line message instead of a stack trace (`PANTHEON_DEBUG=1` restores the trace).
+- All packages and `PANTHEON_VERSION` → `0.9.0`.
+
+### Fixed
+- **Sandbox escape in the `grep` tool.** A path that failed the project-root check was searched anyway; `grep` is auto-approved, so a model could read any file on the machine with no prompt.
+- **Shell allowlist bypass.** Only the first word of a command line was checked before the whole line went to `sh -c`, so `ls; <anything>`, `ls && <anything>`, `echo $(<anything>)` and `cat x | sh` all ran. Every command in a line is now validated; substitution, file redirection and background jobs are refused.
+- **Path jail bypass in shell arguments** via quoting (`cat "/etc/passwd"`), `~`, `$HOME` and embedded `/../`.
+- **`sandbox.additionalAllowlist`, `denyFromDefault` and `allowlistEnabled` in `config.yml` were never applied** — the chat route always used the default sandbox.
+- **The reviewer ran the project's test suite with every API key in its environment.**
+- **CLI talked to port 3000 even when the server had started on another port** — most commands ignored the recorded port.
+- **`pantheon models default` always failed** — it sent POST to a PUT route.
+- **Chat events could be dropped** when an SSE `event:` line and its `data:` line arrived in different network chunks.
+- **`grep` omitted the file name when searching a single file** (the one failing test in the v0.8 suite).
+- **Server start-up failures were invisible** (output discarded); the CLI now prints the tail of the server log.
+- **Database connections were never closed on shutdown.**
+- **A failed usage-record write failed the whole LLM call.**
+- **Orchestration error handlers could mask the real error** with a secondary database failure.
+- **`POST /api/chat` with an unknown `sessionId`** surfaced as a raw foreign-key error.
+- **Episodic memory** could present the current session's own summary as a past session, was ignored entirely on the `--no-tools` path, and loaded a whole session to keep its last ten messages.
+- **Concurrent background summarisation** of one session could fail on a unique constraint.
+- **Query parameters were not validated** (`?limit=abc` → `NaN`).
+- **Corrupt JSON** in `tool_calls`, span `attributes`, sub-task `dependencies` or consensus `model_responses` made the whole record unreadable.
+- **Docker:** the SQLite file lived in the container's writable layer and was lost on rebuild; `ripgrep` was missing from the image.
+- SQLite `busy_timeout` set so the CLI and server do not race on the same file; README `cd pantheon` → `cd Pantheon`.
+
+### Removed
+- `packages/core/src/db/__tests__/run-tests.ts` — a hand-rolled v0.4 test runner Vitest never executed.
+
+### Not in this release
+- **Web dashboard** (`:3001`) — deferred.
+- **Role-based access to traces, cost, agents and plugins** — these are instance-wide for every authenticated user; planned with RBAC in v1.0.
+- **Refresh-token rotation** — sessions simply expire after 7 days (v1.0).
+
+### Tests
+- **750 tests** across **45 files** (up from 278 / 30); **879** with a real PostgreSQL server. Build and lint pass with no errors.
+
+---
+
 ## [0.8.0] — 2026-09-03
 
 Pantheon gains **multi-model consensus**, **A/B experiment routing**, and a **provider failover chain**. The routing classifier now emits a confidence score and auto-escalates ambiguous prompts. A full audit of v0.7 gap-fix tools uncovered two silent bugs in the `grep` tool (parameters accepted but never forwarded to `rg`), a missing `taskRole` column in the DB schema, orphaned gateway variable causing type unsafety in the chat route, and quality scores that were computed but never written back to the DB — all fixed in this version.

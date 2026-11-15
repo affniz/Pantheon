@@ -1,6 +1,6 @@
 {
     "name": "@pantheon/core",
-    "version": "0.8.0",
+    "version": "0.9.1",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -23,11 +23,15 @@
         "drizzle-orm": "^0.45.2",
         "js-yaml": "^4.1.0",
         "openai": "^4.52.0",
+        "pg": "^8.23.1",
         "ts-morph": "^28.0.0"
     },
     "devDependencies": {
+        "@electric-sql/pglite": "^0.5.16",
+        "@electric-sql/pglite-pgvector": "^0.0.17",
         "@types/js-yaml": "^4.0.9",
         "@types/node": "^22.0.0",
+        "@types/pg": "^8.23.1",
         "drizzle-kit": "^0.31.10",
         "typescript": "^5.5.0"
     }

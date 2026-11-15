@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { PantheonApiClient } from "../api-client.js";
-import { ensureServerRunning } from "../server-manager.js";
+import { ensureServerRunning, getServerUrl } from "../server-manager.js";
+import { resolveToken } from "../credentials.js";
 
 const dim = chalk.hex("#6B7280");
 const accent = chalk.hex("#56B6C2");
@@ -207,4 +208,116 @@ export async function agentsPlan(sessionId: string) {
 
     console.log(`  ${dim("─".repeat(80))}`);
     console.log("");
+}
+
+// ── Live feed (v0.9) ─────────────────────────────────────────────────────────
+
+/** One line per event, in the vocabulary of the chat stream. */
+function describeEvent(type: string, data: Record<string, unknown>): string | undefined {
+    const short = (v: unknown, n = 70) => String(v ?? "").replace(/\s+/g, " ").slice(0, n);
+    switch (type) {
+        case "routing":
+            return `${accent("route")}    ${String(data["tier"])} → ${String(data["selectedModelId"])} ${dim(short(data["reason"], 50))}`;
+        case "plan_created": {
+            const tasks = ((data["plan"] as { tasks?: unknown[] } | undefined)?.tasks ?? []).length;
+            return `${brand("plan")}     ${tasks} sub-task${tasks === 1 ? "" : "s"}`;
+        }
+        case "agent_spawned": {
+            const agent = (data["agent"] ?? {}) as Record<string, unknown>;
+            return `${chalk.green("spawn")}    ${String(agent["role"])} ${dim(String(agent["modelId"] ?? ""))}`;
+        }
+        case "agent_completed":
+            return `${chalk.green("done")}     agent ${short(data["agentId"], 8)} ${dim(short(data["result"]))}`;
+        case "agent_failed":
+            return `${chalk.red("failed")}   agent ${short(data["agentId"], 8)} ${dim(short(data["error"]))}`;
+        case "tool_call":
+            return `${accent("tool")}     ${String(data["name"])} ${dim(short(JSON.stringify(data["arguments"] ?? {})))}`;
+        case "tool_result":
+            return `${data["isError"] ? chalk.red("tool err") : dim("tool ok ")} ${dim(short(data["content"]))}`;
+        case "tool_permission_required":
+            return `${chalk.yellow("approve?")} ${String(data["toolName"])} ${dim("(waiting for the user)")}`;
+        case "review_result":
+            return `${brand("review")}   ${data["approved"] ? chalk.green("approved") : chalk.yellow("not approved")} ${dim(short(data["feedback"]))}`;
+        case "model_fallback":
+            return `${chalk.yellow("failover")} ${String(data["from"])} → ${String(data["to"])}`;
+        case "warning":
+            return `${chalk.yellow("warning")}  ${short(data["message"], 100)}`;
+        case "error":
+            return `${chalk.red("error")}    ${short(data["message"], 100)}`;
+        case "done":
+            return `${chalk.green("finished")} ${dim(`${String(data["iterations"] ?? 0)} iteration(s)`)}`;
+        case "orchestration_start":
+        case "orchestration_done":
+        case "consensus_model_start":
+        case "consensus_model_done":
+        case "consensus_done":
+            return `${dim(type)}`;
+        default:
+            return undefined;
+    }
+}
+
+/**
+ * pantheon agents watch [--session <id>] [--json]
+ *
+ * Follows live activity over the server's WebSocket feed: routing decisions, tool
+ * calls and the agent lifecycle of every session (or one), as they happen — also
+ * for chats running in another terminal. Ctrl+C to stop.
+ */
+export async function agentsWatch(opts: { session?: string; json?: boolean }): Promise<void> {
+    await ensureServerRunning();
+    const server = getServerUrl();
+    const token = resolveToken(server);
+
+    const url = new URL(server.replace(/^http/, "ws") + "/api/ws");
+    if (opts.session) url.searchParams.set("sessionId", opts.session);
+    // The WebSocket API cannot send an Authorization header, hence the query parameter
+    if (token) url.searchParams.set("access_token", token);
+
+    const ws = new WebSocket(url);
+    let opened = false;
+
+    ws.addEventListener("open", () => {
+        opened = true;
+        if (!opts.json) {
+            console.log("");
+            console.log(`  ${brand.bold("◆")} ${chalk.white.bold("Live agent activity")} ${dim(opts.session ? `session ${opts.session.slice(0, 8)}` : "all sessions")}`);
+            console.log(`  ${dim("Waiting for events… (Ctrl+C to stop)")}`);
+            console.log("");
+        }
+    });
+
+    ws.addEventListener("message", (evt) => {
+        if (opts.json) {
+            console.log(String(evt.data));
+            return;
+        }
+        let msg: { type: string; sessionId?: string; timestamp?: number; data?: Record<string, unknown> };
+        try {
+            msg = JSON.parse(String(evt.data));
+        } catch {
+            return;
+        }
+        if (!msg.sessionId) return; // connected / pong / subscribed
+        const line = describeEvent(msg.type, msg.data ?? {});
+        if (!line) return;
+        const time = new Date(msg.timestamp ?? Date.now()).toLocaleTimeString();
+        console.log(`  ${dim(time)}  ${dim(msg.sessionId.slice(0, 8))}  ${line}`);
+    });
+
+    await new Promise<void>((resolve) => {
+        ws.addEventListener("close", (evt) => {
+            if (!opened) {
+                console.error(
+                    chalk.red(`\n  ✗ Could not open the live feed at ${server}`) +
+                    dim(token ? "" : " — if the server requires authentication, run `pantheon auth login`.") + "\n",
+                );
+                process.exitCode = 1;
+            } else if (!opts.json) {
+                console.log(dim(`\n  Feed closed${evt.reason ? `: ${evt.reason}` : ""}.\n`));
+            }
+            resolve();
+        });
+        process.once("SIGINT", () => ws.close());
+    });
 }

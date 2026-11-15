@@ -1,0 +1,14 @@
+name: answer-from-code
+description: A question that can only be answered by reading the project — and that needs no changes.
+prompt: Which port does this server listen on by default, and which environment variable overrides it? Do not change any files.
+files:
+  server.js: |
+    const http = require("node:http");
+    const port = Number(process.env.GATEWAY_PORT ?? 8472);
+    http.createServer((_, res) => res.end("ok")).listen(port);
+checks:
+  - response_contains: "8472"
+  - response_contains: GATEWAY_PORT
+  - tool_not_called: write_file
+  - tool_not_called: edit_file
+  - file_contains: { path: server.js, text: "8472" }

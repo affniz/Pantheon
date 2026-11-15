@@ -1,26 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { eq, and } from "drizzle-orm";
+import { eq, asc, desc } from "drizzle-orm";
 import type { ABRunRecord, ABComparison } from "@pantheon/shared";
-import { getDb } from "../db/client.js";
-import { schema } from "../db/index.js";
+import { DbStore } from "../db/store.js";
 
 /**
  * ABStore persists A/B run records and computes comparison analytics.
  */
-export class ABStore {
+export class ABStore extends DbStore {
     /** Hash a prompt for grouping (first 16 hex chars of SHA-256). */
     static hashPrompt(prompt: string): string {
         return createHash("sha256").update(prompt).digest("hex").slice(0, 16);
     }
 
     /** Save a new A/B run record. Returns the saved record with generated ID and timestamp. */
-    save(record: Omit<ABRunRecord, "id" | "createdAt">): ABRunRecord {
+    async save(record: Omit<ABRunRecord, "id" | "createdAt">): Promise<ABRunRecord> {
+        const { abRuns } = this.t;
         const id = randomUUID();
         const createdAt = new Date().toISOString();
 
-        const db = getDb();
-        db.insert(schema.abRuns).values({
+        await this.db.insert(abRuns).values({
             id,
             experimentId: record.experimentId,
             ...(record.sessionId ? { sessionId: record.sessionId } : {}),
@@ -32,33 +31,32 @@ export class ABStore {
             outputTokens: record.outputTokens,
             ...(record.qualityScore !== undefined ? { qualityScore: record.qualityScore } : {}),
             createdAt,
-        }).run();
+        });
 
         return { ...record, id, createdAt };
     }
 
     /** Update the quality score for an existing run. */
-    updateQualityScore(id: string, qualityScore: number): void {
-        const db = getDb();
-        db.update(schema.abRuns)
-            .set({ qualityScore })
-            .where(eq(schema.abRuns.id, id))
-            .run();
+    async updateQualityScore(id: string, qualityScore: number): Promise<void> {
+        const { abRuns } = this.t;
+        await this.db.update(abRuns).set({ qualityScore }).where(eq(abRuns.id, id));
     }
 
-    /** Get all runs for an experiment. */
-    getRuns(experimentId: string): ABRunRecord[] {
-        const db = getDb();
-        const rows = db
-            .select()
-            .from(schema.abRuns)
-            .where(eq(schema.abRuns.experimentId, experimentId))
-            .all();
+    /**
+     * Get runs for an experiment, oldest first.
+     * With `limit`, returns only the most recent `limit` runs (still oldest first).
+     */
+    async getRuns(experimentId: string, limit?: number): Promise<ABRunRecord[]> {
+        const { abRuns } = this.t;
+        const base = this.db.select().from(abRuns).where(eq(abRuns.experimentId, experimentId));
+        const rows = limit === undefined
+            ? await base.orderBy(asc(abRuns.createdAt), asc(abRuns.id))
+            : (await base.orderBy(desc(abRuns.createdAt), desc(abRuns.id)).limit(limit)).reverse();
 
         return rows.map((r) => ({
             id: r.id,
             experimentId: r.experimentId,
-            ...(r.sessionId ? { sessionId: r.sessionId } : { sessionId: "" }),
+            sessionId: r.sessionId ?? "",
             promptHash: r.promptHash,
             arm: r.arm as "control" | "variant",
             modelId: r.modelId,
@@ -71,8 +69,8 @@ export class ABStore {
     }
 
     /** Compute comparison analytics for an experiment. */
-    getComparison(experimentId: string): ABComparison {
-        const runs = this.getRuns(experimentId);
+    async getComparison(experimentId: string): Promise<ABComparison> {
+        const runs = await this.getRuns(experimentId);
         const controlRuns = runs.filter((r) => r.arm === "control");
         const variantRuns = runs.filter((r) => r.arm === "variant");
 

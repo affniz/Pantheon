@@ -12,12 +12,16 @@ import { listModels, addModel, removeModel, setDefaultModel } from "./commands/m
 import { costSummary, costRecent, costReset } from "./commands/cost.js";
 import { sessionsList, sessionsShow, sessionsDelete, sessionsArchive } from "./commands/sessions.js";
 import { traceList, traceShow, traceClear } from "./commands/trace.js";
-import { agentsList, agentsShow, agentsPlan } from "./commands/agents.js";
+import { agentsList, agentsShow, agentsPlan, agentsWatch } from "./commands/agents.js";
 import { pluginsList, pluginsInstall, pluginsRemove, pluginsInfo } from "./commands/plugins.js";
 import { consensusList, consensusShow } from "./commands/consensus.js";
 import { abList, abComparison } from "./commands/ab.js";
 import { ensureServerRunning, stopServer, isServerRunning, getServerPid, getServerUrl } from "./server-manager.js";
 import { doctorCommand } from "./commands/doctor.js";
+import { dbStatus, dbMigrate } from "./commands/db.js";
+import { evalCommand } from "./commands/eval.js";
+import { memoryStatus, memorySearch, memoryReindex, memoryClear } from "./commands/memory.js";
+import { authLogin, authLogout, authStatus, authTokenCreate, authTokenList, authTokenRevoke } from "./commands/auth.js";
 
 // Brand colors matching theme.ts
 const brand = chalk.hex("#F5A623");
@@ -159,13 +163,15 @@ const costCmd = program.command("cost").description("View usage and cost stats")
 costCmd
     .command("summary", { isDefault: true })
     .description("Show total usage summary (default)")
-    .action(costSummary);
+    .option("-s, --session <id>", "Only usage from this session")
+    .action((opts) => costSummary(opts));
 
 costCmd
     .command("recent")
     .description("Show last 10 calls")
     .option("-n, --num <n>", "Number of calls to show", "10")
-    .action((opts) => costRecent(Number(opts.num)));
+    .option("-s, --session <id>", "Only calls from this session")
+    .action((opts) => costRecent(Number(opts.num), opts.session));
 
 costCmd
     .command("reset")
@@ -216,6 +222,13 @@ agentsCmd
     .description("Show agent details")
     .argument("<id>", "Agent ID")
     .action(agentsShow);
+
+agentsCmd
+    .command("watch")
+    .description("Follow live agent activity (routing, tool calls, agent lifecycle) as it happens")
+    .option("-s, --session <id>", "Only this session")
+    .option("--json", "Print raw events, one JSON object per line")
+    .action((opts) => agentsWatch(opts));
 
 agentsCmd
     .command("plan")
@@ -337,6 +350,109 @@ serverCmd
         }
     });
 
+// ── Eval ──────────────────────────────────────────────────────────────────────
+
+program
+    .command("eval")
+    .description("Run repeatable end-to-end tasks against the real model and check the results")
+    .argument("[location]", "Directory of task files (*.yml) or a single task (default: ./evals)")
+    .option("--only <name...>", "Run only tasks whose name contains one of these")
+    .option("--report <file>", "Write a JSON report")
+    .option("--compare <file>", "Compare with an earlier report: show regressions and fixes")
+    .option("--keep", "Keep each task's project directory for inspection")
+    .action((location, opts) => evalCommand(location, opts));
+
+// ── Memory (v0.9) ─────────────────────────────────────────────────────────────
+
+const memoryCmd = program.command("memory").description("Semantic memory over past conversations");
+
+memoryCmd
+    .command("status", { isDefault: true })
+    .description("Show whether semantic memory is enabled and what is indexed")
+    .action(memoryStatus);
+
+memoryCmd
+    .command("search")
+    .description("Find passages from past conversations similar to a query")
+    .argument("<query...>", "What to look for")
+    .option("-n, --num <n>", "Number of results", "5")
+    .action((query: string[], opts) => memorySearch(query.join(" "), opts));
+
+memoryCmd
+    .command("reindex")
+    .description("Embed all messages that are not indexed yet")
+    .action(memoryReindex);
+
+memoryCmd
+    .command("clear")
+    .description("Delete the semantic index (conversations are kept)")
+    .action(memoryClear);
+
+// ── Auth (v0.9) ───────────────────────────────────────────────────────────────
+
+const authCmd = program.command("auth").description("Sign in to a Pantheon server and manage API tokens");
+
+authCmd
+    .command("login")
+    .description("Sign in through the browser (OAuth) and save an API token")
+    .option("-p, --provider <name>", "Sign-in provider: github or google (default: the server's first)")
+    .option("--server <url>", "Pantheon server to sign in to (default: the local server)")
+    .action((opts) => authLogin(opts));
+
+authCmd
+    .command("logout")
+    .description("Revoke and remove the saved API token")
+    .option("--server <url>", "Pantheon server to sign out of")
+    .action((opts) => authLogout(opts));
+
+authCmd
+    .command("status", { isDefault: true })
+    .description("Show the server's auth mode and who you are signed in as")
+    .option("--server <url>", "Pantheon server to check")
+    .action((opts) => authStatus(opts));
+
+const authTokenCmd = authCmd.command("token").description("Manage API tokens");
+
+authTokenCmd
+    .command("create")
+    .description("Create an API token directly in the database (no OAuth needed; run on the server's machine)")
+    .option("-n, --name <name>", "Label for the token")
+    .option("-e, --email <email>", "User the token belongs to (created if missing)")
+    .option("--expires <days>", "Expire the token after this many days")
+    .option("--no-save", "Print the token without saving it to ~/.pantheon/credentials")
+    .action((opts) => authTokenCreate(opts));
+
+authTokenCmd
+    .command("list")
+    .description("List your API tokens")
+    .option("--server <url>", "Pantheon server")
+    .action((opts) => authTokenList(opts));
+
+authTokenCmd
+    .command("revoke")
+    .description("Revoke one of your API tokens")
+    .argument("<id>", "Token id (or its first characters) from `pantheon auth token list`")
+    .option("--server <url>", "Pantheon server")
+    .action((id, opts) => authTokenRevoke(id, opts));
+
+// ── Database (v0.9) ───────────────────────────────────────────────────────────
+
+const dbCmd = program.command("db").description("Inspect and migrate the storage backend (SQLite / PostgreSQL)");
+
+dbCmd
+    .command("status", { isDefault: true })
+    .description("Show the active database, its schema version and row counts")
+    .option("--url <location>", "Inspect this database instead (postgres://… or a SQLite file path)")
+    .action((opts) => dbStatus(opts));
+
+dbCmd
+    .command("migrate")
+    .description("Copy all data to another database (e.g. SQLite → PostgreSQL)")
+    .requiredOption("--to <location>", "Destination: postgres://user:pass@host/db or a SQLite file path")
+    .option("--from <location>", "Source (default: the database Pantheon is currently using)")
+    .option("-y, --yes", "Do not prompt when the destination already contains data")
+    .action((opts) => dbMigrate(opts));
+
 // ── Doctor ────────────────────────────────────────────────────────────────────
 
 program
@@ -344,4 +460,10 @@ program
     .description("Check prerequisites, API key health, and gateway reachability")
     .action(doctorCommand);
 
-program.parse();
+// parseAsync + a single catch: command handlers are async, and a rejected one used
+// to surface as a raw stack trace ("file:///…/api-client.js:29 … Node.js v22").
+program.parseAsync().catch((err: unknown) => {
+    console.error(chalk.red(`\n  ✗ ${err instanceof Error ? err.message : String(err)}\n`));
+    if (process.env["PANTHEON_DEBUG"] && err instanceof Error && err.stack) console.error(dim(err.stack));
+    process.exit(1);
+});

@@ -9,7 +9,16 @@ import type { Gateway } from "../gateway/gateway.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
 import type { PermissionManager } from "../sandbox/permission-manager.js";
+import { createHash } from "node:crypto";
 import { Tracer } from "../tracing/tracer.js";
+
+/** Source files whose changes can alter the repo map (it indexes exported TS/JS symbols). */
+const REPO_MAP_SOURCE = /\.(tsx?|jsx?|mts|cts|mjs|cjs)$/i;
+
+/** Short, stable identifier for a system prompt — recorded on traces for A/B attribution. */
+export function hashPrompt(prompt: string): string {
+    return createHash("sha256").update(prompt).digest("hex").slice(0, 12);
+}
 
 const BASE_SYSTEM_PROMPT = `You are Pantheon, an AI assistant with access to tools for interacting with the local filesystem and shell.
 
@@ -48,6 +57,13 @@ export interface AgentConfig {
     /** Called when a tool returns a result (for UI rendering) */
     onToolResult?: (result: ToolResult) => void;
     /**
+     * Receives the assistant's text as it is generated — both the commentary it
+     * writes before calling tools and the final answer. When set, every character
+     * of `AgentTurnResult.response` is guaranteed to have passed through here, so a
+     * caller that streams must not send the response again afterwards.
+     */
+    onText?: (delta: string) => void;
+    /**
      * Optional traceId to associate this agent turn with an existing trace.
      * If provided, spans from this turn are recorded under that traceId.
      */
@@ -73,6 +89,13 @@ export interface AgentConfig {
      */
     repoMap?: string;
     /**
+     * Rebuilds the repo map. When provided, the runtime calls it after any iteration
+     * in which the agent created or edited a source file, and swaps the fresh map
+     * into the system prompt — so symbols added mid-turn are visible to later steps
+     * instead of only after the next request.
+     */
+    refreshRepoMap?: () => Promise<string>;
+    /**
      * Maximum total character count of all messages in workingMessages before
      * mid-turn pruning is triggered. When exceeded, the oldest tool-result
      * messages are compressed into a single summary via an LLM call.
@@ -96,6 +119,13 @@ export interface AgentTurnResult {
     escalated: boolean;
     /** Token usage summed across every LLM call made during this turn */
     usage: { inputTokens: number; outputTokens: number };
+    /**
+     * Everything this turn added to the conversation, in order: assistant messages
+     * with their tool calls, the tool results, and the final assistant message.
+     * Persist these (not just `response`) so a follow-up turn can see what the
+     * agent read and did.
+     */
+    messages: ChatMessage[];
 }
 
 export interface AgentRunOptions {
@@ -142,6 +172,9 @@ export class AgentRuntime {
         modelId?: string,
         options: AgentRunOptions = {}
     ): Promise<AgentTurnResult> {
+        let systemPromptHash = "";
+        let repoMapRefreshes = 0;
+
         const runFn = async (): Promise<AgentTurnResult> => {
             // Resolve routing once for the entire turn (or reuse the caller's decision)
             const decision = options.decision ?? await this.gateway.resolveRouting(messages, modelId);
@@ -158,14 +191,60 @@ export class AgentRuntime {
                 return result;
             };
 
+            // Like complete(), but the assistant's text is forwarded to onText as it
+            // arrives. If the gateway produced the message without streaming (a mock,
+            // or a provider fallback), the text is forwarded in one piece instead, so
+            // onText always sees the whole message exactly once.
+            let textEmitted = false; // anything sent to onText so far this turn
+            const completeLive = async (
+                msgs: ChatMessage[],
+                model: string,
+                tools?: ReturnType<ToolRegistry["toOpenAITools"]>,
+            ) => {
+                const onText = this.config.onText;
+                if (!onText) return complete(msgs, model, tools);
+
+                let streamed = "";
+                const result = await this.gateway.complete(msgs, model, tools, {
+                    onToken: (delta) => {
+                        // Separate this message from text of an earlier iteration
+                        if (streamed === "" && textEmitted) onText("\n\n");
+                        streamed += delta;
+                        textEmitted = true;
+                        onText(delta);
+                    },
+                });
+                usage.inputTokens += result.usage?.inputTokens ?? 0;
+                usage.outputTokens += result.usage?.outputTokens ?? 0;
+
+                const content = result.message.content ?? "";
+                if (streamed === "" && content !== "") {
+                    if (textEmitted) onText("\n\n");
+                    textEmitted = true;
+                    onText(content);
+                }
+                return result;
+            };
+
+            /** Messages produced during this turn (returned as AgentTurnResult.messages). */
+            const transcript: ChatMessage[] = [];
+            const finish = (response: string, extra: Omit<AgentTurnResult, "response" | "messages" | "usage" | "toolCalls" | "toolResults">): AgentTurnResult => {
+                transcript.push({ role: "assistant", content: response, timestamp: new Date() });
+                return { response, toolCalls: allToolCalls, toolResults: allToolResults, usage, messages: transcript, ...extra };
+            };
+
             const systemPromptBase = this.config.systemPrompt
                 ? `${BASE_SYSTEM_PROMPT}\n\n${this.config.systemPrompt}`
                 : BASE_SYSTEM_PROMPT;
 
-            // Append the codebase repo map if provided (built at session start)
-            const systemPrompt = this.config.repoMap
-                ? `${systemPromptBase}\n\n## Codebase Map\n${this.config.repoMap}`
-                : systemPromptBase;
+            // Append the codebase repo map if provided (built at session start,
+            // refreshed below whenever the agent changes a source file)
+            const withRepoMap = (map: string | undefined) =>
+                map ? `${systemPromptBase}\n\n## Codebase Map\n${map}` : systemPromptBase;
+            const systemPrompt = withRepoMap(this.config.repoMap);
+            // Hash of the instructions only: the repo map changes with every edit and
+            // would make otherwise-identical prompt versions look different.
+            systemPromptHash = hashPrompt(systemPromptBase);
 
             // Build the working message list with system prompt
             const workingMessages: ChatMessage[] = [
@@ -182,6 +261,7 @@ export class AgentRuntime {
             const ESCALATION_THRESHOLD = 3; // escalate after this many error iterations
             let escalated = false;
             let currentDecision = decision; // may be updated mid-turn on escalation
+            let repoMapDirty = false; // a source file was written since the map was built
 
             const MAX_CONTEXT_CHARS = this.config.maxContextChars ?? 80_000;
 
@@ -227,7 +307,8 @@ export class AgentRuntime {
                                     },
                                     { role: "user", content: combinedContent },
                                 ],
-                                "llama-smart", // fast, cheap summarization model
+                                // The general-tier model: fast and cheap is what a summary needs
+                                this.gateway.getRoutingConfig().tiers.general,
                             );
 
                             const summary = summaryResp.message.content;
@@ -285,7 +366,7 @@ export class AgentRuntime {
                 // Send to LLM with tool definitions
                 let message: ChatMessage;
                 try {
-                    const result = await complete(
+                    const result = await completeLive(
                         workingMessages,
                         currentDecision.selectedModelId,
                         tools.length > 0 ? tools : undefined
@@ -304,37 +385,22 @@ export class AgentRuntime {
                             "Please summarize what you accomplished so far and provide a final response without calling any more tools.",
                         toolCallId: syntheticId,
                     });
-                    const fallback = await complete(
+                    const fallback = await completeLive(
                         workingMessages,
                         currentDecision.selectedModelId
                         // No tools — force plain text
                     );
-                    return {
-                        response: fallback.message.content,
-                        toolCalls: allToolCalls,
-                        toolResults: allToolResults,
-                        decision: currentDecision,
-                        iterations,
-                        escalated,
-                        usage,
-                    };
+                    return finish(fallback.message.content, { decision: currentDecision, iterations, escalated });
                 }
 
                 // If no tool calls → this is the final response
                 if (!message.toolCalls || message.toolCalls.length === 0) {
-                    return {
-                        response: message.content,
-                        toolCalls: allToolCalls,
-                        toolResults: allToolResults,
-                        decision: currentDecision,
-                        iterations,
-                        escalated,
-                        usage,
-                    };
+                    return finish(message.content, { decision: currentDecision, iterations, escalated });
                 }
 
                 // LLM wants to call tools — add the assistant message to history
                 workingMessages.push(message);
+                transcript.push({ ...message, timestamp: new Date() });
 
                 // Track whether this iteration produced any errors
                 let iterationHadErrors = false;
@@ -359,6 +425,7 @@ export class AgentRuntime {
                             content: result.content,
                             toolCallId: toolCall.id,
                         });
+                        transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
                         iterationHadErrors = true;
                         continue;
                     }
@@ -390,6 +457,7 @@ export class AgentRuntime {
                             content: result.content,
                             toolCallId: toolCall.id,
                         });
+                        transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
                         iterationHadErrors = true;
                         continue;
                     }
@@ -434,6 +502,15 @@ export class AgentRuntime {
 
                     if (isError) iterationHadErrors = true;
 
+                    if (
+                        !isError &&
+                        (toolCall.name === "write_file" || toolCall.name === "edit_file") &&
+                        typeof toolCall.arguments["path"] === "string" &&
+                        REPO_MAP_SOURCE.test(toolCall.arguments["path"])
+                    ) {
+                        repoMapDirty = true;
+                    }
+
                     allToolResults.push(result);
                     this.config.onToolResult?.(result);
 
@@ -443,6 +520,24 @@ export class AgentRuntime {
                         content: result.content,
                         toolCallId: toolCall.id,
                     });
+                    transcript.push({ role: "tool", content: result.content, toolCallId: toolCall.id, timestamp: new Date() });
+                }
+
+                // ── Repo map refresh ───────────────────────────────────────────────
+                // The map is a snapshot. If this iteration created or edited source
+                // files, rebuild it before the next LLM call.
+                if (this.config.refreshRepoMap && repoMapDirty) {
+                    repoMapDirty = false;
+                    try {
+                        const fresh = await this.config.refreshRepoMap();
+                        workingMessages[0] = { role: "system", content: withRepoMap(fresh) };
+                        repoMapRefreshes++;
+                    } catch (e) {
+                        // Non-fatal — keep working with the previous map
+                        process.stderr.write(
+                            `[agent] repo map refresh failed: ${e instanceof Error ? e.message : String(e)}\n`,
+                        );
+                    }
                 }
 
                 // Track consecutive error iterations for escalation
@@ -461,21 +556,13 @@ export class AgentRuntime {
                     "Please provide your final response based on the information gathered so far.",
             });
 
-            const { message: finalMessage } = await complete(
+            const { message: finalMessage } = await completeLive(
                 workingMessages,
                 currentDecision.selectedModelId
                 // No tools — force a text response
             );
 
-            return {
-                response: finalMessage.content,
-                toolCalls: allToolCalls,
-                toolResults: allToolResults,
-                decision: currentDecision,
-                iterations,
-                escalated,
-                usage,
-            };
+            return finish(finalMessage.content, { decision: currentDecision, iterations, escalated });
         }; // end runFn
 
 
@@ -498,6 +585,10 @@ export class AgentRuntime {
                     span.attributes.escalated = result.escalated;
                     span.attributes.inputTokens = result.usage.inputTokens;
                     span.attributes.outputTokens = result.usage.outputTokens;
+                    // Prompt versioning: lets A/B and consensus results be attributed
+                    // to the exact instructions that produced them.
+                    span.attributes.systemPromptHash = systemPromptHash;
+                    if (repoMapRefreshes > 0) span.attributes.repoMapRefreshes = repoMapRefreshes;
                     return result;
                 }
             );

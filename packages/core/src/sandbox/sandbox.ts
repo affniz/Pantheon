@@ -1,5 +1,8 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import type { SandboxConfig as SandboxSettings } from "@pantheon/shared";
+import { DockerExecutor, HostExecutor, type CommandExecutor, type ExecResult } from "./executor.js";
+import type { FileCoordinator } from "./file-coordinator.js";
 
 export interface ShellAllowlistEntry {
     /** Command binary name (e.g. "git", "ls", "npm") */
@@ -31,6 +34,8 @@ export interface SandboxConfig {
      * When disabled, all commands are allowed (not recommended for production).
      */
     allowlist: AllowlistConfig;
+    /** Where shell commands run. Default: directly on the host. */
+    executor?: CommandExecutor;
 }
 
 export interface AllowlistConfig {
@@ -59,18 +64,40 @@ export const DEFAULT_SHELL_ALLOWLIST: ShellAllowlistEntry[] = [
     { command: "grep",   description: "Search text with patterns" },
     { command: "egrep",  description: "Extended grep" },
     { command: "fgrep",  description: "Fixed-string grep" },
-    { command: "rg",     description: "ripgrep — fast text search" },
-    { command: "find",   description: "Find files matching criteria", blockedArgs: [/-exec/] },
-    { command: "sort",   description: "Sort lines of text" },
+    {
+        command: "rg",
+        description: "ripgrep — fast text search",
+        blockedArgs: [/--pre\b/, /--hostname-bin\b/], // both run an arbitrary program
+    },
+    {
+        command: "find",
+        description: "Find files matching criteria",
+        // -exec/-ok run programs, -delete removes files, -fprint*/-fls write files
+        blockedArgs: [/-exec/, /-ok(dir)?\b/, /-delete\b/, /-fprint/, /-fls\b/],
+    },
+    { command: "sort",   description: "Sort lines of text", blockedArgs: [/(^|\s)(-o|--output)\b/] },
     { command: "uniq",   description: "Report or filter duplicate lines" },
     { command: "diff",   description: "Compare files line by line" },
-    { command: "awk",    description: "Pattern scanning and processing" },
+    {
+        command: "awk",
+        description: "Pattern scanning and processing (text filtering only)",
+        // awk is a programming language: system() and "cmd" | getline run programs,
+        // print > "file" writes files, getline < "file" reads any file. Its programs
+        // are quoted, so the shell-level checks cannot see inside them.
+        blockedArgs: [/system\s*\(/, /getline/, /\|/, />/, /(^|\s)(-f|--file|-i|--include|-l|--load)\b/],
+    },
     {
         command: "sed",
         description: "Stream editor",
         blockedArgs: [
             /\|\s*(bash|sh|zsh)/,  // block piping to shells
-            /\s-i\b/,              // block -i in-place file modification
+            /(^|\s)-i/,            // block -i / -i.bak in-place file modification
+            /--in-place/,
+            /(^|\s)(-f|--file)\b/, // a script file cannot be inspected here
+            // The `e` command/flag executes a shell command, `w` / `r` write and read
+            // arbitrary files (GNU sed): "1e id", "s/a/b/e", "w /tmp/x".
+            /(^|[;{}'"\s])\d*[ewr]\s+\S/,
+            /s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gpIi\d]*[ew]/,
         ],
     },
     { command: "cut",    description: "Remove sections from lines" },
@@ -101,6 +128,19 @@ export const DEFAULT_SHELL_ALLOWLIST: ShellAllowlistEntry[] = [
                       "tag", "stash", "remote", "config", "ls-files", "ls-tree", "shortlog",
                       "blame", "grep", "check-ignore", "format-patch"],
         description: "Git version control (read-only subcommands)",
+        blockedArgs: [
+            // `git config` may read, never write: core.fsmonitor, core.pager and
+            // aliases are all ways to make a later git command run a program.
+            /^config\s+(?!(--get|--get-all|--get-regexp|--list|-l)\b)/,
+            /^config\s*$/,
+            /--open-files-in-pager|(^|\s)-O\S*/,   // git grep: runs a program
+            /--output\b/,                           // writes a file
+            /--ext-diff|--textconv/,                // run configured external programs
+            /^stash(\s+(?!list\b|show\b)|\s*$)/,   // only inspect stashes
+            /^branch\b.*(\s-[dDmMcCf]\b|--delete|--move|--copy|--force)/,
+            /^tag\s+(?!(-l|--list|-n\d*|--contains|--points-at)\b)/,
+            /^remote\s+(add|remove|rm|rename|set-url|set-head|set-branches|prune|update)\b/,
+        ],
     },
 
     // ── npm / pnpm / yarn (safe subcommands) ─────────────────────────────────
@@ -209,6 +249,10 @@ export class Sandbox {
     readonly maxOutputSize: number;
     readonly shellTimeout: number;
     private readonly allowlist: AllowlistConfig;
+    /** Where validated shell commands run (host process or throw-away container). */
+    readonly executor: CommandExecutor;
+    /** Set on the per-agent views created by `forAgent()` during orchestration. */
+    private writer: { agentId: string; coordinator: FileCoordinator } | undefined;
 
     constructor(config: SandboxConfig) {
         const resolved = path.resolve(config.projectRoot);
@@ -217,6 +261,88 @@ export class Sandbox {
         this.maxOutputSize = config.maxOutputSize;
         this.shellTimeout = config.shellTimeout;
         this.allowlist = config.allowlist;
+        this.executor = config.executor ?? new HostExecutor();
+    }
+
+    /**
+     * Build a sandbox from the `sandbox:` block of config.yml: allowlist additions
+     * and removals, and the execution backend. Environment overrides:
+     *   PANTHEON_EXEC=docker|host, PANTHEON_EXEC_IMAGE, PANTHEON_EXEC_NETWORK=none|bridge
+     */
+    static fromConfig(projectRoot: string, settings?: Partial<SandboxSettings>): Sandbox {
+        const additional: ShellAllowlistEntry[] = (settings?.additionalAllowlist ?? []).map((entry) => ({
+            command: entry.command,
+            description: entry.description ?? entry.command,
+            ...(entry.subcommands ? { subcommands: entry.subcommands } : {}),
+            ...(entry.blockedArgs ? { blockedArgs: entry.blockedArgs.map((pattern) => new RegExp(pattern)) } : {}),
+        }));
+
+        const execution = settings?.execution;
+        const mode = (process.env["PANTHEON_EXEC"]?.trim() || execution?.mode || "host").toLowerCase();
+        const image = process.env["PANTHEON_EXEC_IMAGE"]?.trim() || execution?.image;
+        const network = process.env["PANTHEON_EXEC_NETWORK"]?.trim() || execution?.network;
+        if (mode !== "host" && mode !== "docker") {
+            throw new Error(`Unknown execution mode "${mode}" — use "host" or "docker".`);
+        }
+        if (network !== undefined && network !== "none" && network !== "bridge") {
+            throw new Error(`Unknown execution network "${network}" — use "none" or "bridge".`);
+        }
+
+        return new Sandbox({
+            projectRoot,
+            maxOutputSize: 50_000,
+            shellTimeout: 30_000,
+            allowlist: {
+                enabled: settings?.allowlistEnabled ?? true,
+                entries: buildAllowlist(additional, settings?.denyFromDefault ?? []),
+            },
+            executor: mode === "docker"
+                ? new DockerExecutor({
+                    ...(image ? { image } : {}),
+                    ...(network ? { network } : {}),
+                    ...(execution?.memory ? { memory: execution.memory } : {}),
+                    ...(execution?.cpus ? { cpus: execution.cpus } : {}),
+                    ...(execution?.pidsLimit ? { pidsLimit: execution.pidsLimit } : {}),
+                    ...(execution?.readOnlyProject !== undefined ? { readOnlyProject: execution.readOnlyProject } : {}),
+                    ...(execution?.dockerPath ? { dockerPath: execution.dockerPath } : {}),
+                })
+                : new HostExecutor(),
+        });
+    }
+
+    /**
+     * A view of this sandbox for one agent of a multi-agent run. It behaves
+     * identically, except that file writes go through `coordinator`, which
+     * serialises them per file and stops agents overwriting each other's work.
+     */
+    forAgent(agentId: string, coordinator: FileCoordinator): Sandbox {
+        const view = Object.create(this) as Sandbox;
+        view.writer = { agentId, coordinator };
+        return view;
+    }
+
+    /**
+     * Wrap a file write. Outside orchestration this simply runs `write`; inside,
+     * it is coordinated with the other agents (see FileCoordinator).
+     */
+    async guardWrite<T>(resolvedPath: string, mode: "create" | "edit", write: () => T | Promise<T>): Promise<T> {
+        if (!this.writer) return write();
+        return this.writer.coordinator.withWrite(resolvedPath, this.writer.agentId, mode, write);
+    }
+
+    /**
+     * Validate a shell command against the allowlist, then run it through the
+     * configured executor. Throws only when validation fails; execution problems
+     * are reported in the result.
+     */
+    async exec(command: string, options: { timeoutMs?: number; maxBuffer?: number } = {}): Promise<ExecResult> {
+        this.validateCommand(command);
+        return this.executor.run({
+            command,
+            cwd: this.projectRoot,
+            timeoutMs: options.timeoutMs ?? this.shellTimeout,
+            ...(options.maxBuffer !== undefined ? { maxBuffer: options.maxBuffer } : {}),
+        });
     }
 
     /**
@@ -300,6 +426,11 @@ export class Sandbox {
      * In bypass mode (allowlist.enabled = false):
      *   - All commands are permitted (for development/testing only)
      *
+     * The command line is first split into its simple commands (`a | b && c` is
+     * three), and *every* one must pass — checking only the first word would let
+     * `ls; curl … | sh` through. Command substitution, redirection to files and
+     * background execution are refused outright.
+     *
      * Returns the command unchanged if valid, throws with a clear reason if not.
      */
     validateCommand(command: string): string {
@@ -308,10 +439,21 @@ export class Sandbox {
             return command;
         }
 
-        const trimmed = command.trim();
-        if (!trimmed) {
+        if (!command.trim()) {
             throw new Error("Empty command is not allowed");
         }
+        const segments = splitShellCommand(command);
+        if (segments.length === 0) {
+            throw new Error("Empty command is not allowed");
+        }
+        for (const segment of segments) {
+            this.validateSimpleCommand(segment, command);
+        }
+        return command;
+    }
+
+    /** Allowlist, subcommand, blocked-argument and path checks for one simple command. */
+    private validateSimpleCommand(trimmed: string, command: string): void {
 
         // Extract the command binary (first token, ignoring leading env var assignments)
         // e.g. "FOO=bar git status" → "git"
@@ -378,8 +520,6 @@ export class Sandbox {
 
         // Validate any file path arguments are within the project root
         this.validateArgPaths(cmdBinary, tokens.slice(argStart));
-
-        return command;
     }
 
     /**
@@ -397,12 +537,23 @@ export class Sandbox {
 
         if (!PATH_ARG_COMMANDS.has(cmdBinary)) return;
 
-        for (const token of argTokens) {
+        for (const rawToken of argTokens) {
+            // Compare what the shell will see: quotes are removed before the program runs,
+            // so `cat "/etc/passwd"` must be treated exactly like `cat /etc/passwd`.
+            const token = rawToken.replace(/["']/g, "");
+
+            // The shell would expand these to paths this check cannot see
+            if (token.startsWith("~") || token.includes("$")) {
+                throw new Error(
+                    `Argument "${rawToken}" uses shell expansion; pass a literal path inside the project instead.`
+                );
+            }
+
             // Skip flags (starting with -) and non-path-looking tokens
             if (token.startsWith("-")) continue;
 
             // Validate absolute paths and relative traversals outside current dir
-            if (token.startsWith("/") || token.startsWith("../") || token === "..") {
+            if (token.startsWith("/") || token.startsWith("../") || token === ".." || token.includes("/../")) {
                 try {
                     this.resolvePath(token);
                 } catch {
@@ -450,4 +601,115 @@ export class Sandbox {
             );
         }
     }
+}
+
+/**
+ * Split a shell command line into its simple commands, refusing constructs that
+ * would run something the allowlist never gets to see.
+ *
+ * Allowed:  pipelines and lists (`|`, `&&`, `||`, `;`), quoting, `2>&1`-style
+ *           descriptor duplication, and discarding output to /dev/null.
+ * Refused:  command substitution (`$(…)`, backticks), process substitution,
+ *           redirection to or from files, here-documents and background `&`.
+ *
+ * This is a deliberately conservative scanner, not a shell parser: when in doubt
+ * it refuses.
+ */
+export function splitShellCommand(command: string): string[] {
+    const segments: string[] = [];
+    let current = "";
+    let quote: "'" | '"' | null = null;
+
+    const push = () => {
+        const trimmed = current.trim();
+        if (trimmed) segments.push(trimmed);
+        current = "";
+    };
+    const refuse = (what: string): never => {
+        throw new Error(`${what} is not allowed in shell commands.`);
+    };
+
+    for (let i = 0; i < command.length; i++) {
+        const ch = command[i]!;
+        const next = command[i + 1];
+
+        if (quote === "'") {
+            current += ch;
+            if (ch === "'") quote = null;
+            continue;
+        }
+        // Substitution is live inside double quotes as well as outside
+        if (ch === "`") refuse("Command substitution (backticks)");
+        if (ch === "$" && next === "(") refuse("Command substitution $(…)");
+
+        if (quote === '"') {
+            current += ch;
+            if (ch === "\\" && next !== undefined) {
+                current += next;
+                i++;
+            } else if (ch === '"') {
+                quote = null;
+            }
+            continue;
+        }
+
+        if (ch === "\\" && next !== undefined) {
+            if (next === "\n") refuse("Line continuation");
+            current += ch + next;
+            i++;
+            continue;
+        }
+        if (ch === "'" || ch === '"') {
+            quote = ch;
+            current += ch;
+            continue;
+        }
+
+        if (ch === "\n" || ch === "\r" || ch === ";") {
+            push();
+            continue;
+        }
+        if (ch === "|") {
+            if (next === "|" || next === "&") i++; // `||`, `|&`
+            push();
+            continue;
+        }
+        if (ch === "&") {
+            if (next === "&") {
+                i++;
+                push();
+                continue;
+            }
+            if (next === ">") refuse("Output redirection to a file");
+            refuse("Background execution (&)");
+        }
+        if (ch === "<") {
+            refuse(next === "(" ? "Process substitution" : "Input redirection");
+        }
+        if (ch === ">") {
+            if (next === "(") refuse("Process substitution");
+            const rest = command.slice(i + 1);
+            // `>&1`, `>&2` (optionally preceded by a descriptor digit already in `current`)
+            const dup = /^&[0-9]/.exec(rest);
+            if (dup) {
+                current += ch + dup[0];
+                i += dup[0].length;
+                continue;
+            }
+            // `> /dev/null`, `>> /dev/null`
+            const devNull = /^>?\s*\/dev\/null(?=$|[\s;|&)])/.exec(rest);
+            if (devNull) {
+                current += ch + devNull[0];
+                i += devNull[0].length;
+                continue;
+            }
+            refuse("Output redirection to a file (use the write_file tool)");
+        }
+
+        current += ch;
+    }
+
+    if (quote) throw new Error("Unterminated quote in shell command.");
+    push();
+    return segments;
 }

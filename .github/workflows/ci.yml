@@ -9,6 +9,22 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A real PostgreSQL server, so the storage tests also run through the production
+    # `pg` driver (they always run against SQLite and in-process PGlite as well).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pantheon
+          POSTGRES_PASSWORD: pantheon
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pantheon"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -16,6 +32,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # The agent's `grep` tool shells out to ripgrep; its tests skip silently without it.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: pnpm install --frozen-lockfile
       - name: Typecheck & Build
         run: pnpm turbo build
@@ -23,3 +42,5 @@ jobs:
         run: pnpm turbo lint
       - name: Test
         run: pnpm vitest run
+        env:
+          PANTHEON_TEST_POSTGRES_URL: postgres://pantheon:pantheon@localhost:5432/postgres

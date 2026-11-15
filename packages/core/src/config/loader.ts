@@ -8,12 +8,17 @@ const DEFAULTS: PantheonConfig = {
     models: [
         { id: "llama-smart", provider: "groq", displayName: "Llama 3.3 70B (Smart)" },
         { id: "deepseek-v4-flash", provider: "deepseek", displayName: "DeepSeek V4 Flash" },
-        { id: "deepseek-v4-pro", provider: "deepseek", displayName: "DeepSeek V4 Pro" },
+        {
+            id: "deepseek-v4-pro",
+            provider: "deepseek",
+            displayName: "DeepSeek V4 Pro",
+            // Reasoning model: needs thinking switched on
+            extraParams: { thinking: { type: "enabled" }, reasoning_effort: "high" },
+        },
     ],
-    gateway: {
-        baseUrl: process.env["LITELLM_BASE_URL"] ?? "http://localhost:4000",
-        masterKey: process.env["LITELLM_MASTER_KEY"] ?? "sk-pantheon-local",
-    },
+    // Placeholder — the real values are read from the environment on every
+    // loadConfig() call (see gatewayDefaults), not frozen at import time.
+    gateway: { baseUrl: "http://localhost:4000", masterKey: "sk-pantheon-local" },
     routing: {
         enabled: true,
         tiers: {
@@ -47,20 +52,43 @@ function findConfigPath(): string | null {
     return null;
 }
 
+/**
+ * Gateway address and key from the environment. Read at call time: reading them
+ * once at module load meant a .env loaded (or a variable set) after the first
+ * import of this module was silently ignored.
+ */
+function gatewayDefaults(): PantheonConfig["gateway"] {
+    return {
+        baseUrl: process.env["LITELLM_BASE_URL"] ?? "http://localhost:4000",
+        masterKey: process.env["LITELLM_MASTER_KEY"] ?? "sk-pantheon-local",
+    };
+}
+
 export function loadConfig(): PantheonConfig {
     const configPath = findConfigPath();
 
     if (!configPath) {
-        return DEFAULTS;
+        return { ...DEFAULTS, gateway: gatewayDefaults() };
     }
 
     const raw = fs.readFileSync(configPath, "utf-8");
     const parsed = yaml.load(raw) as Partial<PantheonConfig>;
 
+    // A config that lists its own models replaces the default list. Carry the
+    // built-in request parameters over for models it re-declares without them, so
+    // upgrading does not silently switch off e.g. the reasoning mode of a model.
+    const models = (parsed.models ?? DEFAULTS.models).map((model) => {
+        const builtin = DEFAULTS.models.find((d) => d.id === model.id);
+        return model.extraParams === undefined && builtin?.extraParams
+            ? { ...model, extraParams: builtin.extraParams }
+            : model;
+    });
+
     return {
         ...DEFAULTS,
         ...parsed,
-        gateway: { ...DEFAULTS.gateway, ...parsed.gateway },
+        models,
+        gateway: { ...gatewayDefaults(), ...parsed.gateway },
         routing: {
             ...DEFAULTS.routing,
             ...parsed.routing,

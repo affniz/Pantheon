@@ -6,8 +6,36 @@ import { Classifier } from "../router/classifier.js";
 import { CostTracker } from "../cost/tracker.js";
 import { Tracer } from "../tracing/tracer.js";
 
-/** Default application-level failover chain for the complex tier. */
-const DEFAULT_FAILOVER_CHAIN = ["deepseek-v4-pro", "claude-fallback", "gpt-fallback"] as const;
+/** Fallback models tried, in order, after the complex-tier model when no chain is configured. */
+const DEFAULT_FALLBACK_MODELS = ["claude-fallback", "gpt-fallback"] as const;
+
+/** Per-call options for `complete()`. */
+export interface CompleteOptions {
+    /**
+     * Receive the assistant's text as it is generated. The request is then made in
+     * streaming mode; the returned message is identical to the non-streaming one.
+     */
+    onToken?: (delta: string) => void;
+}
+
+/** The slice of a chat-completion response `complete()` consumes — same shape streamed or not. */
+interface CompletionResponse {
+    choices: Array<{
+        message: {
+            content?: string | null;
+            tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> | null;
+        };
+    }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+}
+
+/** Marks an error raised after text had already been streamed to the caller. */
+class PartialStreamError extends Error {
+    constructor(cause: unknown) {
+        super(cause instanceof Error ? cause.message : String(cause));
+        this.name = "PartialStreamError";
+    }
+}
 
 /** Callback invoked when the gateway falls back to a different model. */
 export type ModelFallbackCallback = (from: string, to: string, reason: string) => void;
@@ -18,6 +46,12 @@ export interface GatewayOptions {
      * `retryBaseDelayMs * N`. Default: 500ms. Tests pass 0 to avoid real sleeps.
      */
     retryBaseDelayMs?: number;
+    /**
+     * Chat session this gateway is serving. Stamped on every usage record so cost
+     * can be broken down per session. When omitted, the session of the active
+     * trace (if any) is used.
+     */
+    sessionId?: string;
 }
 
 /** Number of attempts made against a single model before giving up on it. */
@@ -30,17 +64,22 @@ export class Gateway {
     private tracker: CostTracker;
     private onModelFallback?: ModelFallbackCallback;
     private retryBaseDelayMs: number;
+    private sessionId: string | undefined;
 
     constructor(registry: ModelRegistry, onModelFallback?: ModelFallbackCallback, options: GatewayOptions = {}) {
         this.registry = registry;
         if (onModelFallback !== undefined) this.onModelFallback = onModelFallback;
         this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
+        this.sessionId = options.sessionId;
         const { baseUrl, masterKey } = registry.getGatewayConfig();
 
         this.client = new OpenAI({ baseURL: baseUrl, apiKey: masterKey });
 
-        this.classifier = new Classifier(this.client, registry.getRoutingConfig());
         this.tracker = new CostTracker();
+        // Routing calls cost tokens too — they were previously missing from `pantheon cost`
+        this.classifier = new Classifier(this.client, registry.getRoutingConfig(), (modelId, input, output, prompt) =>
+            this.recordUsage(modelId, input, output, [{ role: "user", content: `[routing] ${prompt}` }]),
+        );
     }
 
     /** Returns the correct OpenAI client for the given model id. */
@@ -54,14 +93,51 @@ export class Gateway {
         return model?.modelName ?? modelId;
     }
 
+    /**
+     * Embed texts with `modelId` through the gateway's OpenAI-compatible
+     * `/embeddings` endpoint. Returns one vector per input, in input order.
+     */
+    async embed(texts: string[], modelId: string): Promise<number[][]> {
+        if (texts.length === 0) return [];
+        return Tracer.startSpan("llm.embedding", "llm", async (span) => {
+            span.attributes.modelId = modelId;
+            span.attributes.inputCount = texts.length;
+            const response = await this.clientFor(modelId).embeddings.create({
+                model: this.upstreamModelName(modelId),
+                input: texts,
+            });
+            // The API may return items out of order; `index` is authoritative.
+            const vectors: number[][] = new Array(texts.length);
+            for (const item of response.data) {
+                vectors[item.index] = item.embedding;
+            }
+            if (vectors.some((v) => !Array.isArray(v))) {
+                throw new Error(`Embedding model "${modelId}" returned ${response.data.length} vectors for ${texts.length} inputs.`);
+            }
+            const inputTokens = response.usage?.prompt_tokens ?? 0;
+            span.attributes.inputTokens = inputTokens;
+            await this.recordUsage(modelId, inputTokens, 0, [{ role: "user", content: `[embedding × ${texts.length}]` }]);
+            return vectors;
+        });
+    }
+
+    /** An `Embedder` bound to one embedding model (for SemanticMemory). */
+    embedder(modelId: string): { modelId: string; embed(texts: string[]): Promise<number[][]> } {
+        return { modelId, embed: (texts) => this.embed(texts, modelId) };
+    }
+
     /** Routing configuration (tiers, thresholds) from the underlying registry. */
     getRoutingConfig(): RoutingConfig {
         return this.registry.getRoutingConfig();
     }
 
-    /** The application-level failover chain (configured or default). */
+    /**
+     * The application-level failover chain: the configured one, or the complex-tier
+     * model followed by the default fallbacks.
+     */
     private failoverChain(): string[] {
-        return this.registry.getGatewayConfig().failoverChain ?? [...DEFAULT_FAILOVER_CHAIN];
+        return this.registry.getGatewayConfig().failoverChain
+            ?? [this.registry.getRoutingConfig().tiers.complex, ...DEFAULT_FALLBACK_MODELS];
     }
 
     /**
@@ -93,20 +169,76 @@ export class Gateway {
         }
     }
 
-    /**
-     * Extra parameters required by DeepSeek V4 Pro (reasoning model).
-     * Returns an empty object for all other models.
-     */
-    private deepseekProParams(modelId: string): Record<string, unknown> {
-        if (modelId === "deepseek-v4-pro") {
-            return {
-                thinking: { type: "enabled" },
-                reasoning_effort: "high",
-            };
-        }
-        return {};
+    /** Provider-specific request parameters configured for the model (`models[].extraParams`). */
+    private extraParams(modelId: string): Record<string, unknown> {
+        return this.registry.get(modelId)?.extraParams ?? {};
     }
 
+    /**
+     * Issue one chat-completion request. With `onToken`, the request is streamed:
+     * text deltas are forwarded as they arrive and tool-call fragments are stitched
+     * back together, yielding the same response shape as a non-streaming call.
+     */
+    private async requestCompletion(
+        client: OpenAI,
+        params: Record<string, unknown>,
+        onToken?: (delta: string) => void,
+    ): Promise<CompletionResponse> {
+        if (!onToken) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return (await client.chat.completions.create(params as any)) as unknown as CompletionResponse;
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const stream = (await (client.chat.completions.create as any)({
+            ...params,
+            stream: true,
+            stream_options: { include_usage: true },
+        })) as AsyncIterable<{
+            choices: Array<{
+                delta?: {
+                    content?: string | null;
+                    tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
+                };
+            }>;
+            usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+        }>;
+
+        let content = "";
+        let emitted = false;
+        const calls: Array<{ id: string; function: { name: string; arguments: string } }> = [];
+        let usage: CompletionResponse["usage"];
+
+        try {
+            for await (const chunk of stream) {
+                const delta = chunk.choices[0]?.delta;
+                if (delta?.content) {
+                    content += delta.content;
+                    emitted = true;
+                    onToken(delta.content);
+                }
+                for (const fragment of delta?.tool_calls ?? []) {
+                    // Fragments of one call share an index; id and name arrive once,
+                    // the JSON arguments in pieces.
+                    const index = fragment.index ?? calls.length - 1;
+                    const call = (calls[index] ??= { id: "", function: { name: "", arguments: "" } });
+                    if (fragment.id) call.id = fragment.id;
+                    if (fragment.function?.name) call.function.name += fragment.function.name;
+                    if (fragment.function?.arguments) call.function.arguments += fragment.function.arguments;
+                }
+                if (chunk.usage) usage = chunk.usage;
+            }
+        } catch (err) {
+            // Text already reached the user: retrying or failing over would repeat it.
+            throw emitted ? new PartialStreamError(err) : err;
+        }
+
+        const toolCalls = calls.filter(Boolean).filter((c) => c.function.name);
+        return {
+            choices: [{ message: { content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) } }],
+            ...(usage ? { usage } : {}),
+        };
+    }
 
     /**
      * Resolve routing decision based on modelId override, auto-routing, or default.
@@ -206,7 +338,8 @@ export class Gateway {
     async complete(
         messages: ChatMessage[],
         modelId: string,
-        tools?: OpenAITool[]
+        tools?: OpenAITool[],
+        options: CompleteOptions = {},
     ): Promise<{
         message: ChatMessage;
         usage: { inputTokens: number; outputTokens: number };
@@ -217,10 +350,10 @@ export class Gateway {
 
         // Only apply failover if the requested model is the head of the chain
         if (chainIdx === 0 && failoverChain.length > 1) {
-            return this.completeWithFailover(messages, failoverChain, tools);
+            return this.completeWithFailover(messages, failoverChain, tools, options);
         }
 
-        return this._completeSingleModel(messages, modelId, tools);
+        return this._completeSingleModel(messages, modelId, tools, options);
     }
 
     /**
@@ -230,7 +363,8 @@ export class Gateway {
     async completeWithFailover(
         messages: ChatMessage[],
         chain: string[],
-        tools?: OpenAITool[]
+        tools?: OpenAITool[],
+        options: CompleteOptions = {},
     ): Promise<{
         message: ChatMessage;
         usage: { inputTokens: number; outputTokens: number };
@@ -239,9 +373,11 @@ export class Gateway {
         for (let i = 0; i < chain.length; i++) {
             const modelId = chain[i]!;
             try {
-                const result = await this._completeSingleModel(messages, modelId, tools);
+                const result = await this._completeSingleModel(messages, modelId, tools, options);
                 return result;
             } catch (err) {
+                // Part of the answer was already streamed — another model would repeat it.
+                if (err instanceof PartialStreamError) throw err;
                 lastError = err;
                 const reason = err instanceof Error ? err.message : String(err);
                 process.stderr.write(`[gateway] failover: model "${modelId}" failed: ${reason}\n`);
@@ -262,7 +398,8 @@ export class Gateway {
     private async _completeSingleModel(
         messages: ChatMessage[],
         modelId: string,
-        tools?: OpenAITool[]
+        tools?: OpenAITool[],
+        options: CompleteOptions = {},
     ): Promise<{
         message: ChatMessage;
         usage: { inputTokens: number; outputTokens: number };
@@ -306,8 +443,8 @@ export class Gateway {
                 const requestParams: Record<string, unknown> = {
                     model: modelId,
                     messages: openaiMessages,
-                    // Inject DeepSeek V4 Pro thinking params when applicable
-                    ...this.deepseekProParams(modelId),
+                    // Provider-specific parameters from the model's config
+                    ...this.extraParams(modelId),
                 };
 
                 if (tools && tools.length > 0) {
@@ -318,7 +455,7 @@ export class Gateway {
                     requestParams["parallel_tool_calls"] = false;
                 }
 
-                let response;
+                let response: CompletionResponse | undefined;
                 let lastError: unknown;
                 // Retry up to 3 times total. Groq/Llama models occasionally generate
                 // malformed tool-call output that causes a 400; retrying usually succeeds.
@@ -326,12 +463,14 @@ export class Gateway {
                 const upstreamModel = this.upstreamModelName(modelId);
                 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
                     try {
-                        response = await client.chat.completions.create(
-                            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                            { ...requestParams, model: upstreamModel } as any
+                        response = await this.requestCompletion(
+                            client,
+                            { ...requestParams, model: upstreamModel },
+                            options.onToken,
                         );
                         break; // success
                     } catch (err) {
+                        if (err instanceof PartialStreamError) throw err; // never retry over streamed text
                         lastError = err;
                         const msg = err instanceof Error ? err.message : String(err);
                         process.stderr.write(`[gateway] attempt ${attempt} failed: ${msg}\n`);
@@ -348,9 +487,7 @@ export class Gateway {
                     process.stderr.write(`[gateway] all tool-call attempts failed, falling back to text-only\n`);
                     if (tools && tools.length > 0) {
                         const fallbackParams = { model: upstreamModel, messages: openaiMessages };
-                        response = await client.chat.completions.create(
-                            fallbackParams as any
-                        );
+                        response = await this.requestCompletion(client, fallbackParams, options.onToken);
                     } else {
                         throw lastError;
                     }
@@ -391,14 +528,7 @@ export class Gateway {
                 };
 
                 // Record usage
-                this.tracker.record({
-                    timestamp: new Date().toISOString(),
-                    modelId,
-                    inputTokens,
-                    outputTokens,
-                    costUsd: this.computeCost(modelId, inputTokens, outputTokens),
-                    promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-                });
+                await this.recordUsage(modelId, inputTokens, outputTokens, messages);
 
                 return { message, usage: { inputTokens, outputTokens } };
             }
@@ -413,11 +543,11 @@ export class Gateway {
         const client = this.clientFor(modelId);
         const upstreamModel = this.upstreamModelName(modelId);
 
-        const extraParams = this.deepseekProParams(modelId);
+        const extraParams = this.extraParams(modelId);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const stream = (await (client.chat.completions.create as any)({
             model: upstreamModel,
-            messages: messages.map((m) => ({ role: m.role, content: m.content })),
+            messages: plainConversation(messages),
             stream: true,
             stream_options: { include_usage: true },
             ...extraParams,
@@ -436,13 +566,54 @@ export class Gateway {
             }
         }
 
-        this.tracker.record({
+        await this.recordUsage(modelId, inputTokens, outputTokens, messages);
+    }
+
+    /**
+     * Persist token usage and cost for one LLM call. Best-effort: a database
+     * problem must never turn a successful model response into a failed request.
+     */
+    private async recordUsage(
+        modelId: string,
+        inputTokens: number,
+        outputTokens: number,
+        messages: ChatMessage[],
+    ): Promise<void> {
+        const record = {
             timestamp: new Date().toISOString(),
             modelId,
             inputTokens,
             outputTokens,
             costUsd: this.computeCost(modelId, inputTokens, outputTokens),
             promptPreview: messages.at(-1)?.content.slice(0, 200) ?? "",
-        });
+        };
+        const sessionId = this.sessionId ?? Tracer.currentSessionId();
+        try {
+            if (sessionId) {
+                try {
+                    await this.tracker.record({ ...record, sessionId });
+                    return;
+                } catch {
+                    // The session row may not exist (unsaved chat, deleted mid-turn).
+                    // Losing the attribution is acceptable; losing the usage is not.
+                }
+            }
+            await this.tracker.record(record);
+        } catch (err) {
+            process.stderr.write(
+                `[gateway] failed to record usage for ${modelId}: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+        }
     }
+}
+
+/**
+ * Messages for a tool-less completion. Persisted sessions also contain tool-call
+ * and tool-result messages; without the matching tool definitions a provider
+ * rejects those, so only the conversational turns with actual text are sent.
+ */
+function plainConversation(messages: ChatMessage[]): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+    return messages
+        .filter((m) => m.role !== "tool" && m.content.trim() !== "")
+        .map((m) => ({ role: m.role as "system" | "user" | "assistant", content: m.content }));
 }

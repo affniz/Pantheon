@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { ensureServerRunning, getServerUrl } from "../server-manager.js";
+import { resolveToken } from "../credentials.js";
 
 const brand = chalk.hex("#F5A623");
 const accent = chalk.hex("#56B6C2");
@@ -10,11 +11,19 @@ const warning = chalk.hex("#E5C07B");
 
 async function pluginsFetch(path: string, options?: RequestInit): Promise<unknown> {
     await ensureServerRunning();
-    const url = `${getServerUrl()}/api/plugins${path}`;
+    const server = getServerUrl();
+    const url = `${server}/api/plugins${path}`;
+    const token = resolveToken(server);
     const response = await fetch(url, {
-        headers: { "Content-Type": "application/json" },
+        headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         ...options,
     });
+    if (response.status === 401) {
+        throw new Error("Authentication required — run `pantheon auth login` (or set PANTHEON_API_TOKEN).");
+    }
     if (!response.ok && response.status !== 404) {
         const body = await response.text().catch(() => "");
         throw new Error(`API error ${response.status}: ${body.slice(0, 200)}`);

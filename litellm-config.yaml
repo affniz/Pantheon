@@ -17,14 +17,27 @@ model_list:
   # ── Fallback models (used only when primary fails) ─────────────────────────
   # Keys are optional — set ANTHROPIC_API_KEY and/or OPENAI_API_KEY in .env
   # to enable automatic failover when DeepSeek is down or rate-limited.
+  # The current Sonnet. (This pointed at claude-3-5-sonnet-20241022, a model from
+  # 2024 that is no longer a sensible target.) Any Anthropic model ID works here.
   - model_name: claude-fallback
     litellm_params:
-      model: anthropic/claude-3-5-sonnet-20241022
+      model: anthropic/claude-sonnet-5-5
       api_key: os.environ/ANTHROPIC_API_KEY
 
   - model_name: gpt-fallback
     litellm_params:
       model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  # ── Embeddings (optional — semantic memory) ────────────────────────────────
+  # Groq and DeepSeek have no embedding models. With OPENAI_API_KEY set, enable
+  # semantic memory in ~/.pantheon/config.yml:
+  #   memory: { semantic: { enabled: true, embeddingModel: pantheon-embed } }
+  # Any LiteLLM-supported embedding model works; keep the name "pantheon-embed"
+  # or change embeddingModel to match.
+  - model_name: pantheon-embed
+    litellm_params:
+      model: openai/text-embedding-3-small
       api_key: os.environ/OPENAI_API_KEY
 
 router_settings:

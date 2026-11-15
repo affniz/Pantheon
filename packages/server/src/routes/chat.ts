@@ -20,8 +20,13 @@ import {
     ABRouter,
     ABStore,
     QualityJudge,
+    eventBus,
 } from "@pantheon/core";
-import type { ABResolution, PermissionDecision } from "@pantheon/core";
+import type { ABResolution, PermissionDecision, SemanticMemory } from "@pantheon/core";
+import { scopeUserId } from "../middleware/auth.js";
+import { getAuthConfig } from "../auth/config.js";
+import { resolveWorkingDir } from "../workspace.js";
+import { semanticMemory, logMemoryError } from "../semantic.js";
 import type { ChatMessage, OrchestrationEvent, RoutingDecision, ToolCall, ToolResult } from "@pantheon/shared";
 
 export const chatRouter = new Hono();
@@ -102,8 +107,28 @@ chatRouter.post("/", async (c) => {
         return c.json({ error: "prompt is required" }, 400);
     }
 
+    // The working directory is the root of everything the agent's file and shell
+    // tools can touch. A local user may point it anywhere; a remote (authenticated)
+    // one must stay inside the workspace the operator configured, or "workingDir: /"
+    // would hand them the server's whole filesystem.
+    const workspace = resolveWorkingDir(workingDir, getAuthConfig().mode === "required");
+    if ("error" in workspace) {
+        return c.json({ error: workspace.error }, 400);
+    }
+    const projectDir = workspace.dir;
+
     return streamSSE(c, async (stream) => {
+        // Set once the session is known; until then there is nothing to attribute events to.
+        let liveSessionId: string | undefined;
+        let semantic: SemanticMemory | undefined;
+        const liveUserId = c.get("user")?.id;
+
         const sendEvent = async (event: string, data: unknown) => {
+            // Mirror to the event bus first, so observers (WebSocket feed) still see the
+            // activity when the requesting client has disconnected mid-turn.
+            if (liveSessionId) {
+                eventBus.publish({ type: event, sessionId: liveSessionId, userId: liveUserId, data });
+            }
             await stream.writeSSE({ event, data: JSON.stringify(data) });
         };
 
@@ -113,16 +138,24 @@ chatRouter.post("/", async (c) => {
 
             // Resolve or create session
             let effectiveSessionId = sessionId;
+            const ownerId = scopeUserId(c);
             if (!effectiveSessionId) {
-                effectiveSessionId = sm.create();
+                effectiveSessionId = await sm.create(undefined, c.get("user")?.id);
+            } else if (!(ownerId ? await sm.isAccessibleBy(effectiveSessionId, ownerId) : await sm.exists(effectiveSessionId))) {
+                // Someone else's session is indistinguishable from a missing one.
+                // Previously this surfaced as an opaque foreign-key error from the first insert.
+                await sendEvent("error", { message: `Session "${effectiveSessionId}" not found` });
+                return;
             }
 
+            liveSessionId = effectiveSessionId;
+
             // Load existing messages for context
-            let messages: ChatMessage[] = sm.getMessages(effectiveSessionId);
+            let messages: ChatMessage[] = await sm.getMessages(effectiveSessionId);
 
             // Append the new user message
             const userMsg: ChatMessage = { role: "user", content: prompt.trim(), timestamp: new Date() };
-            sm.addMessage(effectiveSessionId, userMsg);
+            await sm.addMessage(effectiveSessionId, userMsg);
             messages = [...messages, userMsg];
 
             // Wire gateway with model_fallback SSE event from the start — used everywhere
@@ -130,7 +163,9 @@ chatRouter.post("/", async (c) => {
                 registry,
                 (from, to, reason) => {
                     sendEvent("model_fallback", { from, to, reason }).catch(() => {});
-                }
+                },
+                // Every usage record of this request is attributed to the session
+                { sessionId: effectiveSessionId },
             );
 
             // Build episodic memory context
@@ -138,15 +173,35 @@ chatRouter.post("/", async (c) => {
             let episodicMemory = "";
             if (fastModelId && effectiveSessionId) {
                 const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
-                episodicMemory = summarizer.getEpisodicMemoryContext(effectiveSessionId, {
+                episodicMemory = await summarizer.getEpisodicMemoryContext(effectiveSessionId, {
                     recentMessageCount: 10,
                     summaryLimit: 4,
                 });
             }
 
+            // Semantic memory: passages from past conversations that resemble this
+            // prompt, however old. Complements the summaries above; best-effort.
+            semantic = semanticMemory(gatewayWithFallback);
+            if (semantic) {
+                try {
+                    const relevant = await semantic.buildContext(prompt.trim(), {
+                        excludeSessionId: effectiveSessionId,
+                        userId: scopeUserId(c),
+                    });
+                    if (relevant) episodicMemory = [episodicMemory, relevant].filter(Boolean).join("\n\n");
+                } catch (e) {
+                    logMemoryError("retrieval", e);
+                }
+            }
+
             if (noTools) {
                 // Pure chat mode — stream directly
-                const { generator, decision } = await gatewayWithFallback.stream(messages, model);
+                // Memory context (episodic + semantic) goes in as a system message; this
+                // path used to ignore it entirely.
+                const withMemory: ChatMessage[] = episodicMemory
+                    ? [{ role: "system", content: episodicMemory }, ...messages]
+                    : messages;
+                const { generator, decision } = await gatewayWithFallback.stream(withMemory, model);
                 await sendEvent("routing", decision);
 
                 let accumulated = "";
@@ -156,7 +211,7 @@ chatRouter.post("/", async (c) => {
                 }
 
                 const assistantMsg: ChatMessage = { role: "assistant", content: accumulated, timestamp: new Date() };
-                sm.addMessage(effectiveSessionId, assistantMsg);
+                await sm.addMessage(effectiveSessionId, assistantMsg);
 
                 await sendEvent("done", { sessionId: effectiveSessionId, iterations: 1 });
             } else {
@@ -164,9 +219,11 @@ chatRouter.post("/", async (c) => {
                 const cfg = loadConfig();
 
                 if (consensus) {
+                    // Default: one model per distinct routing tier, synthesised by the strongest
+                    const tiers = registry.getRoutingConfig().tiers;
                     const consensusConfig = cfg.consensus ?? {
-                        models: ["deepseek-v4-flash", "deepseek-v4-pro", "llama-smart"],
-                        synthesisModelId: "deepseek-v4-pro",
+                        models: [...new Set([tiers.simple, tiers.standard, tiers.complex, tiers.general])],
+                        synthesisModelId: tiers.complex,
                     };
 
                     // Emit start events for each model
@@ -175,7 +232,12 @@ chatRouter.post("/", async (c) => {
                     }
 
                     const engine = new ConsensusEngine(gatewayWithFallback, consensusConfig);
-                    const result = await engine.run(messages, effectiveSessionId);
+                    // Stored sessions also hold tool calls and results; the models asked here
+                    // have no tools, so they get the conversation only.
+                    const conversation = messages.filter(
+                        (m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== "",
+                    );
+                    const result = await engine.run(conversation, effectiveSessionId);
 
                     // Emit per-model done events
                     for (const r of result.responses) {
@@ -194,15 +256,13 @@ chatRouter.post("/", async (c) => {
                         content: result.synthesizedContent,
                         timestamp: new Date(),
                     };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    await sm.addMessage(effectiveSessionId, assistantMsg);
 
                     // Async quality scoring — write score back to consensus_runs row
-                    const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
-                    judge.score(prompt.trim(), result.synthesizedContent).then((score) => {
-                        if (score !== null) {
-                            engine.updateQualityScore(result.runId, score);
-                        }
-                    }).catch(() => {});
+                    const judge = new QualityJudge(gatewayWithFallback, registry.getRoutingConfig().tiers.general);
+                    judge.score(prompt.trim(), result.synthesizedContent)
+                        .then((score) => (score === null ? undefined : engine.updateQualityScore(result.runId, score)))
+                        .catch(() => {});
 
                     await sendEvent("done", { sessionId: effectiveSessionId, iterations: 0, consensus: true });
                     return;
@@ -256,14 +316,16 @@ chatRouter.post("/", async (c) => {
                 // Emit the routing decision for the CLI
                 await sendEvent("routing", routingDecision);
 
-                const sandbox = Sandbox.create(workingDir);
+                // Allowlist additions/removals and the execution backend (host or
+                // docker) come from the `sandbox:` block of config.yml.
+                const sandbox = Sandbox.fromConfig(projectDir, cfg.sandbox);
 
                 // Build codebase map at session start — injected into agent system prompt
                 // as a ## Codebase Map section. Gives agents structural awareness without
                 // any listDirectory/readFile exploration loops.
                 let repoMapContent: string | undefined;
                 try {
-                    repoMapContent = await buildRepoMap(workingDir);
+                    repoMapContent = await buildRepoMap(projectDir);
                 } catch (e) {
                     process.stderr.write(
                         `[chat] repo map build failed (non-fatal): ${e instanceof Error ? e.message : String(e)}\n`,
@@ -301,13 +363,30 @@ chatRouter.post("/", async (c) => {
                     sendEvent("tool_result", { toolCallId: result.toolCallId, content: result.content, isError: result.isError }).catch(() => {});
                 };
 
+                // Tools for this turn: built-ins plus installed plugins / MCP servers.
+                // Built once and used by both paths, so orchestrated sub-agents have the
+                // same tools a single agent would (they used to get the built-ins only).
+                const toolRegistry = new ToolRegistry();
+                registerBuiltinTools(toolRegistry);
+                try {
+                    await new PluginRegistry(toolRegistry, cfg.plugins?.directory ?? DEFAULT_PLUGINS_DIR).loadFromDirectory(sandbox);
+                } catch (e) {
+                    process.stderr.write(`[chat] plugin load error: ${e instanceof Error ? e.message : String(e)}\n`);
+                }
+
+                // The answer is streamed as it is written (commentary before tool calls
+                // included), instead of arriving in one piece when the turn is over.
+                const onText = (delta: string) => {
+                    sendEvent("text", { content: delta }).catch(() => {});
+                };
+
                 if (useOrchestration) {
                     // ── Multi-agent orchestration path ──────────────────────────
                     const routingConfig = registry.getRoutingConfig();
 
                     const orchestrator = new Orchestrator({
                         gateway: gatewayWithFallback,
-                        toolRegistry: new ToolRegistry(), // orchestrator creates its own per executor
+                        toolRegistry,
                         sandbox,
                         permissionManager,
                         sessionId: effectiveSessionId,
@@ -317,17 +396,23 @@ chatRouter.post("/", async (c) => {
                         maxConcurrency: 5,
                         maxSubTasks: Math.min(6, Math.max(1, maxSubTasks)),
                         ...(episodicMemory ? { episodicMemory } : {}),
+                        ...(repoMapContent ? { repoMap: repoMapContent } : {}),
+                        refreshRepoMap: () => buildRepoMap(projectDir),
                         onEvent: (event: OrchestrationEvent) => {
                             sendEvent(event.type, event).catch(() => {});
                         },
                         onToolCall,
                         onToolResult,
+                        onText,
                     });
 
                     const result = await orchestrator.run(prompt.trim(), messages);
 
-                    // Emit the final text as a standard text event for CLI rendering
-                    await sendEvent("text", { content: result.finalResponse });
+                    // The reviewer's answer normally arrives through onText; send it whole
+                    // only if it did not (e.g. a provider that could not stream).
+                    if (!result.streamed) {
+                        await sendEvent("text", { content: result.finalResponse });
+                    }
 
                     // Persist assistant message
                     const assistantMsg: ChatMessage = {
@@ -335,11 +420,11 @@ chatRouter.post("/", async (c) => {
                         content: result.finalResponse,
                         timestamp: new Date(),
                     };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    await sm.addMessage(effectiveSessionId, assistantMsg);
 
                     // Background summarization
                     if (fastModelId) {
-                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const allMsgs = await sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
                             const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
@@ -352,21 +437,11 @@ chatRouter.post("/", async (c) => {
                         iterations: 0,
                         orchestrated: true,
                         planId: result.planId,
+                        verified: result.verification.passed,
+                        fixRounds: result.fixRounds,
                     });
                 } else {
-                    // ── Single-agent path (unchanged from v0.5) ──────────────────
-                    const toolRegistry = new ToolRegistry();
-                    registerBuiltinTools(toolRegistry);
-
-                    // Wire plugins
-                    const pluginDir = cfg.plugins?.directory ?? DEFAULT_PLUGINS_DIR;
-                    const pluginReg = new PluginRegistry(toolRegistry, pluginDir);
-                    try {
-                        await pluginReg.loadFromDirectory(sandbox);
-                    } catch (e) {
-                        process.stderr.write(`[chat] plugin load error: ${e instanceof Error ? e.message : String(e)}\n`);
-                    }
-
+                    // ── Single-agent path ────────────────────────────────────────
                     const agentRuntime = new AgentRuntime(gatewayWithFallback, toolRegistry, {
                         maxIterations: 20,
                         sandbox,
@@ -374,8 +449,11 @@ chatRouter.post("/", async (c) => {
                         sessionId: effectiveSessionId,
                         ...(episodicMemory ? { systemPrompt: episodicMemory } : {}),
                         ...(repoMapContent ? { repoMap: repoMapContent } : {}),
+                        // Rebuilt mid-turn whenever the agent writes a source file
+                        refreshRepoMap: () => buildRepoMap(projectDir),
                         onToolCall,
                         onToolResult,
+                        onText,
                     });
 
                     const turnStart = Date.now();
@@ -386,15 +464,17 @@ chatRouter.post("/", async (c) => {
                     if (turnResult.escalated) {
                         await sendEvent("routing", turnResult.decision);
                     }
-                    await sendEvent("text", { content: turnResult.response });
+                    // (No final "text" event: onText has already delivered every character.)
 
-                    // Persist assistant message
-                    const assistantMsg: ChatMessage = { role: "assistant", content: turnResult.response, timestamp: new Date() };
-                    sm.addMessage(effectiveSessionId, assistantMsg);
+                    // Persist the whole turn — tool calls and their results as well as the
+                    // answer — so the next turn knows what the agent read and did.
+                    for (const message of turnResult.messages) {
+                        await sm.addMessage(effectiveSessionId, forStorage(message));
+                    }
 
                     // Background summarization
                     if (fastModelId) {
-                        const allMsgs = sm.getMessages(effectiveSessionId);
+                        const allMsgs = await sm.getMessages(effectiveSessionId);
                         const turnCount = allMsgs.filter((m) => m.role === "user" || m.role === "assistant").length;
                         if (turnCount >= 4) {
                             const summarizer = new SessionSummarizer(gatewayWithFallback, fastModelId);
@@ -405,7 +485,7 @@ chatRouter.post("/", async (c) => {
                     // v0.8: Record A/B run and async quality scoring
                     if (abResolution) {
                         const abStore = new ABStore();
-                        const savedRun = abStore.save({
+                        const savedRun = await abStore.save({
                             experimentId: abResolution.experimentId,
                             sessionId: effectiveSessionId,
                             promptHash: ABStore.hashPrompt(prompt.trim()),
@@ -415,12 +495,10 @@ chatRouter.post("/", async (c) => {
                             inputTokens: turnResult.usage.inputTokens,
                             outputTokens: turnResult.usage.outputTokens,
                         });
-                        const judge = new QualityJudge(gatewayWithFallback, "llama-smart");
-                        judge.score(prompt.trim(), turnResult.response).then((score) => {
-                            if (score !== null) {
-                                abStore.updateQualityScore(savedRun.id, score);
-                            }
-                        }).catch(() => {});
+                        const judge = new QualityJudge(gatewayWithFallback, registry.getRoutingConfig().tiers.general);
+                        judge.score(prompt.trim(), turnResult.response)
+                            .then((score) => (score === null ? undefined : abStore.updateQualityScore(savedRun.id, score)))
+                            .catch(() => {});
                     }
 
                     await sendEvent("done", {
@@ -433,6 +511,11 @@ chatRouter.post("/", async (c) => {
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             await sendEvent("error", { message });
+        } finally {
+            // Index this turn's messages for future retrieval, off the request path.
+            if (semantic && liveSessionId) {
+                semantic.indexSession(liveSessionId).catch((e) => logMemoryError("indexing", e));
+            }
         }
     });
 });
@@ -456,3 +539,21 @@ chatRouter.post("/respond", async (c) => {
     entry.resolve(decision);
     return c.json({ ok: true });
 });
+
+/** Tool output kept per result when a turn is stored; the head is what later turns need. */
+const MAX_STORED_TOOL_OUTPUT = 4000;
+
+/**
+ * A turn's message as it should be stored. Tool results can be very large (a file
+ * dump, a test log); replaying them in full on every later turn would crowd out
+ * the conversation, so they are stored truncated with a marker.
+ */
+function forStorage(message: ChatMessage): ChatMessage {
+    if (message.role !== "tool" || message.content.length <= MAX_STORED_TOOL_OUTPUT) return message;
+    return {
+        ...message,
+        content:
+            message.content.slice(0, MAX_STORED_TOOL_OUTPUT) +
+            `\n[… ${message.content.length - MAX_STORED_TOOL_OUTPUT} more characters not kept in session history]`,
+    };
+}

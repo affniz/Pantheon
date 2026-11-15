@@ -204,3 +204,98 @@ describe("Classifier — edge cases", () => {
         expect(userMsg.content).toContain("previous question about architecture");
     });
 });
+
+describe("structural routing signals", () => {
+    it("recognises pure small talk", async () => {
+        const { structuralSignals } = await import("../classifier.js");
+        for (const text of ["hi", "Hello!", "hey there", "thanks a lot", "Thank you!!", "ok", "good morning", "bye."]) {
+            expect(structuralSignals(text).smallTalk, text).toBe(true);
+        }
+        for (const text of ["hi, can you fix the build?", "thanks, now refactor it", "ok do it", "hello world in rust", "why is the sky blue"]) {
+            expect(structuralSignals(text).smallTalk, text).toBe(false);
+        }
+    });
+
+    it("raises the floor for code, errors, file names and length", async () => {
+        const { structuralSignals } = await import("../classifier.js");
+        expect(structuralSignals("what does this do?").floor).toBe("general");
+        expect(structuralSignals("fix this\n```ts\nconst a = 1\n```").floor).toBe("simple");
+        expect(structuralSignals("TypeError: Cannot read properties of undefined").floor).toBe("simple");
+        expect(structuralSignals("it crashes\n    at run (/app/src/index.ts:10:5)").floor).toBe("simple");
+        expect(structuralSignals("rename the export in utils.ts").floor).toBe("simple");
+        expect(structuralSignals("x".repeat(700)).floor).toBe("simple");
+        expect(structuralSignals("update a.ts, b.tsx and c.py to use the new API").floor).toBe("standard");
+        expect(structuralSignals("x".repeat(3000)).floor).toBe("standard");
+        expect(structuralSignals("update a.ts and b.ts").reasons).toEqual(["mentions 2 files"]);
+    });
+});
+
+describe("Classifier — robustness", () => {
+    function make() {
+        const create = vi.fn();
+        const client = { chat: { completions: { create } } } as any;
+        const config = {
+            enabled: true,
+            tiers: { general: "small", simple: "mid", standard: "mid", complex: "big" },
+            routingContextDepth: 5,
+            confidenceThreshold: 0.6,
+        };
+        return { create, config, client };
+    }
+    const reply = (content: string) => ({ choices: [{ message: { content } }], usage: { prompt_tokens: 5, completion_tokens: 1 } });
+
+    it("answers small talk without calling the model — unless there is conversation history", async () => {
+        const { Classifier } = await import("../classifier.js");
+        const { create, client, config } = make();
+        const classifier = new Classifier(client, config);
+
+        expect(await classifier.classify("thanks!")).toMatchObject({ tier: "general", selectedModelId: "small", confidence: 1 });
+        expect(create).not.toHaveBeenCalled();
+
+        create.mockResolvedValue(reply("complex"));
+        const followUp = await classifier.classify("ok", [{ role: "user", content: "the migration deadlocks under load" }]);
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(followUp.tier).toBe("complex");
+    });
+
+    it("never routes below the structural floor, and says why", async () => {
+        const { Classifier } = await import("../classifier.js");
+        const { create, client, config } = make();
+        create.mockResolvedValue(reply("general 0.95"));
+        const decision = await new Classifier(client, config).classify("why does this fail?\nTypeError: x is not a function");
+        expect(decision.tier).toBe("simple");
+        expect(decision.selectedModelId).toBe("mid");
+        expect(decision.reason).toContain("raised to simple (contains an error or stack trace)");
+    });
+
+    it("never lowers the model's answer", async () => {
+        const { Classifier } = await import("../classifier.js");
+        const { create, client, config } = make();
+        create.mockResolvedValue(reply("complex 0.9"));
+        expect((await new Classifier(client, config).classify("redesign the storage layer")).tier).toBe("complex");
+    });
+
+    it("falls back to a sensible tier when the classifier call fails", async () => {
+        const { Classifier } = await import("../classifier.js");
+        const { create, client, config } = make();
+        create.mockRejectedValue(new Error("429 rate limited"));
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        try {
+            const decision = await new Classifier(client, config).classify("add input validation to the signup form");
+            expect(decision).toMatchObject({ tier: "standard", selectedModelId: "mid" });
+            expect(decision.reason).toContain("classifier unavailable");
+        } finally {
+            stderr.mockRestore();
+        }
+    });
+
+    it("reports usage through the callback, and a failing callback does not break routing", async () => {
+        const { Classifier } = await import("../classifier.js");
+        const { create, client, config } = make();
+        create.mockResolvedValue(reply("simple"));
+        const onUsage = vi.fn().mockRejectedValue(new Error("db down"));
+        const decision = await new Classifier(client, config, onUsage).classify("write a function that reverses a string");
+        expect(decision.tier).toBe("simple");
+        expect(onUsage).toHaveBeenCalledWith("small", 5, 1, "write a function that reverses a string");
+    });
+});

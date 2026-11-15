@@ -54,7 +54,7 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
 
     // Fetch models and initialize session on mount
     useEffect(() => {
-        (async () => {
+        void (async () => {
             try {
                 // Load model list from API
                 const { models, defaultModel } = await client.listModels();
@@ -75,7 +75,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                                 const session = await client.getSession(targetId);
                                 setSessionId(session.id);
                                 const msgs = await client.getSessionMessages(session.id);
-                                setMessages(msgs);
+                                // Tool calls and results are part of the stored transcript; show the conversation only
+                                setMessages(msgs.filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== ""));
                             } catch {
                                 // Session not found — start fresh
                                 setSessionId(null);
@@ -87,7 +88,8 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                                 const session = sessions[0];
                                 setSessionId(session.id);
                                 const msgs = await client.getSessionMessages(session.id);
-                                setMessages(msgs);
+                                // Tool calls and results are part of the stored transcript; show the conversation only
+                                setMessages(msgs.filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== ""));
                             }
                         }
                     }
@@ -275,6 +277,19 @@ function ChatApp({ modelId: initialModelId, noTools = false, resume, noSave, bud
                         const d = evt.data;
                         const icon = d.approved ? "✅" : "⚠️";
                         accumulatedText += `\n\n${icon} Review: ${d.feedback}\n\n`;
+                        setStreamedText(accumulatedText);
+                        break;
+                    }
+
+                    case "verification": {
+                        const d = evt.data;
+                        const label = d.round === 0 ? "Verification" : `Verification after fix ${d.round}`;
+                        const outcome = d.passed
+                            ? "✓ passed"
+                            : d.baselineFailing
+                                ? "✗ failing (already failing before this request)"
+                                : "✗ failed";
+                        accumulatedText += `\n🔎 ${label}: ${outcome}\n`;
                         setStreamedText(accumulatedText);
                         break;
                     }
